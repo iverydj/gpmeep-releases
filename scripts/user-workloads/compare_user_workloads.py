@@ -90,7 +90,7 @@ PAIR_TOLERANCES = {
 }
 
 TERS_SCHEMA = "gpmeep-ters-workload-v2"
-AUNP_SCHEMA = "gpmeep-aunp-r4000-workload-v4"
+AUNP_SCHEMA = "gpmeep-aunp-r4000-workload-v5"
 CHUNK_VALUES = 1024 * 1024
 
 COMPARISON_CLASSES = {
@@ -359,7 +359,7 @@ def load_lane(
             complete = json.load(handle)
     expected_complete_schema = {
         TERS_SCHEMA: "gpmeep-ters-workload-complete-v2",
-        AUNP_SCHEMA: "gpmeep-aunp-r4000-workload-complete-v4",
+        AUNP_SCHEMA: "gpmeep-aunp-r4000-workload-complete-v5",
     }[schema]
     if complete.get("schema") != expected_complete_schema:
         raise WorkloadError(f"wrong workload COMPLETE schema in {root}")
@@ -852,6 +852,21 @@ def validate_aunp_exact_stage_resume(lane: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _sum_squares(values: np.ndarray) -> float:
+    """Reduce one float64 chunk without a BLAS thread-dependent sum order."""
+    # The callers retain their original magnitude/difference dtype conversion.
+    # Square in float64, then sum in C order with fsum rather than BLAS dot:
+    # complete reports must reproduce exactly under independent analysis runs.
+    with np.errstate(over="ignore"):
+        squares = np.square(values.reshape(-1), dtype=np.float64)
+    try:
+        return math.fsum(squares)
+    except OverflowError:
+        # Nonnegative finite terms can overflow their sum, as in the previous
+        # dot reduction. Preserve +inf instead of introducing a new exception.
+        return math.inf
+
+
 def _stream_metrics(
     reference_chunks: Iterator[np.ndarray],
     candidate_chunks: Iterator[np.ndarray],
@@ -875,9 +890,9 @@ def _stream_metrics(
             and np.all(np.isfinite(difference))
         ):
             raise WorkloadError("scientific output contains a non-finite value")
-        reference_square += float(np.dot(ref_magnitude.reshape(-1), ref_magnitude.reshape(-1)))
-        candidate_square += float(np.dot(cand_magnitude.reshape(-1), cand_magnitude.reshape(-1)))
-        difference_square += float(np.dot(difference.reshape(-1), difference.reshape(-1)))
+        reference_square += _sum_squares(ref_magnitude)
+        candidate_square += _sum_squares(cand_magnitude)
+        difference_square += _sum_squares(difference)
         reference_maximum = max(
             reference_maximum, float(np.max(ref_magnitude, initial=0.0))
         )
@@ -1386,7 +1401,7 @@ def _array_stats(array: np.ndarray) -> dict[str, float]:
         magnitude = np.abs(chunk).astype(np.float64, copy=False)
         if not np.all(np.isfinite(magnitude)):
             raise WorkloadError("field array contains a non-finite value")
-        square_sum += float(np.dot(magnitude, magnitude))
+        square_sum += _sum_squares(magnitude)
         maximum = max(maximum, float(np.max(magnitude, initial=0.0)))
         count += magnitude.size
     if count == 0 or square_sum <= 0 or maximum <= 0:
@@ -1434,14 +1449,14 @@ def compare_ters_field(
         magnitude = np.abs(difference).astype(np.float64, copy=False)
         if not np.all(np.isfinite(magnitude)):
             raise WorkloadError("TERS comparison produced a non-finite difference")
-        diff_square += float(np.dot(magnitude, magnitude))
+        diff_square += _sum_squares(magnitude)
         diff_maximum = max(diff_maximum, float(np.max(magnitude, initial=0.0)))
         mask = np.abs(ref_chunk) >= phase_floor
         if np.any(mask):
             phase = np.angle(cand_chunk[mask] / ref_chunk[mask]).astype(
                 np.float64, copy=False
             )
-            phase_square += float(np.dot(phase, phase))
+            phase_square += _sum_squares(phase)
             phase_count += phase.size
     oriented_reference = _orient_ters(reference, x, y)
     oriented_candidate = _orient_ters(candidate, x, y)

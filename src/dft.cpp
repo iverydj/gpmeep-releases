@@ -36,6 +36,14 @@ using namespace std;
 
 namespace meep {
 
+void gpmeep_note_dft_mutation(dft_chunk *dft_chunks) {
+  for (dft_chunk *chunk = dft_chunks; chunk; chunk = chunk->next_in_dft)
+    if (chunk->fc && chunk->fc->gpmeep_fields_owner) {
+      chunk->fc->gpmeep_fields_owner->gpmeep_note_state_mutation();
+      return;
+    }
+}
+
 namespace {
 
 std::atomic<bool> fail_next_dft_norm_on_master(false);
@@ -740,6 +748,7 @@ dft_chunk::dft_chunk(fields_chunk *fc_, ivec is_, ivec ie_, vec s0_, vec s1_, ve
 }
 
 dft_chunk::~dft_chunk() {
+  gpmeep_note_dft_mutation(this);
   // Eigenmode retained plans use the first DFT chunk as their stable monitor
   // identity.  Invalidate that identity before any of its host/device inputs
   // are released so a later monitor cannot observe a recycled address.
@@ -827,6 +836,7 @@ dft_chunk *fields::add_dft(component c, const volume &where, const double *freq,
                            dft_chunk *chunk_next, bool sqrt_dV_and_interp_weights,
                            complex<double> extra_weight, bool use_centered_grid, int vc,
                            int decimation_factor, bool persist) {
+  gpmeep_note_state_mutation();
   if (coordinate_mismatch(gv.dim, c)) return NULL;
 
   /* If you call add_dft before adding sources, it will do nothing
@@ -941,6 +951,7 @@ static bool append_cuda_dft_requests(
 #endif
 
 void fields::update_dfts() {
+  gpmeep_note_state_mutation();
   am_now_working_on(FourierTransforming);
 #if MEEP_HAVE_CUDA
   const bool cuda_phase_eligible =
@@ -1015,7 +1026,7 @@ void fields_chunk::update_dfts(double timeE, double timeH, int current_step) {
 #endif
   for (dft_chunk *cur = dft_chunks; cur; cur = cur->next_in_chunk) {
     if ((current_step % cur->get_decimation_factor()) == 0) {
-      cur->update_dft(is_H_or_B(cur->c) ? timeH : timeE);
+      cur->update_dft_impl(is_H_or_B(cur->c) ? timeH : timeE);
     }
   }
 }
@@ -1042,12 +1053,21 @@ bool fields::cuda_dft_preflight(std::string *reason) const {
 }
 
 void dft_chunk::update_dft(double time) {
+  // fields::update_dfts/step already publish a mutation, but update_dft is
+  // also a public SWIG entry point. A direct call must invalidate an exact
+  // backend acknowledgement before changing phases or accumulators.
+  gpmeep_note_dft_mutation(this);
+  update_dft_impl(time);
+}
+
+void dft_chunk::update_dft_impl(double time) {
   if (!fc->f[c][0]) return;
 
   const int Nomega = omega.size();
+  const bool cuda_backend_active = gpu::detail::cuda_active();
   const bool cuda_phase_eligible =
-      gpu::detail::cuda_active() && sizeof(realnum) == sizeof(float);
-  if (gpu::detail::cuda_active() && !cuda_phase_eligible)
+      cuda_backend_active && sizeof(realnum) == sizeof(float);
+  if (cuda_backend_active && !cuda_phase_eligible)
     throw std::runtime_error(
         "preflighted CUDA DFT update requires FP32 fields");
 #if MEEP_HAVE_CUDA
@@ -1062,8 +1082,8 @@ void dft_chunk::update_dft(double time) {
   // does not transfer this host cache.
   update_public_dft_phase(this, time);
 
-  gpu::detail::resident_curl_session cuda_session(fc,
-                                                   cuda_phase_eligible);
+  gpu::detail::conditional_resident_curl_session cuda_session(
+      fc, cuda_phase_eligible);
 #if MEEP_HAVE_CUDA
   if (cuda_session.active()) {
     static_assert(sizeof(std::complex<realnum>) == 2 * sizeof(realnum),
@@ -1265,6 +1285,7 @@ void dft_chunk::scale_dft(complex<double> scale) {
     throw invalid_argument("DFT scale must be finite");
   if (N && omega.size() > numeric_limits<size_t>::max() / N)
     throw overflow_error("DFT scale value count overflow");
+  gpmeep_note_dft_mutation(this);
   const size_t value_count = N * omega.size();
   if (gpu::detail::cuda_active()) {
     if (sizeof(realnum) != sizeof(float))
@@ -1289,6 +1310,7 @@ void dft_chunk::scale_dft(complex<double> scale) {
 }
 
 void dft_chunk::operator-=(const dft_chunk &chunk) {
+  gpmeep_note_dft_mutation(this);
   gpu::detail::sync_resident_cache_for_owner(fc);
   gpu::detail::sync_resident_cache_for_owner(chunk.fc);
   if (c != chunk.c || N * omega.size() != chunk.N * chunk.omega.size())
@@ -1579,6 +1601,7 @@ void save_dft_hdf5_many(const dft_hdf5_dataset *datasets,
 void load_dft_hdf5(dft_chunk *dft_chunks, const char *name, h5file *file, const char *dprefix,
                    bool single_parallel_file) {
   distributed_dft_checkpoint_failure_guard distributed_failure_guard("load");
+  gpmeep_note_dft_mutation(dft_chunks);
   const dft_hdf5_dataset dataset = {dft_chunks, name};
   load_dft_hdf5_many_impl(&dataset, 1, file, dprefix,
                           single_parallel_file);
@@ -1594,6 +1617,8 @@ void load_dft_hdf5_many(const dft_hdf5_dataset *datasets,
                         size_t dataset_count, h5file *file,
                         const char *dprefix, bool single_parallel_file) {
   distributed_dft_checkpoint_failure_guard distributed_failure_guard("load");
+  for (size_t index = 0; index < dataset_count; ++index)
+    gpmeep_note_dft_mutation(datasets[index].chunks);
   load_dft_hdf5_many_impl(datasets, dataset_count, file, dprefix,
                           single_parallel_file);
   distributed_failure_guard.dismiss();
@@ -4320,6 +4345,7 @@ delete the underlying dft_chunks! (useful for
 adjoint calculations, where we want to keep
 the chunk data around) */
 void fields::clear_dft_monitors() {
+  gpmeep_note_state_mutation();
   for (int i = 0; i < num_chunks; i++)
     if (chunks[i]->is_mine() && chunks[i]->dft_chunks) {
       // Remove the monitors from step-time updates while retaining an owner

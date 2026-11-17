@@ -79,11 +79,14 @@ def _load_target(
     if textured:
         target_argv.append("-textured")
     previous_argv = sys.argv
+    previous_argv_contents = list(previous_argv)
     try:
-        sys.argv = target_argv
+        previous_argv[:] = target_argv
         return run_path(str(example), run_name="__main__")
     finally:
-        sys.argv = previous_argv
+        if sys.argv is not previous_argv:
+            sys.argv = previous_argv
+        previous_argv[:] = previous_argv_contents
 
 
 def _validate_spectra(

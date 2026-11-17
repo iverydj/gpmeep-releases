@@ -1,4 +1,4 @@
-{% set distribution_version = "1.0.3" %}
+{% set distribution_version = "1.1.0" %}
 {% set build_number = 0 %}
 
 package:
@@ -14,7 +14,21 @@ source:
 build:
   number: {{ build_number }}
   skip: true  # [not linux or not x86_64]
+  # The rendered recipe expands source.path to a private staging directory.
+  # Publish the reviewed source recipe separately; do not embed local paths
+  # in the immutable binary package's info/recipe metadata.
+  include_recipe: false
+  {% if distribution_version == "1.1.0" %}
+  {% if environ.get('GPMEEP_V110_BUILD_MODE') == 'development' %}
+  string: cuda124_mpi_openmpi_py{{ py }}_{{ build_number }}_development
+  {% else %}
+  # Candidate bytes use the final build string but remain unpublishable until
+  # an external post-package receipt authorizes their exact SHA-256.
   string: cuda124_mpi_openmpi_py{{ py }}_{{ build_number }}
+  {% endif %}
+  {% else %}
+  string: cuda124_mpi_openmpi_py{{ py }}_{{ build_number }}
+  {% endif %}
   # build.sh finalizes package-relative RPATHs before producing ELF-bound
   # compatibility reports. Conda must not mutate those audited bytes later.
   binary_relocation: false
@@ -22,6 +36,8 @@ build:
     - GPMEEP_SOURCE_COMMIT
     - GPMEEP_CUDA_ARCHS
     - GPMEEP_SOURCE_TREE
+    - GPMEEP_V110_CANDIDATE_RECEIPT
+    - GPMEEP_V110_BUILD_MODE
   skip_compile_pyc:
     # build.sh installs deterministic, prefix-relative checked-hash bytecode.
     - "lib/python3.11/site-packages/meep/*.py"

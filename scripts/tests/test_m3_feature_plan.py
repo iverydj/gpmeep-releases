@@ -29,12 +29,14 @@ def feature_ids() -> list[tuple[str, str]]:
     values.extend(
         (
             ("distributed.cuda_aware_mpi", "distributed_policy"),
+            ("policy.recommend_cpu", "distributed_policy"),
+            ("policy.recommend_cuda", "distributed_policy"),
             ("policy.long_horizon_small", "distributed_policy"),
         )
     )
     values.extend(
         (f"distributed.feature_{index:02d}", "distributed_policy")
-        for index in range(8)
+        for index in range(6)
     )
     return values
 
@@ -83,7 +85,15 @@ class M3FeaturePlanTests(unittest.TestCase):
             features[32]["status"], "planned_capability_gated"
         )
         self.assertEqual(
-            features[33]["status"], "planned_policy_gap_allowed"
+            features[35]["status"], "planned_policy_gap_allowed"
+        )
+        self.assertEqual(
+            tuple(
+                feature["feature_id"]
+                for feature in features
+                if feature["feature_id"].startswith("policy.")
+            ),
+            PLAN.POLICY_FEATURE_IDS,
         )
         self.assertEqual(
             features[0]["primary_current_receipt_evidence"],
@@ -106,6 +116,47 @@ class M3FeaturePlanTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(Exception, "row differs"):
             PLAN.parse_contract(requirement_rows(), evidence)
+
+    def test_explicit_recommendation_policy_inventory_is_required(self) -> None:
+        requirements = requirement_rows().replace(
+            b"policy.recommend_cpu", b"policy.cpu_advice", 1
+        )
+        evidence = evidence_rows().replace(
+            b"policy.recommend_cpu", b"policy.cpu_advice", 1
+        )
+        with self.assertRaisesRegex(
+            Exception, "recommendation policy feature inventory"
+        ):
+            PLAN.parse_contract(requirements, evidence)
+
+    def test_backend_selection_tokens_are_rejected_in_every_contract(self) -> None:
+        for token in (b"auto", b"AUTO1", b"automatic"):
+            with self.subTest(contract="requirements", token=token):
+                requirements = requirement_rows().replace(
+                    b"feature 0", b"feature " + token, 1
+                )
+                with self.assertRaisesRegex(
+                    Exception, "forbidden backend-selection token"
+                ):
+                    PLAN.parse_contract(requirements, evidence_rows())
+            with self.subTest(contract="evidence", token=token):
+                evidence = evidence_rows().replace(
+                    b"release topology 0", b"release topology " + token, 1
+                )
+                with self.assertRaisesRegex(
+                    Exception, "forbidden backend-selection token"
+                ):
+                    PLAN.parse_contract(requirement_rows(), evidence)
+
+    def test_legacy_policy_id_is_rejected_fail_closed(self) -> None:
+        requirements = requirement_rows().replace(
+            b"policy.recommend_cpu", b"policy.auto_small", 1
+        )
+        evidence = evidence_rows().replace(
+            b"policy.recommend_cpu", b"policy.auto_small", 1
+        )
+        with self.assertRaisesRegex(Exception, "forbidden backend-selection token"):
+            PLAN.parse_contract(requirements, evidence)
 
     def test_noncanonical_and_unsafe_evidence_fail(self) -> None:
         with self.assertRaisesRegex(Exception, "noncanonical"):

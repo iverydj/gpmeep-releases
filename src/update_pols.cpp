@@ -87,8 +87,8 @@ bool fields_chunk::update_pols(field_type ft) {
               reason);
       }
     }
-  gpu::detail::resident_curl_session cuda_session(this,
-                                                   cuda_phase_eligible);
+  gpu::detail::conditional_resident_curl_session cuda_session(
+      this, cuda_phase_eligible);
 
   for (polarization_state *p = pol[ft]; p; p = p->next) {
 

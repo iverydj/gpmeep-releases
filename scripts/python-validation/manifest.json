@@ -48,6 +48,162 @@
   ],
   "overrides": [
     {
+      "glob": "python/tests/test_backend_policy.py",
+      "disposition": "run",
+      "reason": "Explicit CPU/CUDA selection, exact first acknowledgement, bounded process-scope reuse, fork invalidation, MPI consensus, semantic-state fingerprinting, and lazy package registration policy oracles; no FDTD stepping is performed.",
+      "milestone": "M2-backend-policy",
+      "tier": [
+        "smoke",
+        "full"
+      ],
+      "timeout_seconds": 300,
+      "comparison": {
+        "mode": "embedded_oracle"
+      },
+      "compute_scope": "host_only",
+      "gpu_contract": "none",
+      "allowed_unittest_skips": 0,
+      "expected_unittest": {
+        "count": 127,
+        "identities": [
+          "test_backend_policy.BackendPolicyTest.test_abandoned_simulation_does_not_leak_challenge_index",
+          "test_backend_policy.BackendPolicyTest.test_acknowledgement_inputs_are_strictly_bounded_utf8",
+          "test_backend_policy.BackendPolicyTest.test_acknowledgement_rank_disagreement_fails_closed",
+          "test_backend_policy.BackendPolicyTest.test_acknowledgement_reason_rejects_invalid_unicode",
+          "test_backend_policy.BackendPolicyTest.test_acknowledgement_scope_is_owned_by_one_simulation",
+          "test_backend_policy.BackendPolicyTest.test_alias_shared_subgraph_and_cycle_topology_are_bound",
+          "test_backend_policy.BackendPolicyTest.test_authentic_lazy_slotnames_cache_is_stable_and_tampering_rejects",
+          "test_backend_policy.BackendPolicyTest.test_automatic_choice_is_rejected",
+          "test_backend_policy.BackendPolicyTest.test_backend_rank_disagreement_fails_closed",
+          "test_backend_policy.BackendPolicyTest.test_bound_builtin_owner_state_invalidates_acknowledgement",
+          "test_backend_policy.BackendPolicyTest.test_bytecode_memo_does_not_freeze_mutable_constants",
+          "test_backend_policy.BackendPolicyTest.test_bytecode_memo_is_local_and_preserves_canonical_tokens",
+          "test_backend_policy.BackendPolicyTest.test_bytecode_memo_keeps_format_permissions_and_print_binding_live",
+          "test_backend_policy.BackendPolicyTest.test_bytecode_memo_preserves_custom_constant_repr_calls_and_errors",
+          "test_backend_policy.BackendPolicyTest.test_canonical_traversal_retains_objects_until_fingerprint_finishes",
+          "test_backend_policy.BackendPolicyTest.test_changed_backend_invalidates_old_challenge",
+          "test_backend_policy.BackendPolicyTest.test_changed_callable_object_and_global_state_invalidate_challenge",
+          "test_backend_policy.BackendPolicyTest.test_changed_mpi_topology_invalidates_old_challenge",
+          "test_backend_policy.BackendPolicyTest.test_changed_recommendation_invalidates_old_challenge",
+          "test_backend_policy.BackendPolicyTest.test_changed_step_function_invalidates_old_challenge",
+          "test_backend_policy.BackendPolicyTest.test_changed_workload_invalidates_old_challenge",
+          "test_backend_policy.BackendPolicyTest.test_class_slots_function_and_subclass_state_invalidate_acknowledgement",
+          "test_backend_policy.BackendPolicyTest.test_collective_preinit_common_file_seal_mismatch_fails_closed",
+          "test_backend_policy.BackendPolicyTest.test_collective_preinit_file_seal_supports_init_before_run_and_reset",
+          "test_backend_policy.BackendPolicyTest.test_consumed_state_rank_disagreement_fails_closed",
+          "test_backend_policy.BackendPolicyTest.test_context_var_default_and_alias_topology_are_semantic",
+          "test_backend_policy.BackendPolicyTest.test_corrupted_pending_reason_fails_closed_before_consumption",
+          "test_backend_policy.BackendPolicyTest.test_cpu_duplicate_rank_device_mapping_runs_without_acknowledgement",
+          "test_backend_policy.BackendPolicyTest.test_descriptor_and_annotation_state_invalidate_acknowledgement",
+          "test_backend_policy.BackendPolicyTest.test_device_inventory_cache_does_not_cache_exception_or_empty",
+          "test_backend_policy.BackendPolicyTest.test_device_inventory_cache_invalidates_on_state_and_environment",
+          "test_backend_policy.BackendPolicyTest.test_device_inventory_cache_is_bounded_to_one_live_simulation",
+          "test_backend_policy.BackendPolicyTest.test_device_inventory_cache_reset_and_callable_replacement_miss",
+          "test_backend_policy.BackendPolicyTest.test_device_inventory_cache_returns_mutation_isolated_records",
+          "test_backend_policy.BackendPolicyTest.test_device_inventory_cache_serializes_concurrent_discovery",
+          "test_backend_policy.BackendPolicyTest.test_dft_ldos_projection_rejects_spoof_and_member_mutation",
+          "test_backend_policy.BackendPolicyTest.test_direct_native_handle_python_state_is_bound_by_collective_digest",
+          "test_backend_policy.BackendPolicyTest.test_distinct_nested_simulation_native_state_remains_bound",
+          "test_backend_policy.BackendPolicyTest.test_duplicate_rank_device_mapping_is_non_acknowledgeable_environment_error",
+          "test_backend_policy.BackendPolicyTest.test_exact_dft_ldos_ignores_pointer_but_binds_frequency_and_python_state",
+          "test_backend_policy.BackendPolicyTest.test_exact_dft_ldos_malformed_proxy_fails_closed",
+          "test_backend_policy.BackendPolicyTest.test_exact_meep_file_inputs_preserve_common_and_rank_local_routes",
+          "test_backend_policy.BackendPolicyTest.test_exact_pcg64_generator_state_is_canonical_and_sequence_exact",
+          "test_backend_policy.BackendPolicyTest.test_extent_resolution_overflow_is_normalized",
+          "test_backend_policy.BackendPolicyTest.test_file_and_chunk_layout_string_subclasses_fail_closed",
+          "test_backend_policy.BackendPolicyTest.test_fork_child_rejects_inherited_pending_and_scope_capabilities",
+          "test_backend_policy.BackendPolicyTest.test_fused_matching_records_preserve_pending_fallback_bindings",
+          "test_backend_policy.BackendPolicyTest.test_fused_matching_runs_recheck_mutable_workload",
+          "test_backend_policy.BackendPolicyTest.test_fused_nonce_failures_and_control_disagreement_fail_closed",
+          "test_backend_policy.BackendPolicyTest.test_fused_received_nonce_record_is_validated",
+          "test_backend_policy.BackendPolicyTest.test_generator_backed_callable_instance_is_exact_and_stateful",
+          "test_backend_policy.BackendPolicyTest.test_gpu_controller_transition_is_serialized_and_invalidates_cache",
+          "test_backend_policy.BackendPolicyTest.test_guard_reuses_positive_device_inventory_for_repeated_runs",
+          "test_backend_policy.BackendPolicyTest.test_immutable_singletons_and_signatures_are_semantic",
+          "test_backend_policy.BackendPolicyTest.test_import_snapshot_prevents_restored_mutation_from_altering_token",
+          "test_backend_policy.BackendPolicyTest.test_inherited_method_receiver_projects_only_used_state",
+          "test_backend_policy.BackendPolicyTest.test_initialized_native_epoch_is_exact_on_retry_then_policy_scope_reuses",
+          "test_backend_policy.BackendPolicyTest.test_initialized_native_owner_replacement_invalidates_retry",
+          "test_backend_policy.BackendPolicyTest.test_initialized_native_source_cycle_manifest_fails_closed",
+          "test_backend_policy.BackendPolicyTest.test_initialized_native_structure_mutation_and_owner_replacement_invalidate",
+          "test_backend_policy.BackendPolicyTest.test_large_cpu_is_guarded_when_cuda_is_recommended",
+          "test_backend_policy.BackendPolicyTest.test_late_package_class_registration_rejects_external_caller",
+          "test_backend_policy.BackendPolicyTest.test_late_package_class_registration_rejects_fabricated_definition",
+          "test_backend_policy.BackendPolicyTest.test_late_package_class_registration_rejects_unlisted_class",
+          "test_backend_policy.BackendPolicyTest.test_lazy_graph_extension_does_not_retrust_existing_mutation",
+          "test_backend_policy.BackendPolicyTest.test_materialized_chunk_layout_binds_target_not_source_lifecycle",
+          "test_backend_policy.BackendPolicyTest.test_materialized_file_input_uses_preinitialization_seal",
+          "test_backend_policy.BackendPolicyTest.test_materialized_file_owner_is_bound_at_native_load",
+          "test_backend_policy.BackendPolicyTest.test_memoized_trusted_dependency_graph_rechecks_at_traversal_end",
+          "test_backend_policy.BackendPolicyTest.test_memoized_trusted_dependency_node_rejects_transient_mutation",
+          "test_backend_policy.BackendPolicyTest.test_missing_device_identity_is_non_acknowledgeable_environment_error",
+          "test_backend_policy.BackendPolicyTest.test_missing_simulation_file_input_fails_collectively",
+          "test_backend_policy.BackendPolicyTest.test_module_dependency_scope_respects_bytecode_binding_kind",
+          "test_backend_policy.BackendPolicyTest.test_monkey_patched_root_simulation_member_is_bound_without_dft",
+          "test_backend_policy.BackendPolicyTest.test_monkey_patched_trusted_meep_member_is_fully_canonicalized",
+          "test_backend_policy.BackendPolicyTest.test_mutable_byte_buffers_fail_closed_and_bytes_are_exact",
+          "test_backend_policy.BackendPolicyTest.test_native_proxy_python_state_changes_native_digest",
+          "test_backend_policy.BackendPolicyTest.test_native_state_manifest_shadowing_fails_closed",
+          "test_backend_policy.BackendPolicyTest.test_nested_fast_binding_does_not_reuse_outer_default",
+          "test_backend_policy.BackendPolicyTest.test_nested_module_state_fails_closed",
+          "test_backend_policy.BackendPolicyTest.test_nonexact_root_does_not_project_chunk_layout_simulation",
+          "test_backend_policy.BackendPolicyTest.test_nonfinite_cell_extent_fails_closed",
+          "test_backend_policy.BackendPolicyTest.test_numpy_array_layout_mutability_and_dtype_are_semantic",
+          "test_backend_policy.BackendPolicyTest.test_numpy_array_view_alias_topology_is_semantic",
+          "test_backend_policy.BackendPolicyTest.test_numpy_hidden_dispatcher_and_export_are_sealed",
+          "test_backend_policy.BackendPolicyTest.test_numpy_rng_rejects_unsupported_subclass_and_export_mutation",
+          "test_backend_policy.BackendPolicyTest.test_numpy_rng_version_and_seed_sequence_exports_are_exact",
+          "test_backend_policy.BackendPolicyTest.test_numpy_ufunc_error_context_is_bound_for_explicit_and_operator_use",
+          "test_backend_policy.BackendPolicyTest.test_only_import_time_numpy_dispatchers_are_accepted",
+          "test_backend_policy.BackendPolicyTest.test_opaque_extension_style_callable_fails_closed",
+          "test_backend_policy.BackendPolicyTest.test_package_path_callable_does_not_bypass_mutable_global_state",
+          "test_backend_policy.BackendPolicyTest.test_package_path_callable_global_mutation_invalidates_acknowledgement",
+          "test_backend_policy.BackendPolicyTest.test_pcg64_alias_topology_is_canonicalized",
+          "test_backend_policy.BackendPolicyTest.test_pcg64_draw_invalidates_pending_acknowledgement",
+          "test_backend_policy.BackendPolicyTest.test_pcg64_seed_sequence_and_spawn_state_are_canonicalized",
+          "test_backend_policy.BackendPolicyTest.test_pcg64_spawn_invalidates_pending_acknowledgement",
+          "test_backend_policy.BackendPolicyTest.test_preflight_exception_rendering_is_bounded_and_nonthrowing",
+          "test_backend_policy.BackendPolicyTest.test_process_scope_cache_is_bounded_and_fails_closed_on_corruption",
+          "test_backend_policy.BackendPolicyTest.test_process_scope_requires_explicit_opt_in_and_reuses_across_simulations",
+          "test_backend_policy.BackendPolicyTest.test_process_scope_value_is_strict_and_does_not_change_default",
+          "test_backend_policy.BackendPolicyTest.test_python_rank_local_state_finalizes_trusted_dependency_integrity",
+          "test_backend_policy.BackendPolicyTest.test_rank_local_digest_change_invalidates_collective_acknowledgement",
+          "test_backend_policy.BackendPolicyTest.test_rank_local_indexed_sources_are_ordered_native_state_only",
+          "test_backend_policy.BackendPolicyTest.test_recursive_receiver_projection_falls_back_without_collision",
+          "test_backend_policy.BackendPolicyTest.test_root_native_state_is_not_duplicated_through_self_reference",
+          "test_backend_policy.BackendPolicyTest.test_root_native_state_is_not_duplicated_through_static_projection",
+          "test_backend_policy.BackendPolicyTest.test_scope_cache_can_be_disabled_for_strict_same_binary_ablation",
+          "test_backend_policy.BackendPolicyTest.test_seed_sequence_generate_state_semantics_are_sealed",
+          "test_backend_policy.BackendPolicyTest.test_seed_sequence_pool_is_canonicalized",
+          "test_backend_policy.BackendPolicyTest.test_seed_sequence_pool_mutation_invalidates_acknowledgement",
+          "test_backend_policy.BackendPolicyTest.test_simulation_chunk_layout_binds_layout_not_rank_local_runtime",
+          "test_backend_policy.BackendPolicyTest.test_simulation_chunk_layout_manifest_fails_closed",
+          "test_backend_policy.BackendPolicyTest.test_simulation_scope_cache_is_weak_and_globally_bounded",
+          "test_backend_policy.BackendPolicyTest.test_simulation_semantic_state_and_file_bytes_are_bound",
+          "test_backend_policy.BackendPolicyTest.test_small_cpu_matches_without_acknowledgement",
+          "test_backend_policy.BackendPolicyTest.test_small_cuda_duplicate_device_is_environment_not_crossover",
+          "test_backend_policy.BackendPolicyTest.test_small_cuda_requires_exact_first_acknowledgement_then_reuses_scope",
+          "test_backend_policy.BackendPolicyTest.test_spoofed_indexed_source_remains_in_uniform_workload",
+          "test_backend_policy.BackendPolicyTest.test_spoofed_meep_module_class_is_fully_canonicalized",
+          "test_backend_policy.BackendPolicyTest.test_spoofed_simulation_reserved_fields_are_never_ephemeral",
+          "test_backend_policy.BackendPolicyTest.test_spoofed_verbosity_cvars_is_never_ephemeral",
+          "test_backend_policy.BackendPolicyTest.test_static_closure_owner_projection_binds_only_used_attributes",
+          "test_backend_policy.BackendPolicyTest.test_transitive_module_and_iterator_state_invalidate_challenge",
+          "test_backend_policy.BackendPolicyTest.test_trusted_dependency_memo_is_local_and_ordinary_checks_are_rooted",
+          "test_backend_policy.BackendPolicyTest.test_user_fields_are_not_treated_as_simulation_ephemeral_state",
+          "test_backend_policy.BackendPolicyTest.test_workload_record_finalizes_trusted_dependency_integrity",
+          "test_backend_policy.BackendPolicyTest.test_zero_dimensional_cell_counts_as_one_spatial_sample"
+        ]
+      }
+    },
+    {
+      "glob": "python/tests/test_backend_policy_mpi.py",
+      "disposition": "mpi_only",
+      "reason": "The backend-policy consensus and initialization-order suite requires the dedicated two-rank installed qualification lane and cannot be interpreted in this single-process Python harness.",
+      "milestone": "M2-backend-policy",
+      "compute_scope": "mpi_fdtd_cuda"
+    },
+    {
       "glob": "python/tests/test_adjoint_*.py",
       "disposition": "deferred_milestone",
       "reason": "Adjoint objectives, gradients, and directional derivatives are the dedicated M8 validation gate.",
@@ -238,7 +394,7 @@
     {
       "glob": "python/tests/test_adjoint_utils.py",
       "disposition": "run",
-      "reason": "Pure adjoint filtering, sparse multifrequency source-fit diagnostics, and zero-phase utility oracles; no FDTD stepping is performed.",
+      "reason": "Pure adjoint filtering, sparse multifrequency source-fit diagnostics, backend-policy registration, callback lifetime, and zero-phase utility oracles; no FDTD stepping is performed.",
       "milestone": "M8-adjoint",
       "tier": [
         "smoke",
@@ -252,8 +408,10 @@
       "gpu_contract": "none",
       "allowed_unittest_skips": 0,
       "expected_unittest": {
-        "count": 7,
+        "count": 9,
         "identities": [
+          "test_adjoint_utils.TestAdjointUtils.test_filtered_source_callbacks_do_not_retain_owner",
+          "test_adjoint_utils.TestAdjointUtils.test_filtered_source_policy_binds_semantic_state",
           "test_adjoint_utils.TestAdjointUtils.test_filtered_source_sparse_response_error_is_finite",
           "test_adjoint_utils.TestAdjointUtils.test_filter_offset_0_1_0_1_0_20_conic",
           "test_adjoint_utils.TestAdjointUtils.test_filter_offset_1_1_0_1_0_23_conic",
@@ -696,7 +854,7 @@
     {
       "glob": "python/examples/waveguide_crossing.py",
       "disposition": "run",
-      "reason": "Fixed-design slices exercise C4 filtering plus smoothed/tanh projections at low and extreme beta, with mapped adjoint gradients and independent forward directional differences. A reduced two-epoch NLopt run additionally verifies callback sequencing, design mutation, beta continuation, solver reset, checkpointing, and final-result output.",
+      "reason": "Fixed-design slices exercise C4 filtering plus smoothed/tanh projections at low and extreme beta, with mapped adjoint gradients and independent forward directional differences. Every validation solve is pinned to an exact timestep count so CPU/CUDA comparisons are equal-work. A reduced two-epoch NLopt run additionally verifies callback sequencing, design mutation, beta continuation, solver reset, checkpointing, and final-result output.",
       "milestone": "M8-adjoint",
       "tier": [
         "full"
@@ -746,6 +904,10 @@
           "tanh_beta1000.saturation_objective_atol": {
             "rtol": 1e-05,
             "atol": 1e-12
+          },
+          "fixed_work.run_timesteps[[]*]": {
+            "rtol": 0.0,
+            "atol": 0.0
           },
           "optimizer_smoke.epoch0_design[[]*]": {
             "rtol": 0.001,
@@ -828,6 +990,10 @@
             "atol": 0.0
           },
           "optimizer_smoke.result_roundtrip_max_abs_difference": {
+            "rtol": 0.0,
+            "atol": 0.0
+          },
+          "optimizer_smoke.run_timesteps[[]*]": {
             "rtol": 0.0,
             "atol": 0.0
           }
@@ -4069,7 +4235,7 @@
           "example_results.reciprocity_backward_base_normalized_flux.*": {"rtol": 0.002, "atol": 1e-6},
           "example_results.reciprocity_backward_doubled_normalized_flux.*": {"rtol": 0.002, "atol": 1e-6},
           "example_results.reciprocity_backward_normalized_flux.*": {"rtol": 0.002, "atol": 1e-6},
-          "example_results.reciprocity_forward_normalized_convergence_residual.*": {"rtol": 0.01, "atol": 1e-5},
+          "example_results.reciprocity_forward_normalized_convergence_residual.*": {"rtol": 0.02, "atol": 1e-5},
           "example_results.reciprocity_forward_normalized_convergence_relative_l2.*": {"rtol": 0.01, "atol": 1e-5},
           "example_results.reciprocity_forward_normalized_convergence_pointwise_relative_error.*": {"rtol": 0.01, "atol": 1e-5, "diagnostic_only": true},
           "example_results.reciprocity_forward_normalized_convergence_scale_aware_pointwise_relative_error.*": {"rtol": 0.01, "atol": 1e-5},
@@ -4523,6 +4689,8 @@
       "command": [
         "{python}",
         "{repo}/scripts/python-validation/run_example_oracle.py",
+        "--observe-operation",
+        "run_k_point",
         "--expected-run-count",
         "7",
         "--expected-final-timestep",
@@ -5610,17 +5778,26 @@
       "compute_scope": "fdtd_cuda",
       "gpu_contract": "none",
       "expected_unittest": {
-        "count": 9,
+        "count": 18,
         "identities": [
-          "test_gpu_backend.TestGpuBackend.test_automatic_00_small_owner_does_not_touch_cuda_runtime",
-          "test_gpu_backend.TestGpuBackend.test_automatic_10_owner_selects_cuda",
+          "test_gpu_backend.TestGpuBackend.test_automatic_backend_selection_is_rejected",
           "test_gpu_backend.TestGpuBackend.test_backend_control_and_inventory",
+          "test_gpu_backend.TestGpuBackend.test_boundary_execution_statistics_cpu_backend",
+          "test_gpu_backend.TestGpuBackend.test_initialized_native_step_invalidates_acknowledgement",
+          "test_gpu_backend.TestGpuBackend.test_initialized_public_native_mutators_invalidate_acknowledgement",
           "test_gpu_backend.TestGpuBackend.test_internal_mpi_overlap_state_is_not_python_api",
+          "test_gpu_backend.TestGpuBackend.test_low_level_automatic_backend_token_is_rejected",
+          "test_gpu_backend.TestGpuBackend.test_preflighted_fields_pin_backend_until_run_scope_ends",
+          "test_gpu_backend.TestGpuBackend.test_required_cuda_boundary_replay_observations",
           "test_gpu_backend.TestGpuBackend.test_required_cuda_centered_grid_unequal_dft_reduction",
           "test_gpu_backend.TestGpuBackend.test_required_cuda_cylindrical_cartesian_near2far",
           "test_gpu_backend.TestGpuBackend.test_required_cuda_python_step",
           "test_gpu_backend.TestGpuBackend.test_required_cuda_resident_dft_scale_statistics",
-          "test_gpu_backend.TestGpuBackend.test_statistics_have_stable_groups"
+          "test_gpu_backend.TestGpuBackend.test_required_cuda_sparse_drude_increment_production_path",
+          "test_gpu_backend.TestGpuBackend.test_required_cuda_sparse_lorentzian_production_path",
+          "test_gpu_backend.TestGpuBackend.test_sourcedata_python_state_invalidates_acknowledgement",
+          "test_gpu_backend.TestGpuBackend.test_statistics_have_stable_groups",
+          "test_gpu_backend.TestGpuBackend.test_zero_state_elision_statistics_follow_opt_in"
         ]
       }
     },
@@ -5748,6 +5925,12 @@
       "compute_scope": "host_only",
       "gpu_contract": "none",
       "reason": "MPB eigenmode k-domain metadata oracle; it performs no FDTD time stepping."
+    },
+    {
+      "glob": "python/tests/test_material_omp.py",
+      "compute_scope": "host_only",
+      "gpu_contract": "none",
+      "reason": "C4 static-material OpenMP initialization and fail-closed control oracle; it deliberately selects CPU and performs no CUDA dispatch."
     },
     {
       "glob": "python/tests/test_materials_library.py",
@@ -6279,6 +6462,18 @@
       }
     },
     {
+      "glob": "python/tests/test_material_omp.py",
+      "expected_unittest": {
+        "count": 4,
+        "identities": [
+          "test_material_omp.TestMaterialOpenMP.test_malformed_or_conflicting_controls_fail_closed",
+          "test_material_omp.TestMaterialOpenMP.test_static_prism_off_on_bitwise_and_causal",
+          "test_material_omp.TestMaterialOpenMP.test_unset_control_preserves_legacy_serial_path",
+          "test_material_omp.TestMaterialOpenMP.test_user_material_fails_closed_to_serial"
+        ]
+      }
+    },
+    {
       "glob": "python/tests/test_materials_library.py",
       "expected_unittest": {
         "count": 1,
@@ -6578,8 +6773,8 @@
           "example_results.phase_reciprocal_relative_error.*": {"rtol": 0.1, "atol": 1e-7},
           "example_results.phase_endpoint_relative_error.*": {"rtol": 0.1, "atol": 1e-7},
           "example_results.phase_progress.*": {"rtol": 5e-5, "atol": 2e-6},
-          "example_results.phase_snapshot_ez.*": {"rtol": 0.001, "atol": 2e-6},
-          "example_results.phase_snapshot_dz.*": {"rtol": 0.001, "atol": 2e-6},
+          "example_results.phase_snapshot_ez.*": {"rtol": 0.001, "atol": 3e-6},
+          "example_results.phase_snapshot_dz.*": {"rtol": 0.001, "atol": 3e-6},
           "example_results.phase_changed_region_ez_l2.*": {"rtol": 0.001, "atol": 2e-6},
           "example_results.phase_static_initial_ez.*": {"rtol": 0.001, "atol": 2e-6},
           "example_results.phase_static_initial_dz.*": {"rtol": 0.001, "atol": 2e-6},

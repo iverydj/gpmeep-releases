@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 SCRIPTS = pathlib.Path(__file__).resolve().parents[1]
@@ -180,6 +181,104 @@ class CondaSourceBytecodeTests(unittest.TestCase):
         probe = PROBE.probe(self.prefix, self.normalization)
         self.assertTrue(probe["pass"])
         self.assertEqual(len(probe["bytecode"]), 2)
+
+    def test_normalizer_replaces_generated_bytecode_created_after_audit(self):
+        compiled = self.compiler_records()
+        self.write_pre_audit(compiled)
+        self.generated_pyc.parent.mkdir()
+        self.generated_pyc.write_bytes(b"intervening-timestamp-bytecode")
+        intervening_sha256 = sha256(self.generated_pyc)
+
+        report = NORMALIZER.normalize(self.prefix, self.pre_audit, COMPILER)
+
+        expected = {record["path"]: record["pyc_sha256"] for record in compiled}
+        generated_path = str(self.generated_pyc.relative_to(self.prefix))
+        self.assertEqual(sha256(self.generated_pyc), expected[generated_path])
+        self.assertEqual(report["intervening_generated_bytecode_count"], 1)
+        self.assertEqual(
+            report["intervening_generated_bytecode"],
+            [
+                {
+                    "appearance_phase": "before-snapshot",
+                    "before_sha256": intervening_sha256,
+                    "before_size_bytes": len(b"intervening-timestamp-bytecode"),
+                    "path": generated_path,
+                }
+            ],
+        )
+
+    def test_normalizer_replaces_generated_bytecode_created_during_compile(self):
+        compiled = self.compiler_records()
+        self.write_pre_audit(compiled)
+        original_run = NORMALIZER.subprocess.run
+
+        def create_bytecode_after_compile(*args, **kwargs):
+            completed = original_run(*args, **kwargs)
+            self.generated_pyc.parent.mkdir()
+            self.generated_pyc.write_bytes(b"late-intervening-bytecode")
+            return completed
+
+        with mock.patch.object(
+            NORMALIZER.subprocess, "run", side_effect=create_bytecode_after_compile
+        ):
+            report = NORMALIZER.normalize(self.prefix, self.pre_audit, COMPILER)
+
+        expected = {record["path"]: record["pyc_sha256"] for record in compiled}
+        generated_path = str(self.generated_pyc.relative_to(self.prefix))
+        self.assertEqual(sha256(self.generated_pyc), expected[generated_path])
+        self.assertEqual(report["intervening_generated_bytecode_count"], 1)
+        self.assertEqual(
+            report["intervening_generated_bytecode"][0]["appearance_phase"],
+            "after-snapshot",
+        )
+
+    def test_normalizer_rejects_unsafe_generated_bytecode_created_after_audit(self):
+        compiled = self.compiler_records()
+        self.write_pre_audit(compiled)
+        self.generated_pyc.parent.mkdir()
+        outside = self.root / "outside.pyc"
+        outside.write_bytes(b"outside")
+        self.generated_pyc.symlink_to(outside)
+
+        with self.assertRaisesRegex(RuntimeError, "canonical regular file"):
+            NORMALIZER.normalize(self.prefix, self.pre_audit, COMPILER)
+
+    def test_normalizer_rejects_unsafe_generated_bytecode_created_during_compile(self):
+        compiled = self.compiler_records()
+        self.write_pre_audit(compiled)
+        original_run = NORMALIZER.subprocess.run
+
+        def create_unsafe_bytecode_after_compile(*args, **kwargs):
+            completed = original_run(*args, **kwargs)
+            self.generated_pyc.parent.mkdir()
+            outside = self.root / "late-outside.pyc"
+            outside.write_bytes(b"late-outside")
+            self.generated_pyc.symlink_to(outside)
+            return completed
+
+        with mock.patch.object(
+            NORMALIZER.subprocess,
+            "run",
+            side_effect=create_unsafe_bytecode_after_compile,
+        ), self.assertRaisesRegex(RuntimeError, "canonical regular file"):
+            NORMALIZER.normalize(self.prefix, self.pre_audit, COMPILER)
+
+    def test_normalizer_rejects_relocated_bytecode_changed_during_compile(self):
+        compiled = self.compiler_records()
+        self.write_pre_audit(compiled)
+        original_run = NORMALIZER.subprocess.run
+
+        def change_relocated_bytecode_after_compile(*args, **kwargs):
+            completed = original_run(*args, **kwargs)
+            self.relocated_pyc.write_bytes(b"changed-relocated-bytecode")
+            return completed
+
+        with mock.patch.object(
+            NORMALIZER.subprocess,
+            "run",
+            side_effect=change_relocated_bytecode_after_compile,
+        ), self.assertRaisesRegex(RuntimeError, "prefix changed before normalization"):
+            NORMALIZER.normalize(self.prefix, self.pre_audit, COMPILER)
 
     def test_normalizer_rejects_source_and_derived_digest_mutations(self):
         compiled = self.compiler_records()

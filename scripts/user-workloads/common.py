@@ -54,6 +54,9 @@ AUNP_ENGINE_POLARIZATIONS = ("physical_ex",)
 AUNP_OUTPUT_POLARIZATIONS = ("TM_Ex",)
 AUNP_DFT_MINIMUM_RUN_TIME = 20.0
 AUNP_DFT_DECAY_TOLERANCE = 5e-8
+AUNP_BACKEND_ACKNOWLEDGEMENT_REASON = (
+    "AuNP release qualification intentionally compares explicit CPU and CUDA"
+)
 GPMEEP_DISTRIBUTION_VERSION = _DISTRIBUTION_VERSION
 GPMEEP_RELEASE_MANIFEST_SCHEMA_VERSION = _RELEASE_MANIFEST_SCHEMA_VERSION
 GPMEEP_SEALED_M3_ANCHOR = _SEALED_M3_ANCHOR
@@ -92,6 +95,64 @@ def unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 
 def reject_json_constant(value: str) -> None:
     raise WorkloadError(f"non-finite JSON constant {value!r}")
+
+
+def _fsync_directory(path: pathlib.Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def durable_publish_terminal(
+    pending: pathlib.Path, complete: pathlib.Path
+) -> None:
+    """Publish one verified terminal without clobbering and durably name it.
+
+    The hard-link step preserves ``pending`` until the directory entry for
+    ``complete`` is durable.  A retry can finish cleanup after interruption.
+    """
+
+    pending = pending.absolute()
+    complete = complete.absolute()
+    if pending.parent != complete.parent:
+        raise WorkloadError("terminal paths must share one directory")
+    parent = pending.parent.resolve(strict=True)
+    if parent != pending.parent or pending.is_symlink() or complete.is_symlink():
+        raise WorkloadError("terminal publication path is unsafe")
+    if complete.exists():
+        if pending.exists():
+            pending_stat = pending.stat(follow_symlinks=False)
+            complete_stat = complete.stat(follow_symlinks=False)
+            if (pending_stat.st_dev, pending_stat.st_ino) != (
+                complete_stat.st_dev,
+                complete_stat.st_ino,
+            ):
+                raise WorkloadError("complete terminal already exists with different bytes")
+        else:
+            _fsync_directory(parent)
+            return
+    else:
+        if not pending.is_file():
+            raise WorkloadError("pending terminal is absent")
+        os.link(pending, complete, follow_symlinks=False)
+        try:
+            _fsync_directory(parent)
+        except OSError:
+            complete.unlink(missing_ok=True)
+            try:
+                _fsync_directory(parent)
+            except OSError:
+                pass
+            raise
+    try:
+        pending.unlink(missing_ok=True)
+        _fsync_directory(parent)
+    except OSError:
+        # ``complete`` already has durable bytes.  A retry enters the branch
+        # above and deterministically finishes any remaining cleanup.
+        raise
 
 
 def aunp_qualification_profile() -> dict[str, Any]:
@@ -890,6 +951,10 @@ def validate_package_provenance_attestation(
         "runtime",
         "report_id",
     }
+    if GPMEEP_DISTRIBUTION_VERSION == "1.1.0":
+        required.add("v110_candidate_gate")
+        if isinstance(report, dict) and "v110_final_release" in report:
+            required.add("v110_final_release")
     if not isinstance(report, dict) or set(report) != required:
         raise WorkloadError("installed package provenance schema differs")
     if report.get("schema_version") != 1 or report.get("state") != "PASS":
@@ -964,6 +1029,30 @@ def validate_package_provenance_attestation(
         )
     except ReleaseManifestError as exc:
         raise WorkloadError(f"installed package release contract differs: {exc}") from exc
+    if GPMEEP_DISTRIBUTION_VERSION == "1.1.0":
+        candidate = report.get("v110_candidate_gate")
+        authorization = candidate.get("authorization") if isinstance(candidate, dict) else None
+        if (
+            not isinstance(candidate, dict)
+            or candidate.get("state") != "CANDIDATE_BUILD_AUTHORIZED"
+            or candidate.get("source_commit") != expected_source_commit
+            or not isinstance(candidate.get("receipt_id"), str)
+            or not _lower_hex(candidate["receipt_id"], 64)
+            or not isinstance(authorization, dict)
+            or authorization.get("candidate_build") is not True
+            or authorization.get("package_publication") is not False
+            or authorization.get("git_tag") is not False
+        ):
+            raise WorkloadError("installed package candidate authority differs")
+        final = report.get("v110_final_release")
+        if final is not None and (
+            not isinstance(final, dict)
+            or final.get("state") != "RELEASE_AUTHORIZED"
+            or final.get("package", {}).get("sha256") != expected_package_sha256
+            or final.get("candidate_authority", {}).get("receipt_id")
+            != candidate["receipt_id"]
+        ):
+            raise WorkloadError("installed package final release authority differs")
 
     ownership = report.get("ownership")
     if (

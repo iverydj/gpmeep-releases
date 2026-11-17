@@ -53,6 +53,9 @@ dependencies:
   - matplotlib-base
   - parameterized
   - pytest
+  # The M4 controller validates the normative inversion registry both before
+  # a campaign and while sealing its terminal evidence.
+  - jsonschema=4.26.0
   - nlopt
   - trimesh
   - gdstk=1.0.1

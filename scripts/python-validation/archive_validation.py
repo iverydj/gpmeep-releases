@@ -94,6 +94,8 @@ def trusted_tar() -> pathlib.Path:
     )
 RUN_RECORD_KEYS = {
     "backend",
+    "backend_acknowledgement_requested",
+    "backend_acknowledgement_reason",
     "command",
     "cwd",
     "evidence_case_directory",
@@ -253,6 +255,9 @@ FIXED_REPO_INPUTS = {
     ),
     "gpmeep_qualification_contract.py": pathlib.PurePosixPath(
         "scripts/gpmeep_qualification_contract.py"
+    ),
+    "gpmeep_backend_guard.py": pathlib.PurePosixPath(
+        "scripts/gpmeep_backend_guard.py"
     ),
     "gpmeep-control-python.py": pathlib.PurePosixPath(
         "scripts/gpmeep-control-python.py"
@@ -1263,6 +1268,22 @@ def _canonical_case_command(
         raise ArchiveError(f"cannot reconstruct case command: {exc}") from exc
 
 
+def _backend_guard_owner_index(
+    command: list[str], expected_repository: pathlib.Path
+) -> int | None:
+    # Replay retains the original command paths. Its adapters are authenticated
+    # by FIXED_REPO_INPUTS and the receipt source closure, not by live lstat at
+    # those original paths (which need not exist after relocation).
+    owner_paths = frozenset(
+        str(expected_repository / "scripts/python-validation" / name)
+        for name in runner_contract.BACKEND_GUARD_OWNER_FILENAMES
+    )
+    try:
+        return runner_contract.backend_guard_owner_position(command, owner_paths)
+    except runner_contract.ManifestError as exc:
+        raise ArchiveError(f"run backend guard owner differs: {exc}") from exc
+
+
 def _raw_run_member(
     evidence_root: pathlib.Path,
     run: dict[str, Any],
@@ -1292,6 +1313,7 @@ def _verify_run_environment_contract(
     expected_repository: pathlib.Path,
     evidence_root: pathlib.Path,
     bind_output_root: bool,
+    guard_owner_index: int | None,
 ) -> None:
     contract = _require_dict(
         run.get("environment_contract"), "run environment contract"
@@ -1313,15 +1335,43 @@ def _verify_run_environment_contract(
     ):
         raise ArchiveError("run exact environment digest differs")
 
+    acknowledgement_requested = run.get("backend_acknowledgement_requested")
+    acknowledgement_reason = run.get("backend_acknowledgement_reason")
+    if (
+        not isinstance(acknowledgement_requested, bool)
+        or acknowledgement_requested is not (acknowledgement_reason is not None)
+    ):
+        raise ArchiveError("run backend acknowledgement identity differs")
+    if acknowledgement_reason is not None:
+        try:
+            runner_contract.backend_guard.validate_reason(acknowledgement_reason)
+        except runner_contract.backend_guard.BackendGuardEvidenceError as exc:
+            raise ArchiveError(
+                f"run backend acknowledgement reason differs: {exc}"
+            ) from exc
+    # Reuse the canonical base command's owner. The inserted acknowledgement
+    # reason is arbitrary text and must not be interpreted as a command path.
+    site_guard_expected = bool(
+        acknowledgement_reason is not None and guard_owner_index is None
+    )
+
     allowed = (
         set(runner_contract.SAFE_AMBIENT_ENVIRONMENT)
         | {"CUDA_VISIBLE_DEVICES", "CUDA_DEVICE_ORDER"}
         | RUN_CONTROLLED_ENVIRONMENT
         | ({"GPMEEP_VALIDATION_STRICT_CUDA"} if backend == "cuda" else set())
+        | ({"GPMEEP_VALIDATION_GPU_OBSERVATION"} if backend == "cuda" else set())
+        | (
+            {"GPMEEP_VALIDATION_BACKEND_ACKNOWLEDGEMENT_REASON"}
+            if site_guard_expected
+            else set()
+        )
     )
     required = set(RUN_CONTROLLED_ENVIRONMENT)
     if backend == "cuda":
         required.add("GPMEEP_VALIDATION_STRICT_CUDA")
+    if site_guard_expected:
+        required.add("GPMEEP_VALIDATION_BACKEND_ACKNOWLEDGEMENT_REASON")
     if not required.issubset(environment) or not set(environment).issubset(allowed):
         raise ArchiveError("run exact environment key allowlist differs")
 
@@ -1428,6 +1478,10 @@ def _verify_run_environment_contract(
     }
     if backend == "cuda":
         fixed_values["GPMEEP_VALIDATION_STRICT_CUDA"] = "1"
+    if site_guard_expected:
+        fixed_values["GPMEEP_VALIDATION_BACKEND_ACKNOWLEDGEMENT_REASON"] = (
+            acknowledgement_reason
+        )
     if any(environment.get(key) != value for key, value in fixed_values.items()):
         raise ArchiveError("run controlled environment value differs")
 
@@ -1603,13 +1657,41 @@ def _replay_report_semantics(
             continue
         if list(sorted(runs)) != list(sorted(configuration["backends"])):
             raise ArchiveError("case run backends differ from configuration")
-        expected_command = _canonical_case_command(
+        base_expected_command = _canonical_case_command(
             case, report, expected_repository, expected_python
         )
         for backend, run_value in runs.items():
             run = _require_dict(run_value, f"run {backend}")
             if set(run) != RUN_RECORD_KEYS:
                 raise ArchiveError("run record has unexpected or missing fields")
+            acknowledgement_reason = run.get("backend_acknowledgement_reason")
+            requested = run.get("backend_acknowledgement_requested")
+            if (
+                not isinstance(requested, bool)
+                or requested is not (acknowledgement_reason is not None)
+            ):
+                raise ArchiveError("run backend acknowledgement identity differs")
+            owner_index = _backend_guard_owner_index(
+                base_expected_command, expected_repository
+            )
+            try:
+                runner_contract.reject_preexisting_backend_acknowledgement(
+                    base_expected_command,
+                    reject_abbreviations=owner_index is not None,
+                )
+            except runner_contract.ManifestError as exc:
+                raise ArchiveError(
+                    f"cannot reconstruct acknowledged case command: {exc}"
+                ) from exc
+            expected_command = list(base_expected_command)
+            if acknowledgement_reason is not None and owner_index is not None:
+                expected_command[owner_index + 1 : owner_index + 1] = [
+                    runner_contract.BACKEND_ACKNOWLEDGEMENT_OPTION,
+                    acknowledgement_reason,
+                ]
+            site_guard_expected = bool(
+                acknowledgement_reason is not None and owner_index is None
+            )
             if run.get("backend") != backend or run.get("command") != expected_command:
                 raise ArchiveError(
                     f"case {result['path']!r} command differs from manifest"
@@ -1635,6 +1717,7 @@ def _replay_report_semantics(
                 expected_repository=expected_repository,
                 evidence_root=evidence_root,
                 bind_output_root=bind_environment_to_evidence_root,
+                guard_owner_index=owner_index,
             )
             stats_path = _raw_run_member(
                 evidence_root, run, backend, "statistics"
@@ -1672,6 +1755,13 @@ def _replay_report_semantics(
                     raw_stats,
                     start_runtime,
                     run.get("run_nonce"),
+                    acknowledgement_reason,
+                    site_guard_expected,
+                    (
+                        json.loads(run["environment_contract"]["environment"]["GPMEEP_VALIDATION_GPU_OBSERVATION"])
+                        if "GPMEEP_VALIDATION_GPU_OBSERVATION" in run["environment_contract"]["environment"]
+                        else None
+                    ),
                 )
             )
             stdout_size = stdout_path.stat().st_size

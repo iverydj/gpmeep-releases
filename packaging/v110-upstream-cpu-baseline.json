@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "baseline_id": "upstream-meep-3be5b944-cpu-mpi-python-fp32",
+  "source": {
+    "archive_sha256": "a9e92dbdf820820b341965c368a5e8c34241e79a142318421da1ed0751527202",
+    "archive_top_level_directory": "meep-master",
+    "upstream_commit": "3be5b944ebf2358a1c3433773e477453d1e36ae5"
+  },
+  "dependency_environment": {
+    "lock_path": "environment/locks/cuda-mpi-linux-64.lock",
+    "lock_sha256": "88a9f0a1e177b9720df92199ef84d416d4fe9984620314fe42702ad27ef6c901",
+    "prefix_path": ".envs/meep-gpu-cuda-mpi"
+  },
+  "build": {
+    "configure_arguments": [
+      "--enable-maintainer-mode",
+      "--enable-shared",
+      "--enable-single",
+      "--with-openmp",
+      "--with-mpi",
+      "--with-python",
+      "--without-scheme"
+    ],
+    "build_directory": "build/upstream-meep-cpu-mpi-python-fp32",
+    "build_layout": "in_tree_inside_fresh_archive_copy",
+    "install_prefix": "install/upstream-meep-cpu-mpi-python-fp32",
+    "builder": "scripts/build-upstream-meep-cpu-mpi-python-fp32.sh",
+    "required_cxx_optimization_flag": "-O2",
+    "qualification": {
+      "python_mpi_two_rank_smoke": "qualification-logs/python-mpi-two-rank-smoke.log",
+      "python_single_process_import": "qualification-logs/python-single-process-import.log",
+      "upstream_binary_partition_utils": "qualification-logs/upstream-binary-partition-utils.log",
+      "upstream_build_configuration": "source/meep-master/Makefile",
+      "upstream_dependency_package_set": "qualification-logs/upstream-dependency-package-set.log",
+      "upstream_fontconfig_configuration": "qualification-fontconfig.conf"
+    }
+  },
+  "measurement_role": "M3 upstream Meep FP32 CPU comparison lane only",
+  "gpu_backend_forbidden": true,
+  "scheme_forbidden": true
+}

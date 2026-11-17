@@ -25,34 +25,41 @@ COMMIT = "a" * 40
 
 def report() -> dict[str, object]:
     return {
-        "schema": "gpmeep-m3-release-aggregation-v3",
-        "requirement_closure": {
-            "outcome": "PASS_WITH_EXPLICIT_M4_DEFERRED_SCOPE",
-            "achieved_count": 11,
-            "deferred_count": 3,
-            "achieved": [
-                {
-                    "requirement_id": f"fixture.achieved.{index}",
-                    "outcome": "PASS",
-                }
-                for index in range(11)
-            ],
-            "deferred": [
-                {
-                    "requirement_id": requirement_id,
-                    "outcome": "DEFERRED_TO_M4_COORDINATION",
-                }
-                for requirement_id in (
-                    "m4.portable_gpu_distribution",
-                    "m4.private_github_release",
-                    "m4.long_horizon_dispatch",
-                )
-            ],
+        "schema": SEAL.aggregation.SCHEMA,
+        "outcome": "PASS",
+        "source": {
+            "repository": "REPLACED_BY_FIXTURE",
+            "git_commit": COMMIT,
+            "git_status_porcelain": "",
         },
-        "adversarial_audits": {
-            "m1": {"outcome": "PASS"},
-            "m2": {"outcome": "PASS"},
+        "next_action": "STOP_FOR_M4_COORDINATION_AFTER_M3_ADVERSARIAL_AUDIT",
+        "backend_policy": {
+            "outcome": "PASS",
+            "backend_selection": "user-explicit-only",
+            "automatic_backend_selection": False,
+            "classification_unit": "guard-event",
+            "case_level_recommendations_used": False,
+            "aggregate": {
+                "classification_unit": "guard-event",
+                "total_event_count": 4,
+                "direction_counts": {
+                    direction: 1
+                    for direction in (
+                        SEAL.aggregation.explicit_policy_evidence.DIRECTIONS
+                    )
+                },
+                "all_selected_recommended_directions_present": True,
+            },
+            "feature_ids": list(
+                SEAL.aggregation.explicit_policy_evidence.EXPECTED_FEATURES
+            ),
         },
+        "official_meep_examples": {
+            "outcome": "PASS",
+            "feature_count": 42,
+            "total_physical_units": 79,
+        },
+        "aunp": {"outcome": "PASS", "adversarial_audit": {"outcome": "PASS"}},
     }
 
 
@@ -104,12 +111,16 @@ class M3PostAuditReleaseTests(unittest.TestCase):
         aggregate_report: dict[str, object] | None = None,
     ) -> dict[str, object]:
         source = {"repo": str(repo), "commit": COMMIT, "status_porcelain": ""}
+        selected_report = aggregate_report or report()
+        if selected_report.get("source", {}).get("repository") == "REPLACED_BY_FIXTURE":
+            selected_report = {**selected_report, "source": dict(selected_report["source"])}
+            selected_report["source"]["repository"] = str(repo)
         with mock.patch.object(
             SEAL, "_source_state", return_value=source
         ), mock.patch.object(
             SEAL.aggregation,
             "verify_complete",
-            return_value=aggregate_report or report(),
+            return_value=selected_report,
         ), mock.patch.object(
             SEAL.audit_seal, "verify", return_value=audit_value
         ):
@@ -123,12 +134,12 @@ class M3PostAuditReleaseTests(unittest.TestCase):
             value = self.derive(repo, aggregate, audit, audit_value)
         self.assertEqual(value["outcome"], "PASS")
         self.assertEqual(
-            value["release_status"], "M1_M3_COMPLETE_M4_COORDINATION_REQUIRED"
+            value["release_status"], "M3_COMPLETE_M4_COORDINATION_REQUIRED"
         )
         self.assertEqual(value["next_action"], "STOP_FOR_M4_COORDINATION")
-        self.assertEqual(value["adversarial_milestones"], ["M1", "M2", "M3"])
+        self.assertEqual(value["adversarial_milestones"], ["M2", "M3"])
         self.assertEqual(
-            value["aggregation"]["requested_scope"]["achieved_count"], 11
+            value["aggregation"]["requested_scope"]["feature_count"], 42
         )
 
     def test_m3_audit_binding_and_material_closure_fail_closed(self) -> None:
@@ -154,27 +165,46 @@ class M3PostAuditReleaseTests(unittest.TestCase):
                 ):
                     self.derive(repo, aggregate, audit, changed)
 
-    def test_requested_scope_must_be_exact_and_explicit(self) -> None:
+    def test_current_scope_policy_must_be_exact_and_explicit(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             repo, aggregate, audit, audit_value = self.fixture(
                 pathlib.Path(raw).resolve()
             )
             changed = report()
-            changed["requirement_closure"]["achieved"].pop()
-            with self.assertRaisesRegex(SEAL.PostAuditError, "requested-scope"):
+            changed["backend_policy"]["automatic_backend_selection"] = True
+            with self.assertRaisesRegex(SEAL.PostAuditError, "current-scope"):
                 self.derive(repo, aggregate, audit, audit_value, changed)
             changed = report()
-            changed["requirement_closure"]["deferred"][0][
-                "requirement_id"
-            ] = "m4.unknown"
-            with self.assertRaisesRegex(SEAL.PostAuditError, "M4 deferred"):
+            changed["backend_policy"]["feature_ids"].pop()
+            with self.assertRaisesRegex(SEAL.PostAuditError, "current-scope"):
+                self.derive(repo, aggregate, audit, audit_value, changed)
+            changed = report()
+            changed["backend_policy"]["classification_unit"] = "case"
+            with self.assertRaisesRegex(SEAL.PostAuditError, "classification"):
+                self.derive(repo, aggregate, audit, audit_value, changed)
+            changed = report()
+            changed["backend_policy"]["aggregate"]["direction_counts"][
+                "cpu_selected__cpu_recommended"
+            ] = 0
+            with self.assertRaisesRegex(SEAL.PostAuditError, "aggregate"):
+                self.derive(repo, aggregate, audit, audit_value, changed)
+
+    def test_aggregation_source_commit_is_bound_to_release_source(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            repo, aggregate, audit, audit_value = self.fixture(
+                pathlib.Path(raw).resolve()
+            )
+            changed = report()
+            changed["source"]["repository"] = str(repo)
+            changed["source"]["git_commit"] = "b" * 40
+            with self.assertRaisesRegex(SEAL.PostAuditError, "aggregation/source"):
                 self.derive(repo, aggregate, audit, audit_value, changed)
 
     def test_publication_is_exclusive_and_exactly_replayed(self) -> None:
         value = {
             "schema": SEAL.SCHEMA,
             "outcome": "PASS",
-            "release_status": "M1_M3_COMPLETE_M4_COORDINATION_REQUIRED",
+            "release_status": "M3_COMPLETE_M4_COORDINATION_REQUIRED",
             "next_action": "STOP_FOR_M4_COORDINATION",
             "source": {"repo": "/repo"},
             "aggregation": {"root": "/aggregate"},

@@ -40,7 +40,7 @@ class LazyPythonApiTests(unittest.TestCase):
             relative: (tuple(selectors), count)
             for relative, selectors, count in contract.INSTALLED_LAZY_API_TEST_SPECS
         }
-        self.assertEqual(specs["python/tests/test_adjoint_utils.py"], ((), 7))
+        self.assertEqual(specs["python/tests/test_adjoint_utils.py"], ((), 9))
         selectors, count = specs["python/tests/test_adjoint_jax.py"]
         self.assertEqual(count, 3)
         self.assertIn(

@@ -22,11 +22,14 @@ import time
 from typing import Any
 
 SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
-if str(SCRIPT_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPT_DIR))
+SCRIPTS_DIR = SCRIPT_DIR.parent
+for import_root in (SCRIPT_DIR, SCRIPTS_DIR):
+    if str(import_root) not in sys.path:
+        sys.path.insert(0, str(import_root))
 
 from common import (  # noqa: E402
     AUNP_ARCHIVE_SHA256,
+    AUNP_BACKEND_ACKNOWLEDGEMENT_REASON,
     AUNP_DFT_DECAY_TOLERANCE,
     AUNP_DFT_MINIMUM_RUN_TIME,
     AUNP_ENGINE_POLARIZATIONS,
@@ -50,9 +53,10 @@ from common import (  # noqa: E402
     verify_build_receipt_collective,
 )
 import aunp_exact_resume as exact_resume  # noqa: E402
+import gpmeep_backend_guard as backend_guard  # noqa: E402
 
 
-SCHEMA = "gpmeep-aunp-r4000-workload-v4"
+SCHEMA = "gpmeep-aunp-r4000-workload-v5"
 PHASE_CONTRACT = [
     {
         "stage": stage,
@@ -83,6 +87,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output", required=True, type=pathlib.Path)
     parser.add_argument("--build-receipt", required=True, type=pathlib.Path)
     parser.add_argument("--expected-backend", required=True, choices=("cpu", "cuda"))
+    parser.add_argument(
+        "--acknowledge-backend-mismatch-reason", required=True
+    )
     return parser.parse_args(argv)
 
 
@@ -104,6 +111,16 @@ def _validate_backend_record(record: dict[str, Any], expected_backend: str) -> N
         )
     if record["timestep_delta"] <= 0 or record["wall_seconds"] <= 0:
         raise WorkloadError("AuNP did not perform positive timed FDTD work")
+    try:
+        backend_guard.validate_evidence(
+            record.get("backend_guard"),
+            expected_backend=expected_backend,
+            expected_reason=AUNP_BACKEND_ACKNOWLEDGEMENT_REASON,
+        )
+    except backend_guard.BackendGuardEvidenceError as exc:
+        raise WorkloadError(
+            f"AuNP exact backend-guard evidence differs: {exc}"
+        ) from exc
 
 
 def _utc_now() -> str:
@@ -284,6 +301,11 @@ def _postprocess_tm_only(engine: Any, cfg: Any, root: pathlib.Path) -> pathlib.P
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    if (
+        args.acknowledge_backend_mismatch_reason
+        != AUNP_BACKEND_ACKNOWLEDGEMENT_REASON
+    ):
+        raise WorkloadError("AuNP exact acknowledgement reason differs")
     archive = verify_file(args.archive, AUNP_ARCHIVE_SHA256, "AuNP archive")
     output = args.output.resolve()
 
@@ -516,10 +538,22 @@ def main(argv: list[str] | None = None) -> int:
         before_timestep = int(simulation.fields.t) if simulation.fields is not None else 0
         before_stats_full = json_safe(mp.gpu.statistics())
         comm.Barrier()
-        started = time.perf_counter()
-        result = original_run(simulation, *step_functions, **kwargs)
+        result, backend_guard_evidence = backend_guard.invoke_with_acknowledgement(
+            mp,
+            simulation,
+            lambda: backend_guard.invoke_pristine_class_method(
+                mp.Simulation,
+                "run",
+                audited_run,
+                original_run,
+                simulation,
+                step_functions,
+                kwargs,
+            ),
+            args.acknowledge_backend_mismatch_reason,
+        )
         comm.Barrier()
-        wall_seconds = time.perf_counter() - started
+        wall_seconds = backend_guard_evidence["execution_wall_seconds"]
         record = None
         validation_error = None
         try:
@@ -532,6 +566,7 @@ def main(argv: list[str] | None = None) -> int:
                 "timestep_delta": int(simulation.timestep()) - before_timestep,
                 "meep_time": float(simulation.meep_time()),
                 "wall_seconds": wall_seconds,
+                "backend_guard": backend_guard_evidence,
                 "active_backend": str(mp.gpu.active_backend),
                 "requested_backend": str(
                     getattr(mp.gpu, "requested_backend", mp.gpu.active_backend)
@@ -1020,7 +1055,7 @@ def main(argv: list[str] | None = None) -> int:
             atomic_write_json(
                 output / "COMPLETE",
                 {
-                    "schema": "gpmeep-aunp-r4000-workload-complete-v4",
+                    "schema": "gpmeep-aunp-r4000-workload-complete-v5",
                     "summary": file_record(output / "summary.json", output),
                 },
             )

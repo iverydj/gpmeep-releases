@@ -258,6 +258,52 @@ void step_curl_material_phase_batched_fp32(
     const std::uint32_t *block_operation_indices,
     std::size_t operation_count, std::size_t total_block_count);
 
+// Reusable CUDA-graph submission of the ordinary structured curl kernels.
+// Unlike step_curl_material_phase_batched_fp32, this preserves one specialized
+// structured kernel node per operation and only removes repeated host launch
+// submission. Operations execute in input order. All nested pointers and
+// allocation lifetimes remain owned by the caller.  Destruction is a
+// synchronous lifetime fence on the graph's creation device: true means the
+// executable was quiesced and destroyed, so captured allocations may be
+// reclaimed.  False means device selection, synchronization, or executable
+// destruction failed; the graph handle remains live and the caller must
+// quarantine both it and every captured allocation for the rest of the
+// process.
+struct structured_curl_graph_fp32;
+structured_curl_graph_fp32 *create_structured_curl_graph_fp32(
+    const curl_phase_operation_fp32 *operations,
+    std::size_t operation_count, int threads_per_block = 256);
+void launch_structured_curl_graph_fp32(
+    structured_curl_graph_fp32 *graph);
+bool destroy_structured_curl_graph_fp32(
+    structured_curl_graph_fp32 *graph) noexcept;
+
+// Destructive test-only failure hooks.  The API-return hook fails at the
+// cudaGraphLaunch call boundary.  The post-enqueue hook submits a real graph
+// and then injects a synthetic C++ exception; it proves uncertain-completion
+// handling but is not a CUDA-reported asynchronous failure.  The destroy hook
+// synthetically rejects the lifetime fence before cudaDeviceSynchronize.  The
+// asynchronous-device hook instead submits a real trap kernel immediately
+// before the destroy fence, after creation-device selection, so the following
+// cudaDeviceSynchronize must observe the execution error without an
+// intervening CUDA API.  That hook poisons the CUDA context and may be used
+// only by a process-isolated test which does no subsequent device work.
+// Production leaves all controls at zero.
+void set_structured_curl_graph_launch_api_failures_for_testing(
+    std::uint64_t count) noexcept;
+void set_structured_curl_graph_post_enqueue_failures_for_testing(
+    std::uint64_t count) noexcept;
+void set_structured_curl_graph_destroy_sync_failures_for_testing(
+    std::uint64_t count) noexcept;
+void set_structured_curl_graph_async_device_failures_for_testing(
+    std::uint64_t count) noexcept;
+std::uint64_t
+structured_curl_graph_destroy_cuda_sync_failures_for_testing() noexcept;
+// Returns the thread's actual CUDA runtime ordinal, or -1 if it cannot be
+// queried.  Tests use this to distinguish runtime state from the configured
+// gpmeep device policy.
+int current_device_ordinal_for_testing() noexcept;
+
 struct beta_material_fp32 {
   const float *sigma_inverse;
   float *field_u;
@@ -395,7 +441,97 @@ struct lorentzian_material_fp32 {
   float gamma_previous;
   float omega_dt_squared;
   float omega_dt_squared_denominator;
+  // Keep source compatibility with callers that default-construct this
+  // public descriptor and assign the original seven fields individually.
+  // Experiments must remain disabled unless a caller explicitly opts in.
+  std::uint32_t options = 0;
 };
+
+enum lorentzian_option_fp32 : std::uint32_t {
+  lorentzian_elide_bit_identical_positive_zero_fp32 = 1U << 0
+};
+
+constexpr std::size_t lorentzian_sparse_compaction_block_size = 256;
+
+enum lorentzian_sparse_plan_validation_fp32 : std::uint32_t {
+  lorentzian_sparse_coefficient_unsafe_fp32 = 1U << 0,
+  lorentzian_sparse_fill_invalid_fp32 = 1U << 1
+};
+
+// Device-resident causal ledger for the experimental guarded sparse path.
+// The runtime updates these counters inside the branch that actually runs;
+// callers may read them only after an explicit checked synchronization.
+struct lorentzian_sparse_execution_ledger_fp32 {
+  std::uint64_t guard_scan_calls;
+  std::uint64_t guard_scan_points;
+  std::uint64_t sparse_update_calls;
+  std::uint64_t sparse_update_points;
+  std::uint64_t dense_fallback_calls;
+  std::uint64_t dense_fallback_points;
+  std::uint32_t counter_overflow;
+  std::uint32_t reserved;
+};
+
+// Number of fixed logical blocks required by the deterministic compaction
+// primitives below.  This operation is host-only and cannot overflow.
+std::size_t lorentzian_sparse_compaction_block_count(
+    std::size_t point_count) noexcept;
+
+// First compaction pass. One uint32 count is written for every fixed logical
+// block. Coefficient safety is evaluated on the device; an unsafe tuple makes
+// every point active and ORs coefficient_unsafe into plan_validation_flag.
+// The caller initializes the flag to zero and must reject a nonzero flag.
+void count_lorentzian_sparse_active_blocks_fp32(
+    const float *polarization, const float *auxiliary,
+    const index_space_fp32 &index_space, std::size_t count,
+    const lorentzian_material_fp32 &material, bool increment_state,
+    std::uint32_t *block_counts, std::uint32_t *plan_validation_flag);
+
+// Second compaction pass. block_offsets is the checked exclusive prefix of
+// the first-pass counts. The output is deterministic and sorted in structured
+// point order. The validation flag is ORed with fill_invalid for checked-
+// addition overflow, a nonzero first offset, discontinuity between blocks, a
+// write past active_count, or a final-total mismatch. Callers must check the
+// same flag after completion before publishing a plan.
+void fill_lorentzian_sparse_active_indices_fp32(
+    const float *polarization, const float *auxiliary,
+    const index_space_fp32 &index_space, std::size_t count,
+    const lorentzian_material_fp32 &material, bool increment_state,
+    const std::uint64_t *block_offsets, std::size_t active_count,
+    std::ptrdiff_t *active_indices,
+    std::uint32_t *plan_validation_flag);
+
+// Sticky full-domain finite-field guard. The flag is only ever set, never
+// cleared, by this operation. The guard scan and causal ledger update are
+// enqueued in the current default stream.
+void scan_lorentzian_sparse_field_finite_fp32(
+    const float *field, const index_space_fp32 &index_space,
+    std::size_t count, std::uint32_t *sticky_nonfinite,
+    lorentzian_sparse_execution_ledger_fp32 *ledger);
+
+// Conditional sparse/dense updates. Zero plan-validation and sticky flags
+// execute the sorted indexed domain; either nonzero flag executes the complete
+// structured domain. Off-diagonal material pointers are rejected because C3
+// is isotropic-only.
+void update_lorentzian_sparse_guarded_fp32(
+    float *polarization, float *previous_polarization, const float *field,
+    const std::ptrdiff_t *active_indices, std::size_t active_count,
+    const index_space_fp32 &index_space, std::size_t structured_count,
+    const lorentzian_material_fp32 &material,
+    const std::uint32_t *plan_validation_flag,
+    const std::uint32_t *sticky_nonfinite,
+    lorentzian_sparse_execution_ledger_fp32 *ledger,
+    int threads_per_block = 256);
+
+void update_lorentzian_increment_sparse_guarded_fp32(
+    float *polarization, float *polarization_increment, const float *field,
+    const std::ptrdiff_t *active_indices, std::size_t active_count,
+    const index_space_fp32 &index_space, std::size_t structured_count,
+    const lorentzian_material_fp32 &material,
+    const std::uint32_t *plan_validation_flag,
+    const std::uint32_t *sticky_nonfinite,
+    lorentzian_sparse_execution_ledger_fp32 *ledger,
+    int threads_per_block = 256);
 
 // Cartesian FP32 Lorentzian/Drude polarization update. The explicit indices
 // identify the owned Yee points. Optional off-diagonal sigma rows use the

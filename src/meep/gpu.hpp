@@ -27,14 +27,11 @@ struct runtime_touch_statistics {
   std::uint64_t device_selections;
 };
 
-// The CPU backend remains the default. "automatic" first applies a
-// workload/observed-CPU-team floor without touching CUDA, then uses selected
-// device bandwidth facts for larger owners. A fields owner is entirely CPU
-// or entirely CUDA for a validated time step; unsupported CUDA features do
-// not create mixed per-chunk execution.
-// "cuda" requires CUDA and rejects unsupported field-update configurations
-// before modifying a time step.
-enum class backend_mode { cpu, automatic, cuda };
+// The user chooses CPU or CUDA; gpmeep never switches between them. The
+// explicit numeric values preserve the historical Python binding tokens while
+// leaving token 1 invalid. CUDA rejects unsupported field-update
+// configurations before modifying a time step.
+enum class backend_mode { cpu = 0, cuda = 2 };
 
 struct dispatch_statistics {
   std::uint64_t cpu_curl_calls;
@@ -64,6 +61,53 @@ struct polarization_statistics {
   std::uint64_t cpu_update_points;
   std::uint64_t cuda_update_calls;
   std::uint64_t cuda_update_points;
+  // Launch-level causal counters for the experimental zero-state path.
+  // "Inspectable" means diagonal material with finite recurrence
+  // coefficients; the exact per-point bit predicate is evaluated on-device.
+  std::uint64_t cuda_zero_state_elision_enabled_calls;
+  std::uint64_t cuda_zero_state_elision_enabled_points;
+  std::uint64_t cuda_zero_state_elision_inspectable_calls;
+  std::uint64_t cuda_zero_state_elision_inspectable_points;
+};
+
+// Checked evidence for the opt-in resident sparse Lorentzian/Drude path.
+// Submission counters are host-side; the final six execution counters are
+// read from causal device ledgers only by get_sparse_lorentzian_statistics().
+struct sparse_lorentzian_statistics {
+  std::uint64_t opt_in_calls;
+  std::uint64_t opt_in_points;
+  std::uint64_t eligible_calls;
+  std::uint64_t eligible_points;
+  std::uint64_t ineligible_calls;
+  std::uint64_t ineligible_points;
+  std::uint64_t first_observation_dense_calls;
+  std::uint64_t first_observation_dense_points;
+  std::uint64_t plan_build_attempts;
+  std::uint64_t plan_build_successes;
+  std::uint64_t plan_build_failures;
+  std::uint64_t plan_hits;
+  std::uint64_t plan_invalidations;
+  std::uint64_t dense_locked_decisions;
+  std::uint64_t accepted_total_points;
+  std::uint64_t accepted_active_points;
+  std::uint64_t sparse_submission_calls;
+  std::uint64_t sparse_submission_points;
+  std::uint64_t guard_scan_submissions;
+  std::uint64_t guard_scan_submission_points;
+  std::uint64_t cpu_fallback_calls;
+  std::uint64_t cpu_fallback_points;
+  std::uint64_t device_guard_scan_calls;
+  std::uint64_t device_guard_scan_points;
+  std::uint64_t device_sparse_update_calls;
+  std::uint64_t device_sparse_update_points;
+  std::uint64_t device_dense_fallback_calls;
+  std::uint64_t device_dense_fallback_points;
+  std::uint64_t live_plans;
+  std::uint64_t live_guards;
+  std::uint64_t retained_index_bytes;
+  std::uint64_t reset_generation;
+  bool counter_overflow;
+  bool teardown_incomplete;
 };
 
 struct source_statistics {
@@ -78,6 +122,75 @@ struct boundary_statistics {
   std::uint64_t cpu_update_points;
   std::uint64_t cuda_update_calls;
   std::uint64_t cuda_update_points;
+};
+
+// Additive, process-wide, non-synchronizing boundary diagnostics. Existing
+// boundary_statistics keeps its ABI. Read/reset at quiescent points: individual
+// atomics do not form a transaction. local_checks equals the sum of the six
+// local outcomes after all decisions finish, including exceptional decisions.
+// local_failures counts exceptions during the early-replay decision, not later
+// descriptor rebuild failures after a disabled/unready/invalidated decision.
+// Local outcomes cover eligible single-rank CUDA decisions only. An unready
+// plan may be absent, unstable, or generation-invalid; prepare_invalidations
+// means ready before preparation and not ready afterwards, without inferring
+// which underlying predicate changed. Rebuild attempts count path entry.
+// prepared_arrays counts successful ensure-span calls, including partial work
+// in a failed preparation. prepare_host_nanoseconds includes any host waiting
+// or uploads inside preparation; it is not device time and overlaps Boundaries.
+// Plan counters cover successful individual plan submissions (or empty plans),
+// not completion or the separate combined MPI boundary-phase graph API.
+struct boundary_execution_statistics {
+  std::uint64_t local_checks;
+  std::uint64_t local_disabled;
+  std::uint64_t local_unready;
+  std::uint64_t local_prepare_invalidations;
+  std::uint64_t local_replay_empty;
+  std::uint64_t local_replay_work;
+  std::uint64_t local_failures;
+  std::uint64_t local_descriptor_rebuild_attempts;
+  std::uint64_t prepare_calls;
+  std::uint64_t prepare_failures;
+  std::uint64_t prepared_arrays;
+  std::uint64_t prepare_host_nanoseconds;
+  std::uint64_t plan_empty;
+  std::uint64_t plan_direct_zero;
+  std::uint64_t plan_direct_local;
+  std::uint64_t plan_graph;
+  std::uint64_t plan_staged;
+  // Exact span-resolution outcomes; refresh and finite checks remain separate.
+  std::uint64_t span_cache_hits;
+  std::uint64_t span_cache_misses;
+  std::uint64_t span_cache_bypasses;
+};
+
+// Selected paths after successful setup in a CUDA material-phasing step.
+// Setup exceptions are not counted; reused does not assert full-step success.
+// Quiescent snapshots satisfy checks == reused + disabled + ineligible.
+struct material_phasing_statistics {
+  std::uint64_t checks;
+  std::uint64_t reused;
+  std::uint64_t disabled;
+  std::uint64_t ineligible;
+};
+
+// Readback diagnostics only after at least one dirty resident component was
+// found. Excludes owner/cache lookup, registry lock acquisition, clean-host
+// fallback, and CPU-only execution. Attempts include validation failures after
+// that point. At quiescence attempts = completions + failures. Only successful
+// copy API returns contribute calls/scalars/bytes; partial work in a failed copy
+// is unknown. A complex read currently uses two scalar copies, but calls and
+// scalars are distinct so future batching cannot change the units silently.
+// Host duration includes validation, device selection, synchronous copies and
+// output commit, possibly waiting on earlier GPU work. It is not pure DMA or
+// device time. Non-synchronizing snapshots and reset require quiescent access.
+struct resident_point_read_statistics {
+  std::uint64_t cuda_read_attempts;
+  std::uint64_t cuda_read_completions;
+  std::uint64_t cuda_read_failures;
+  std::uint64_t scalars_copied;
+  std::uint64_t device_to_host_calls;
+  std::uint64_t device_to_host_bytes;
+  std::uint64_t host_nanoseconds;
 };
 
 struct dft_statistics {
@@ -351,10 +464,10 @@ struct tile_coalescing_statistics {
   std::uint64_t update_eh_input_tiles;
 };
 
-// Additive evidence for the topology-aware cross-operation phase policy.
-// Automatic checks count logical phase decisions, including a validated
-// replay of a previously collected phase. Singleton ordinary phases remain
-// unbatched without pretending that a crossover decision was made.
+// Additive evidence for the cross-operation phase policy. Curl is
+// production-disabled unless explicitly forced; E/H automatic checks count
+// logical phase decisions. Singleton ordinary phases remain unbatched without
+// pretending that a crossover decision was made.
 struct phase_batch_policy_statistics {
   std::uint64_t curl_automatic_checks;
   std::uint64_t curl_automatic_selected;
@@ -379,6 +492,40 @@ struct curl_phase_replay_statistics {
   std::uint64_t unready;
   std::uint64_t generation_misses;
   std::uint64_t mirror_misses;
+};
+
+// Additive evidence for the expert-only, sequence-preserving structured-curl
+// CUDA Graph path. A collection/replay "launch" is a host graph submission;
+// logical_operations counts the ordinary structured kernel nodes represented
+// by those submissions. Launch failures are a subset of attempted launches.
+// Consequently:
+//   collection_checks == collection_launches + unsupported_fallbacks +
+//                        creation_fallbacks
+//   replay_checks == replay_launches + replay_unready +
+//                    replay_generation_misses + replay_mirror_misses
+// live_plans and quarantined_plans are non-resetting state gauges.  A failed
+// synchronous destroy increments plan_destroy_failures but never
+// plan_destroys, and its executable remains included in both gauges until
+// process exit.
+struct structured_curl_graph_statistics {
+  std::uint64_t collection_checks;
+  std::uint64_t collection_launches;
+  std::uint64_t plan_creations;
+  std::uint64_t plan_rebuilds;
+  std::uint64_t plan_reuses;
+  std::uint64_t plan_destroys;
+  std::uint64_t plan_destroy_failures;
+  std::uint64_t live_plans;
+  std::uint64_t quarantined_plans;
+  std::uint64_t logical_operations;
+  std::uint64_t unsupported_fallbacks;
+  std::uint64_t creation_fallbacks;
+  std::uint64_t launch_failures;
+  std::uint64_t replay_checks;
+  std::uint64_t replay_launches;
+  std::uint64_t replay_unready;
+  std::uint64_t replay_generation_misses;
+  std::uint64_t replay_mirror_misses;
 };
 
 // Additive evidence for the cached MPI-boundary descriptor fast path.
@@ -409,8 +556,9 @@ void select_device(int ordinal);
 // may have rank-specific configuration errors should prefer MEEP_GPU_BACKEND
 // plus the fields::step collective preflight, or collectively agree on local
 // set_backend success before continuing. Accepted environment values are
-// "cpu", "auto", and "cuda"; the default is "cpu". MEEP_GPU_DEVICE
-// optionally selects a CUDA runtime ordinal.
+// "cpu" and "cuda"; automatic selection is rejected and the default remains
+// "cpu" for upstream-compatible CPU execution. MEEP_GPU_DEVICE optionally
+// selects a CUDA runtime ordinal.
 void set_backend(backend_mode mode);
 backend_mode requested_backend();
 backend_mode active_backend();
@@ -426,13 +574,17 @@ std::string backend_diagnostic();
 
 dispatch_statistics get_dispatch_statistics() noexcept;
 resident_statistics get_resident_statistics() noexcept;
+resident_point_read_statistics get_resident_point_read_statistics() noexcept;
+material_phasing_statistics get_material_phasing_statistics() noexcept;
 // Current process-wide resident device buffers. This state gauge is a
 // separate additive API so resident_statistics keeps its original ABI.
 std::uint64_t get_live_resident_device_buffers() noexcept;
 field_update_statistics get_field_update_statistics() noexcept;
 polarization_statistics get_polarization_statistics() noexcept;
+sparse_lorentzian_statistics get_sparse_lorentzian_statistics();
 source_statistics get_source_statistics() noexcept;
 boundary_statistics get_boundary_statistics() noexcept;
+boundary_execution_statistics get_boundary_execution_statistics() noexcept;
 dft_statistics get_dft_statistics() noexcept;
 dft_batch_statistics get_dft_batch_statistics() noexcept;
 dft_reduction_statistics get_dft_reduction_statistics() noexcept;
@@ -452,11 +604,14 @@ phase_batch_policy_statistics
 get_phase_batch_policy_statistics() noexcept;
 curl_phase_replay_statistics
 get_curl_phase_replay_statistics() noexcept;
+structured_curl_graph_statistics
+get_structured_curl_graph_statistics() noexcept;
 boundary_descriptor_replay_statistics
 get_boundary_descriptor_replay_statistics() noexcept;
 runtime_touch_statistics get_runtime_touch_statistics() noexcept;
 void reset_boundary_descriptor_replay_statistics() noexcept;
 void reset_dispatch_statistics() noexcept;
+void reset_sparse_lorentzian_statistics();
 
 } // namespace gpu
 } // namespace meep

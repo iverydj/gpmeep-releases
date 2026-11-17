@@ -4,7 +4,7 @@ harmonics.cpp integrate.cpp known_results.cpp near2far.cpp              \
 one_dimensional.cpp physical.cpp stress_tensor.cpp symmetry.cpp 	\
 three_d.cpp two_dimensional.cpp 2D_convergence.cpp h5test.cpp pml.cpp
 
-EXTRA_DIST = $(SRC)
+EXTRA_DIST = $(SRC) run-structured-curl-graph-failure-matrix.sh
 
 OBJ = $(SRC:.cpp=.o)
 DAC = $(SRC:.cpp=.dac)
@@ -140,6 +140,14 @@ $(DAC): $(LIBMEEP)
 
 benchmark: bench
 	$(RUNCODE) ./bench
+
+# Destructive CUDA lifetime failures poison or intentionally quarantine
+# process state, so every mode must run in its own singleton process.  This is
+# an explicit GPU qualification target rather than part of host-only checks.
+.PHONY: check-structured-curl-graph-failures
+check-structured-curl-graph-failures: gpu-step-db
+	bash $(srcdir)/run-structured-curl-graph-failure-matrix.sh \
+		$(abs_builddir)/gpu-step-db$(EXEEXT)
 
 dac: $(DAC)
 

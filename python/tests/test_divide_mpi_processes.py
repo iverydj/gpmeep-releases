@@ -9,7 +9,10 @@ import meep as mp
 
 _VALIDATION_NONCE = os.environ.get("GPMEEP_DIVIDE_VALIDATION_NONCE", "")
 _STARTUP_GPU_STATISTICS = mp.gpu.statistics() if _VALIDATION_NONCE else None
-_VALIDATION_PREFIX = "gpmeep-divide-mpi-validation-v1:"
+_VALIDATION_PREFIX = "gpmeep-divide-mpi-validation-v2:"
+_BACKEND_ACKNOWLEDGEMENT_REASON = (
+    "M3 MPI qualification intentionally compares explicit CPU and CUDA"
+)
 
 
 @unittest.skipIf(mp.count_processors() < 2, "MPI specific test")
@@ -60,7 +63,20 @@ class TestDivideParallelProcesses(unittest.TestCase):
             decimation_factor=1,
         )
 
-        self.sim.run(until_after_sources=30)
+        if _VALIDATION_NONCE:
+            import gpmeep_backend_guard as backend_guard
+
+            _, backend_guard_evidence = (
+                backend_guard.invoke_with_acknowledgement(
+                    mp,
+                    self.sim,
+                    lambda: self.sim.run(until_after_sources=30),
+                    _BACKEND_ACKNOWLEDGEMENT_REASON,
+                )
+            )
+        else:
+            self.sim.run(until_after_sources=30)
+            backend_guard_evidence = None
 
         tot_flux = mp.get_fluxes(flux_box)[0]
 
@@ -76,7 +92,7 @@ class TestDivideParallelProcesses(unittest.TestCase):
             from mpi4py import MPI
 
             record = {
-                "schema_version": 1,
+                "schema_version": 2,
                 "nonce": _VALIDATION_NONCE,
                 "world_rank": MPI.COMM_WORLD.rank,
                 "pid": os.getpid(),
@@ -85,6 +101,7 @@ class TestDivideParallelProcesses(unittest.TestCase):
                 "requested_backend": mp.gpu.requested_backend,
                 "selected_device": int(mp.gpu.selected_device),
                 "selected_device_identifier": mp.gpu.selected_device_identifier,
+                "backend_guard": backend_guard_evidence,
                 "startup_statistics": _STARTUP_GPU_STATISTICS,
                 "statistics": mp.gpu.statistics(),
             }
@@ -117,7 +134,7 @@ class TestDivideParallelProcesses(unittest.TestCase):
                     _VALIDATION_PREFIX
                     + json.dumps(
                         {
-                            "schema_version": 1,
+                            "schema_version": 2,
                             "sha256": hashlib.sha256(payload).hexdigest(),
                         },
                         sort_keys=True,

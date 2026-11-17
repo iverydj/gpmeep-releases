@@ -99,6 +99,8 @@ def write_log(path: pathlib.Path, result: dict, overlap: dict) -> None:
         + COMPARATOR.OVERLAP_PREFIX
         + json.dumps(overlap, separators=(",", ":"))
         + "\n"
+        + COMPARATOR.STRUCTURED_CURL_GRAPH_PREFIX
+        + "{}\n"
         + COMPARATOR.QUALIFICATION_PREFIX
         + path.name
         + ":PASS\n",
@@ -217,6 +219,14 @@ class BoundaryEhOverlapComparatorTests(unittest.TestCase):
                     text.replace(
                         qualification,
                         'gpmeep-multi-benchmark-v3:{"schema_version":3}\n'
+                        + qualification,
+                    ),
+                    "mixed-version",
+                ),
+                (
+                    text.replace(
+                        qualification,
+                        'gpmeep-structured-curl-graph-v2:{}\n'
                         + qualification,
                     ),
                     "mixed-version",

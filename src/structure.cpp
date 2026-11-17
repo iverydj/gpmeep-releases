@@ -15,7 +15,18 @@
 %  Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
 */
 
+#include <algorithm>
 #include <memory>
+#include <array>
+#include <cstring>
+#include <cstdint>
+#include <iomanip>
+#include <limits>
+#include <locale>
+#include <mutex>
+#include <sstream>
+#include <string>
+#include <typeinfo>
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
@@ -30,12 +41,252 @@ using namespace std;
 
 namespace meep {
 
+namespace {
+
+class material_sha256 {
+public:
+  material_sha256()
+      : state{{0x6a09e667u, 0xbb67ae85u, 0x3c6ef372u, 0xa54ff53au,
+               0x510e527fu, 0x9b05688cu, 0x1f83d9abu, 0x5be0cd19u}},
+        buffered(0), total_bytes(0) {}
+
+  void update(const void *data, size_t bytes) {
+    if (bytes > std::numeric_limits<std::uint64_t>::max() - total_bytes)
+      meep::abort("material manifest byte count overflow");
+    total_bytes += static_cast<std::uint64_t>(bytes);
+    const unsigned char *input = static_cast<const unsigned char *>(data);
+    while (bytes) {
+      const size_t amount = std::min(bytes, block.size() - buffered);
+      std::memcpy(block.data() + buffered, input, amount);
+      buffered += amount;
+      input += amount;
+      bytes -= amount;
+      if (buffered == block.size()) {
+        transform(block.data());
+        buffered = 0;
+      }
+    }
+  }
+
+  std::string finish_hex() {
+    if (total_bytes > std::numeric_limits<std::uint64_t>::max() / 8)
+      meep::abort("material manifest bit count overflow");
+    const std::uint64_t total_bits = total_bytes * 8;
+    block[buffered++] = 0x80;
+    if (buffered > 56) {
+      std::fill(block.begin() + buffered, block.end(), 0);
+      transform(block.data());
+      buffered = 0;
+    }
+    std::fill(block.begin() + buffered, block.begin() + 56, 0);
+    for (int index = 0; index < 8; ++index)
+      block[56 + index] =
+          static_cast<unsigned char>(total_bits >> (56 - 8 * index));
+    transform(block.data());
+
+    std::ostringstream result;
+    result << std::hex << std::setfill('0');
+    for (std::uint32_t word : state) result << std::setw(8) << word;
+    return result.str();
+  }
+
+private:
+  static std::uint32_t rotate_right(std::uint32_t value, unsigned count) {
+    return (value >> count) | (value << (32 - count));
+  }
+
+  static std::uint32_t load_be32(const unsigned char *data) {
+    return (static_cast<std::uint32_t>(data[0]) << 24) |
+           (static_cast<std::uint32_t>(data[1]) << 16) |
+           (static_cast<std::uint32_t>(data[2]) << 8) |
+           static_cast<std::uint32_t>(data[3]);
+  }
+
+  void transform(const unsigned char *data) {
+    static const std::uint32_t constants[64] = {
+        0x428a2f98u, 0x71374491u, 0xb5c0fbcfu, 0xe9b5dba5u,
+        0x3956c25bu, 0x59f111f1u, 0x923f82a4u, 0xab1c5ed5u,
+        0xd807aa98u, 0x12835b01u, 0x243185beu, 0x550c7dc3u,
+        0x72be5d74u, 0x80deb1feu, 0x9bdc06a7u, 0xc19bf174u,
+        0xe49b69c1u, 0xefbe4786u, 0x0fc19dc6u, 0x240ca1ccu,
+        0x2de92c6fu, 0x4a7484aau, 0x5cb0a9dcu, 0x76f988dau,
+        0x983e5152u, 0xa831c66du, 0xb00327c8u, 0xbf597fc7u,
+        0xc6e00bf3u, 0xd5a79147u, 0x06ca6351u, 0x14292967u,
+        0x27b70a85u, 0x2e1b2138u, 0x4d2c6dfcu, 0x53380d13u,
+        0x650a7354u, 0x766a0abbu, 0x81c2c92eu, 0x92722c85u,
+        0xa2bfe8a1u, 0xa81a664bu, 0xc24b8b70u, 0xc76c51a3u,
+        0xd192e819u, 0xd6990624u, 0xf40e3585u, 0x106aa070u,
+        0x19a4c116u, 0x1e376c08u, 0x2748774cu, 0x34b0bcb5u,
+        0x391c0cb3u, 0x4ed8aa4au, 0x5b9cca4fu, 0x682e6ff3u,
+        0x748f82eeu, 0x78a5636fu, 0x84c87814u, 0x8cc70208u,
+        0x90befffau, 0xa4506cebu, 0xbef9a3f7u, 0xc67178f2u};
+    std::uint32_t words[64];
+    for (int index = 0; index < 16; ++index)
+      words[index] = load_be32(data + 4 * index);
+    for (int index = 16; index < 64; ++index) {
+      const std::uint32_t s0 = rotate_right(words[index - 15], 7) ^
+                               rotate_right(words[index - 15], 18) ^
+                               (words[index - 15] >> 3);
+      const std::uint32_t s1 = rotate_right(words[index - 2], 17) ^
+                               rotate_right(words[index - 2], 19) ^
+                               (words[index - 2] >> 10);
+      words[index] = words[index - 16] + s0 + words[index - 7] + s1;
+    }
+
+    std::uint32_t a = state[0], b = state[1], c = state[2], d = state[3];
+    std::uint32_t e = state[4], f = state[5], g = state[6], h = state[7];
+    for (int index = 0; index < 64; ++index) {
+      const std::uint32_t sum1 = rotate_right(e, 6) ^ rotate_right(e, 11) ^ rotate_right(e, 25);
+      const std::uint32_t choice = (e & f) ^ ((~e) & g);
+      const std::uint32_t temporary1 = h + sum1 + choice + constants[index] + words[index];
+      const std::uint32_t sum0 = rotate_right(a, 2) ^ rotate_right(a, 13) ^ rotate_right(a, 22);
+      const std::uint32_t majority = (a & b) ^ (a & c) ^ (b & c);
+      const std::uint32_t temporary2 = sum0 + majority;
+      h = g;
+      g = f;
+      f = e;
+      e = d + temporary1;
+      d = c;
+      c = b;
+      b = a;
+      a = temporary1 + temporary2;
+    }
+    state[0] += a;
+    state[1] += b;
+    state[2] += c;
+    state[3] += d;
+    state[4] += e;
+    state[5] += f;
+    state[6] += g;
+    state[7] += h;
+  }
+
+  std::array<std::uint32_t, 8> state;
+  std::array<unsigned char, 64> block;
+  size_t buffered;
+  std::uint64_t total_bytes;
+};
+
+std::string material_array_sha256(const realnum *values, size_t elements) {
+  if (elements > std::numeric_limits<size_t>::max() / sizeof(realnum))
+    meep::abort("material manifest array byte count overflow");
+  material_sha256 digest;
+  digest.update(values, elements * sizeof(realnum));
+  return digest.finish_hex();
+}
+
+void verify_material_sha256_once() {
+  static std::once_flag once;
+  std::call_once(once, []() {
+    material_sha256 empty;
+    if (empty.finish_hex() !=
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+      meep::abort("material manifest SHA-256 empty-vector self-test failed");
+    material_sha256 abc;
+    static const char payload[] = "abc";
+    abc.update(payload, 3);
+    if (abc.finish_hex() !=
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+      meep::abort("material manifest SHA-256 abc self-test failed");
+  });
+}
+
+void append_material_array(std::ostringstream &output, component c, direction d,
+                           bool trivial, const realnum *values, size_t elements) {
+  const size_t bytes = values ? elements * sizeof(realnum) : 0;
+  output << "{\"component\":" << static_cast<int>(c)
+         << ",\"direction\":" << static_cast<int>(d)
+         << ",\"trivial\":" << (trivial ? "true" : "false")
+         << ",\"null\":" << (values ? "false" : "true")
+         << ",\"elements\":" << (values ? elements : 0)
+         << ",\"bytes\":" << bytes << ",\"sha256\":";
+  if (values)
+    output << '\"' << material_array_sha256(values, elements) << '\"';
+  else
+    output << "null";
+  output << '}';
+}
+
+} // namespace
+
 typedef structure_chunk *structure_chunk_ptr;
+
+std::string sourcedata::gpmeep_manifest() const {
+  verify_material_sha256_once();
+  material_sha256 index_digest;
+  if (!idx_arr.empty())
+    index_digest.update(idx_arr.data(), idx_arr.size() * sizeof(idx_arr[0]));
+  material_sha256 amplitude_digest;
+  if (!amp_arr.empty())
+    amplitude_digest.update(amp_arr.data(), amp_arr.size() * sizeof(amp_arr[0]));
+
+  std::ostringstream output;
+  output << "{\"schema\":\"gpmeep-sourcedata-v1\",\"near_fd_comp\":"
+         << static_cast<int>(near_fd_comp) << ",\"fc_idx\":" << fc_idx
+         << ",\"index_element_bytes\":" << sizeof(idx_arr[0])
+         << ",\"index_count\":" << idx_arr.size() << ",\"index_sha256\":\""
+         << index_digest.finish_hex() << "\",\"amplitude_element_bytes\":"
+         << sizeof(amp_arr[0]) << ",\"amplitude_count\":" << amp_arr.size()
+         << ",\"amplitude_sha256\":\"" << amplitude_digest.finish_hex() << "\"}";
+  return output.str();
+}
+
+std::string structure::material_arrays_manifest() const {
+  verify_material_sha256_once();
+  std::ostringstream output;
+  output << "{\"schema\":\"gpmeep-material-arrays-v1\",\"realnum_bytes\":"
+         << sizeof(realnum) << ",\"num_chunks\":" << num_chunks << ",\"chunks\":[";
+  for (int chunk_index = 0; chunk_index < num_chunks; ++chunk_index) {
+    if (chunk_index) output << ',';
+    const structure_chunk *chunk = chunks[chunk_index];
+    if (!chunk) meep::abort("material manifest encountered a null structure chunk");
+    const size_t elements = chunk->gv.ntot();
+    output << "{\"index\":" << chunk_index << ",\"owned\":"
+           << (chunk->is_mine() ? "true" : "false") << ",\"ntot\":" << elements
+           << ",\"chi1inv\":[";
+    bool first_array = true;
+    for (int component_index = 0; component_index < NUM_FIELD_COMPONENTS; ++component_index)
+      for (int direction_index = 0; direction_index < 5; ++direction_index) {
+        if (!first_array) output << ',';
+        first_array = false;
+        append_material_array(output, static_cast<component>(component_index),
+                              static_cast<direction>(direction_index),
+                              chunk->trivial_chi1inv[component_index][direction_index],
+                              chunk->chi1inv[component_index][direction_index], elements);
+      }
+    output << "],\"susceptibilities\":[";
+    bool first_susceptibility = true;
+    for (int field_index = 0; field_index < NUM_FIELD_TYPES; ++field_index) {
+      int order = 0;
+      for (const susceptibility *sus = chunk->chiP[field_index]; sus; sus = sus->next, ++order) {
+        if (!first_susceptibility) output << ',';
+        first_susceptibility = false;
+        output << "{\"field_type\":" << field_index << ",\"order\":" << order
+               << ",\"type\":\"" << typeid(*sus).name() << "\",\"ntot\":" << sus->ntot
+               << ",\"sigma\":[";
+        bool first_sigma = true;
+        for (int component_index = 0; component_index < NUM_FIELD_COMPONENTS; ++component_index)
+          for (int direction_index = 0; direction_index < 5; ++direction_index) {
+            if (!first_sigma) output << ',';
+            first_sigma = false;
+            append_material_array(output, static_cast<component>(component_index),
+                                  static_cast<direction>(direction_index),
+                                  sus->trivial_sigma[component_index][direction_index],
+                                  sus->sigma[component_index][direction_index], sus->ntot);
+          }
+        output << "]}";
+      }
+    }
+    output << "]}";
+  }
+  output << "]}";
+  return output.str();
+}
 
 structure::structure(const grid_volume &thegv, material_function &eps, const boundary_region &br,
                      const symmetry &s, int num, double Courant, bool use_anisotropic_averaging,
                      double tol, int maxeval, const binary_partition *_bp)
-    : Courant(Courant), v(D1) // Aaack, this is very hokey.
+    : Courant(Courant), v(D1), gpmeep_mutation_epoch_(0) // Aaack, this is very hokey.
 {
   outdir = ".";
   shared_chunks = false;
@@ -49,7 +300,7 @@ structure::structure(const grid_volume &thegv, material_function &eps, const bou
 structure::structure(const grid_volume &thegv, double eps(const vec &), const boundary_region &br,
                      const symmetry &s, int num, double Courant, bool use_anisotropic_averaging,
                      double tol, int maxeval, const binary_partition *_bp)
-    : Courant(Courant), v(D1) // Aaack, this is very hokey.
+    : Courant(Courant), v(D1), gpmeep_mutation_epoch_(0) // Aaack, this is very hokey.
 {
   outdir = ".";
   shared_chunks = false;
@@ -335,7 +586,8 @@ void structure::add_to_effort_volumes(const grid_volume &new_effort_volume, doub
 structure::structure(const structure &s)
     : num_chunks{s.num_chunks}, shared_chunks{false}, gv(s.gv), user_volume(s.user_volume), a{s.a},
       Courant{s.Courant}, dt{s.dt}, v(s.v), S(s.S), outdir(s.outdir),
-      num_effort_volumes{s.num_effort_volumes}, bp(new binary_partition(*s.bp)) {
+      num_effort_volumes{s.num_effort_volumes}, bp(new binary_partition(*s.bp)),
+      gpmeep_mutation_epoch_(s.gpmeep_mutation_epoch_) {
   chunks = new structure_chunk_ptr[num_chunks];
   for (int i = 0; i < num_chunks; i++) {
     chunks[i] = new structure_chunk(s.chunks[i]);
@@ -363,12 +615,75 @@ structure::~structure() {
    preserve the illusion that the structure and fields are
    independent objects, we implement copy-on-write semantics. */
 void structure::changing_chunks() { // call this whenever chunks are modified
+  gpmeep_note_state_mutation();
   if (shared_chunks) return;        // shared view of chunks with fields, no COW
   for (int i = 0; i < num_chunks; i++)
     if (chunks[i]->refcount > 1) { // this chunk is shared, so make a copy
       chunks[i]->refcount--;
       chunks[i] = new structure_chunk(chunks[i]);
     }
+}
+
+unsigned long long structure::gpmeep_state_epoch() const {
+  return gpmeep_mutation_epoch_;
+}
+
+void structure::gpmeep_note_state_mutation() {
+  if (gpmeep_mutation_epoch_ == std::numeric_limits<unsigned long long>::max())
+    meep::abort("gpmeep structure mutation epoch exhausted\n");
+  ++gpmeep_mutation_epoch_;
+}
+
+std::string structure::gpmeep_state_manifest() const {
+  std::ostringstream out;
+  out.imbue(std::locale::classic());
+  const auto write_double = [&out](double value) {
+    out << '\"' << std::hexfloat << value << std::defaultfloat << '\"';
+  };
+  out << "{\"schema\":\"gpmeep-structure-state-v1\",\"epoch\":"
+      << gpmeep_mutation_epoch_ << ",\"num_chunks\":" << num_chunks
+      << ",\"shared_chunks\":" << (shared_chunks ? "true" : "false")
+      << ",\"a\":";
+  write_double(a);
+  out << ",\"Courant\":";
+  write_double(Courant);
+  out << ",\"dt\":";
+  write_double(dt);
+  out << '}';
+  return out.str();
+}
+
+std::string structure::gpmeep_chunk_layout_manifest() const {
+  std::ostringstream out;
+  out.imbue(std::locale::classic());
+  const auto write_double = [&out](double value) {
+    out << '"' << std::hexfloat << value << std::defaultfloat << '"';
+  };
+  out << "{\"schema\":\"gpmeep-chunk-layout-v1\",\"num_chunks\":" << num_chunks
+      << ",\"chunks\":[";
+  for (int chunk_index = 0; chunk_index < num_chunks; ++chunk_index) {
+    if (chunk_index) out << ',';
+    const grid_volume &chunk_volume = chunks[chunk_index]->gv;
+    const ivec little = chunk_volume.little_corner();
+    const ivec big = chunk_volume.big_corner();
+    out << "{\"index\":" << chunk_index << ",\"owner\":"
+        << chunks[chunk_index]->n_proc() << ",\"dimension\":"
+        << static_cast<int>(chunk_volume.dim) << ",\"a\":";
+    write_double(chunk_volume.a);
+    out << ",\"inva\":";
+    write_double(chunk_volume.inva);
+    out << ",\"directions\":[";
+    for (int slot = 0; slot < 3; ++slot) {
+      if (slot) out << ',';
+      out << "{\"slot\":" << slot << ",\"direction\":"
+          << static_cast<int>(chunk_volume.yucky_direction(slot)) << ",\"little\":"
+          << little.yucky_val(slot) << ",\"big\":" << big.yucky_val(slot)
+          << ",\"num\":" << chunk_volume.yucky_num(slot) << '}';
+    }
+    out << "]}";
+  }
+  out << "]}";
+  return out.str();
 }
 
 void structure::set_materials(material_function &mat, bool use_anisotropic_averaging, double tol,

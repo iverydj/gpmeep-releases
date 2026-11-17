@@ -18,6 +18,7 @@ ALLOWED_CONTROL_SCRIPTS = frozenset(
         "gpmeep_qualification_contract.py",
         "normalize-conda-generated-bytecode.py",
         "normalize-conda-relocated-bytecode.py",
+        "stage-conda-lock-archives.py",
         "verify-protected-bash.py",
         "write-build-receipt.py",
     }

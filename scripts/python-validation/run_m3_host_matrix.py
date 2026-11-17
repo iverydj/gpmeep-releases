@@ -33,6 +33,7 @@ from common import (  # noqa: E402
     StableFile,
     WorkloadError,
     atomic_write_json,
+    durable_publish_terminal,
     file_record,
 )
 
@@ -144,6 +145,7 @@ def _external_record(path: pathlib.Path, label: str) -> dict[str, Any]:
 def paired_identity(
     paired_output: pathlib.Path, paired_report: dict[str, Any]
 ) -> dict[str, Any]:
+    build_receipt = paired_report["contract"]["build_receipt"]
     return {
         "path": str(paired_output),
         "complete": _external_record(
@@ -155,10 +157,9 @@ def paired_identity(
         "checkpoint": _external_record(
             paired_output / "CHECKPOINT.json", "M3 paired checkpoint"
         ),
-        "receipt_id": paired_report["contract"]["build_receipt"]["receipt_id"],
-        "source_sha256": paired_report["contract"]["build_receipt"][
-            "source_sha256"
-        ],
+        "receipt_id": build_receipt["receipt_id"],
+        "source_sha256": build_receipt["source_sha256"],
+        "git_head": build_receipt["git_head"],
     }
 
 
@@ -830,7 +831,9 @@ def publish_terminal(output: pathlib.Path, report: dict[str, Any]) -> None:
         output / "PENDING_HOST_COMPLETE", _terminal_payload(output, report)
     )
     verify_complete(output, "PENDING_HOST_COMPLETE")
-    os.replace(output / "PENDING_HOST_COMPLETE", output / "HOST_COMPLETE")
+    durable_publish_terminal(
+        output / "PENDING_HOST_COMPLETE", output / "HOST_COMPLETE"
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1066,7 +1069,7 @@ def main(argv: list[str] | None = None) -> int:
         }
         if (output / "JOURNAL.json").is_file():
             failure["journal"] = file_record(output / "JOURNAL.json", output)
-        atomic_write_json(output / "FAILED.json", failure)
+        matrix.publish_failure_record(output, failure)
         raise
     finally:
         for stable in code_stables.values():

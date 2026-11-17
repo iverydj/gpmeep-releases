@@ -80,14 +80,65 @@ class M3HostOracleTests(unittest.TestCase):
     def test_mpb_suite_requires_47_tests_and_zero_skip(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             target = pathlib.Path(raw) / "test_fixture.py"
+            helper = pathlib.Path(raw) / "host_mpb_sibling_fixture.py"
+            helper.write_text("VALUE = 47\n")
             methods = "\n".join(
                 f"    def test_{index:02d}(self): self.assertTrue(True)"
                 for index in range(47)
             )
-            target.write_text("import unittest\nclass T(unittest.TestCase):\n" + methods + "\n")
-            result = HOST.run_mpb_suite(target, HOST.BoundedText("mpb"))
-            self.assertEqual(result["tests_run"], 47)
-            self.assertEqual(result["skipped"], 0)
+            target.write_text(
+                "import sys\n"
+                "import unittest\n"
+                "from host_mpb_sibling_fixture import VALUE\n"
+                "sys.path.append('mutated-by-target')\n"
+                "sys.path = ['rebound-by-successful-target']\n"
+                "class T(unittest.TestCase):\n"
+                + methods
+                + "\n"
+            )
+            previous_path = sys.path
+            caller_contents = list(previous_path)
+            previous_path.insert(0, str(pathlib.Path(raw)))
+            previous_contents = list(previous_path)
+            previous_module = object()
+            sys.modules["gpmeep_m3_test_mpb"] = previous_module
+            try:
+                result = HOST.run_mpb_suite(target, HOST.BoundedText("mpb"))
+                self.assertEqual(result["tests_run"], 47)
+                self.assertEqual(result["skipped"], 0)
+                self.assertEqual(sys.modules["host_mpb_sibling_fixture"].VALUE, 47)
+                self.assertIs(sys.path, previous_path)
+                self.assertEqual(sys.path, previous_contents)
+                self.assertIs(
+                    sys.modules["gpmeep_m3_test_mpb"], previous_module
+                )
+            finally:
+                sys.modules.pop("host_mpb_sibling_fixture", None)
+                sys.modules.pop("gpmeep_m3_test_mpb", None)
+                previous_path[:] = caller_contents
+
+    def test_mpb_suite_restores_exact_import_state_after_load_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            target = pathlib.Path(raw) / "test_fixture.py"
+            target.write_text(
+                "import sys\n"
+                "sys.path = ['rebound-by-target']\n"
+                "raise RuntimeError('fixture load failure')\n"
+            )
+            previous_path = sys.path
+            previous_contents = list(previous_path)
+            previous_module = object()
+            sys.modules["gpmeep_m3_test_mpb"] = previous_module
+            try:
+                with self.assertRaisesRegex(RuntimeError, "fixture load failure"):
+                    HOST.run_mpb_suite(target, HOST.BoundedText("mpb"))
+                self.assertIs(sys.path, previous_path)
+                self.assertEqual(sys.path, previous_contents)
+                self.assertIs(
+                    sys.modules["gpmeep_m3_test_mpb"], previous_module
+                )
+            finally:
+                sys.modules.pop("gpmeep_m3_test_mpb", None)
 
     def test_parallel_waveguide_oracle_requires_full_distinct_arrays(self) -> None:
         separation = np.arange(0.025, 1.075, 0.05)

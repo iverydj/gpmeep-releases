@@ -29,20 +29,39 @@ def marker(prefix: str, value: dict) -> str:
 def policy(condition: str, pixels: int, ranks: int) -> dict[str, int]:
     value = {key: 0 for key in BENCHMARK.POLICY_KEYS}
     for prefix in ("curl", "update_eh"):
-        if condition == "automatic":
+        mode = (
+            "automatic"
+            if prefix == "update_eh" or condition == "automatic"
+            else condition.removeprefix("curl-")
+        )
+        if mode == "automatic":
+            if prefix == "curl":
+                value[f"{prefix}_automatic_checks"] = 10 * ranks
+                if pixels == 32:
+                    value[f"{prefix}_automatic_selected"] = 10 * ranks
+                    value[f"{prefix}_batched_operations"] = 80 * ranks
+                else:
+                    value[f"{prefix}_automatic_rejected"] = 10 * ranks
+                    value[f"{prefix}_unbatched_operations"] = 80 * ranks
+                continue
             value[f"{prefix}_automatic_checks"] = 10 * ranks
             if pixels == 256 and ranks == 1:
-                value[f"{prefix}_automatic_selected"] = 5
-                value[f"{prefix}_automatic_rejected"] = 5
-                value[f"{prefix}_batched_operations"] = 40
-                value[f"{prefix}_unbatched_operations"] = 40
+                value[f"{prefix}_automatic_rejected"] = 10
+                value[f"{prefix}_unbatched_operations"] = 80
             else:
                 value[f"{prefix}_automatic_selected"] = 10 * ranks
                 value[f"{prefix}_batched_operations"] = 80 * ranks
-        elif condition == "forced":
+        elif mode == "forced":
             value[f"{prefix}_forced_batches"] = 10 * ranks
             value[f"{prefix}_batched_operations"] = 80 * ranks
     return value
+
+
+def workload_parameters(pixels: int) -> dict[str, int]:
+    matches = [item for item in BENCHMARK.workloads(1) if item["pixels"] == pixels]
+    if len(matches) != 1:
+        raise AssertionError(f"missing unique workload for {pixels}")
+    return matches[0]
 
 
 def worker_record(pixels: int, ranks: int, seconds: float = 1.0) -> dict:
@@ -64,20 +83,22 @@ def worker_record(pixels: int, ranks: int, seconds: float = 1.0) -> dict:
         "expectation": "not_applicable",
     }
     cells = pixels**3
+    workload = workload_parameters(pixels)
+    steps = workload["steps"]
     mpi_scalars = 100 if ranks == 2 else 0
     return {
         "schema_version": 4,
         "mpi_ranks": ranks,
         "pixels": pixels,
         "cells": cells,
-        "warmup_steps": 12,
-        "steps": 80,
+        "warmup_steps": workload["warmup_steps"],
+        "steps": steps,
         "loop_tile_base_db": 128,
         "bfast": False,
         "source_enabled": True,
         "overlap_material": False,
         "seconds": seconds,
-        "mcells_per_second": cells * 80 / seconds / 1e6,
+        "mcells_per_second": cells * steps / seconds / 1e6,
         "requested_transport": "pinned",
         "selected_transport": "pinned" if ranks == 2 else "none",
         "completion_policy": "waitsome",
@@ -145,11 +166,12 @@ def worker_output(condition: str, pixels: int, ranks: int) -> str:
 
 
 def configuration(pixels: int = 128, ranks: int = 1, repeats: int = 3) -> dict:
+    workload = workload_parameters(pixels)
     return {
         "pixels": pixels,
         "ranks": ranks,
-        "warmup_steps": 12,
-        "steps": 80,
+        "warmup_steps": workload["warmup_steps"],
+        "steps": workload["steps"],
         "repeats": repeats,
     }
 
@@ -205,23 +227,29 @@ class EnvironmentTests(unittest.TestCase):
         self.assertFalse(any("PHASE_BATCHED_CURL" in key for key in result))
         self.assertFalse(any("PHASE_BATCHED_UPDATE_EH" in key for key in result))
 
-    def test_disabled_and_forced_controls_are_exact(self) -> None:
-        disabled = BENCHMARK.condition_environment({}, "disabled", configuration())
-        forced = BENCHMARK.condition_environment({}, "forced", configuration())
-        self.assertEqual(disabled["MEEP_GPU_DISABLE_PHASE_BATCHED_CURL"], "1")
-        self.assertEqual(
-            disabled["MEEP_GPU_DISABLE_PHASE_BATCHED_UPDATE_EH"], "1"
+    def test_curl_controls_are_isolated_from_automatic_eh(self) -> None:
+        disabled = BENCHMARK.condition_environment(
+            {}, "curl-disabled", configuration()
         )
-        self.assertEqual(forced["MEEP_GPU_ENABLE_PHASE_BATCHED_CURL"], "1")
-        self.assertEqual(
-            forced["MEEP_GPU_ENABLE_PHASE_BATCHED_UPDATE_EH"], "1"
-        )
+        forced = BENCHMARK.condition_environment({}, "curl-forced", configuration())
+        self.assertEqual(disabled, {
+            "MEEP_GPU_MULTI_PIXELS": "128",
+            "MEEP_GPU_MULTI_WARMUP_STEPS": "12",
+            "MEEP_GPU_MULTI_STEPS": "80",
+            "MEEP_GPU_DISABLE_PHASE_BATCHED_CURL": "1",
+        })
+        self.assertEqual(forced, {
+            "MEEP_GPU_MULTI_PIXELS": "128",
+            "MEEP_GPU_MULTI_WARMUP_STEPS": "12",
+            "MEEP_GPU_MULTI_STEPS": "80",
+            "MEEP_GPU_ENABLE_PHASE_BATCHED_CURL": "1",
+        })
 
 
 class StrictParsingTests(unittest.TestCase):
     def test_all_conditions_validate_for_one_and_two_gpus(self) -> None:
         for ranks in (1, 2):
-            for pixels in (128, 256):
+            for pixels in (32, 128, 256):
                 for condition in BENCHMARK.CONDITIONS:
                     record, counters, devices, processes = BENCHMARK.validate_sample(
                         condition,
@@ -236,8 +264,8 @@ class StrictParsingTests(unittest.TestCase):
     def test_policy_schema_duplicate_and_negative_values_fail_closed(self) -> None:
         output = worker_output("automatic", 128, 1)
         bad = output.replace(
-            '"curl_automatic_checks":10',
-            '"curl_automatic_checks":-1',
+            '"update_eh_automatic_checks":10',
+            '"update_eh_automatic_checks":-1',
             1,
         )
         with self.assertRaisesRegex(RuntimeError, "invalid exact schema"):
@@ -248,10 +276,57 @@ class StrictParsingTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "exactly one"):
             BENCHMARK.validate_sample("automatic", configuration(), duplicate)
 
+    def test_production_default_large_grid_curl_must_reject_consistently(self) -> None:
+        base = policy("automatic", 128, 1)
+        invalid = []
+        for field, value in (
+            ("curl_automatic_checks", 0),
+            ("curl_automatic_selected", 1),
+            ("curl_automatic_rejected", 0),
+            ("curl_forced_batches", 1),
+            ("curl_batched_operations", 1),
+            ("curl_unbatched_operations", 0),
+        ):
+            mutated = dict(base)
+            mutated[field] = value
+            invalid.append((field, mutated))
+        for field, counters in invalid:
+            with self.subTest(field=field), self.assertRaisesRegex(
+                RuntimeError, "automatic curl|large-grid curl"
+            ):
+                BENCHMARK.validate_policy("automatic", 128, 1, counters)
+
+    def test_automatic_eh_accounting_fails_closed(self) -> None:
+        invalid = []
+        rejected_without_unbatched = policy("automatic", 128, 1)
+        rejected_without_unbatched["update_eh_automatic_selected"] = 5
+        rejected_without_unbatched["update_eh_automatic_rejected"] = 5
+        invalid.append(rejected_without_unbatched)
+
+        selected_without_batched = policy("automatic", 128, 1)
+        selected_without_batched["update_eh_batched_operations"] = 0
+        invalid.append(selected_without_batched)
+
+        batched_without_selected = policy("automatic", 128, 1)
+        batched_without_selected["update_eh_automatic_selected"] = 0
+        batched_without_selected["update_eh_automatic_rejected"] = 10
+        invalid.append(batched_without_selected)
+
+        for counters in invalid:
+            with self.subTest(counters=counters):
+                with self.assertRaisesRegex(
+                    RuntimeError, "accounting|unbatched operations"
+                ):
+                    BENCHMARK.validate_policy(
+                        "automatic", 256, 2, counters
+                    )
+
     def test_wrong_policy_mode_and_unknown_marker_are_rejected(self) -> None:
         with self.assertRaisesRegex(RuntimeError, "disabled curl"):
             BENCHMARK.validate_sample(
-                "disabled", configuration(), worker_output("forced", 128, 1)
+                "curl-disabled",
+                configuration(),
+                worker_output("curl-forced", 128, 1),
             )
         with self.assertRaisesRegex(RuntimeError, "unknown or mixed-version"):
             BENCHMARK.validate_sample(
@@ -274,40 +349,91 @@ class StrictParsingTests(unittest.TestCase):
 
 
 class SummaryTests(unittest.TestCase):
-    def test_small_speedup_and_large_no_regression_gates(self) -> None:
-        small_times = {
-            "automatic": [1.00, 1.01, 0.99],
-            "disabled": [1.40, 1.41, 1.39],
-            "forced": [1.00, 1.02, 0.98],
-        }
-        small = BENCHMARK.summarize_configuration(
-            configuration(128, 1), samples_for_summary(128, 1, small_times)
-        )
-        self.assertTrue(small["pass"])
-        self.assertAlmostEqual(
-            small["median_paired_time_ratios"]["disabled_over_automatic"], 1.4
-        )
-        large_times = {
-            "automatic": [1.00, 1.00, 1.00],
-            "disabled": [1.00, 1.01, 0.99],
-            "forced": [1.01, 1.00, 0.99],
-        }
-        large = BENCHMARK.summarize_configuration(
-            configuration(256, 2), samples_for_summary(256, 2, large_times)
-        )
-        self.assertTrue(large["pass"])
+    gate_names = {
+        "maximum_median_paired_automatic_over_curl_disabled_time_ratio",
+        "maximum_median_paired_automatic_over_curl_forced_time_ratio",
+    }
 
-    def test_regression_and_changed_observable_fail_closed(self) -> None:
+    def test_both_no_regression_gates_apply_to_every_grid(self) -> None:
         times = {
-            "automatic": [1.05, 1.05, 1.05],
-            "disabled": [1.00, 1.00, 1.00],
-            "forced": [1.00, 1.00, 1.00],
+            "automatic": [1.00, 1.00, 1.00],
+            "curl-disabled": [1.00, 1.00, 1.00],
+            "curl-forced": [1.00, 1.00, 1.00],
+        }
+        for pixels in (32, 128, 256):
+            with self.subTest(pixels=pixels):
+                summary = BENCHMARK.summarize_configuration(
+                    configuration(pixels, 1),
+                    samples_for_summary(pixels, 1, times),
+                )
+                self.assertTrue(summary["pass"])
+                self.assertEqual(len(summary["gates"]), 2)
+                self.assertEqual(
+                    {gate["name"] for gate in summary["gates"]},
+                    self.gate_names,
+                )
+                self.assertTrue(all(gate["pass"] for gate in summary["gates"]))
+
+    def test_each_comparator_rejects_regression_at_every_grid(self) -> None:
+        cases = {
+            "curl-disabled": {
+                "automatic": [1.03, 1.03, 1.03],
+                "curl-disabled": [1.00, 1.00, 1.00],
+                "curl-forced": [1.20, 1.20, 1.20],
+            },
+            "curl-forced": {
+                "automatic": [1.03, 1.03, 1.03],
+                "curl-disabled": [1.20, 1.20, 1.20],
+                "curl-forced": [1.00, 1.00, 1.00],
+            },
+        }
+        for pixels in (32, 128, 256):
+            for comparator, times in cases.items():
+                with self.subTest(pixels=pixels, comparator=comparator):
+                    summary = BENCHMARK.summarize_configuration(
+                        configuration(pixels, 1),
+                        samples_for_summary(pixels, 1, times),
+                    )
+                    gates = {gate["name"]: gate for gate in summary["gates"]}
+                    failed_name = (
+                        "maximum_median_paired_automatic_over_"
+                        f"{comparator.replace('-', '_')}_time_ratio"
+                    )
+                    self.assertFalse(summary["pass"])
+                    self.assertEqual(set(gates), self.gate_names)
+                    self.assertFalse(gates[failed_name]["pass"])
+                    self.assertTrue(
+                        all(
+                            gate["pass"]
+                            for name, gate in gates.items()
+                            if name != failed_name
+                        )
+                    )
+
+    def test_no_regression_threshold_boundary_is_inclusive(self) -> None:
+        for automatic, expected in ((1.02, True), (1.0201, False)):
+            with self.subTest(automatic=automatic):
+                times = {
+                    "automatic": [automatic] * 3,
+                    "curl-disabled": [1.00] * 3,
+                    "curl-forced": [1.00] * 3,
+                }
+                summary = BENCHMARK.summarize_configuration(
+                    configuration(128, 1),
+                    samples_for_summary(128, 1, times),
+                )
+                self.assertEqual(summary["pass"], expected)
+                self.assertTrue(
+                    all(gate["pass"] == expected for gate in summary["gates"])
+                )
+
+    def test_changed_observable_fails_closed(self) -> None:
+        times = {
+            "automatic": [1.00, 1.00, 1.00],
+            "curl-disabled": [1.00, 1.00, 1.00],
+            "curl-forced": [1.00, 1.00, 1.00],
         }
         samples = samples_for_summary(256, 1, times)
-        summary = BENCHMARK.summarize_configuration(
-            configuration(256, 1), samples
-        )
-        self.assertFalse(summary["pass"])
         samples[1]["result"]["energy"] += 1.0
         with self.assertRaisesRegex(RuntimeError, "physical observable"):
             BENCHMARK.summarize_configuration(configuration(256, 1), samples)
@@ -315,8 +441,8 @@ class SummaryTests(unittest.TestCase):
     def test_markdown_reports_every_configuration(self) -> None:
         times = {
             "automatic": [1.0, 1.0, 1.0],
-            "disabled": [1.4, 1.4, 1.4],
-            "forced": [1.0, 1.0, 1.0],
+            "curl-disabled": [1.4, 1.4, 1.4],
+            "curl-forced": [1.0, 1.0, 1.0],
         }
         item = BENCHMARK.summarize_configuration(
             configuration(128, 2), samples_for_summary(128, 2, times)
@@ -426,6 +552,75 @@ class ProcessMonitorTests(unittest.TestCase):
         )
         self.assertTrue(record["pass"])
 
+    def test_current_driver_row_without_worker_name_passes(self) -> None:
+        output = "\n".join(
+            [
+                "# gpu pid type sm mem enc dec jpg ofa fb ccpm command",
+                "0 1000 C 2 0 - - - - 324 0 3",
+                "1 1001 C 1 0 - - - - 262 0",
+            ]
+        )
+        record = BENCHMARK.parse_process_monitor(
+            output, True, 0, {1000: 0, 1001: 1}
+        )
+        self.assertTrue(record["pass"])
+        self.assertEqual(record["unrelated_process_rows"], [])
+
+    def test_missing_expected_worker_fails_closed(self) -> None:
+        record = BENCHMARK.parse_process_monitor(
+            "0 1000 C 1 0 - - - - 100 0 3",
+            True,
+            -15,
+            {1000: 0, 1001: 1},
+        )
+        self.assertFalse(record["pass"])
+        self.assertEqual(record["unobserved_expected_worker_pids"], [1001])
+
+    def test_expected_worker_on_wrong_gpu_fails_closed(self) -> None:
+        output = "\n".join(
+            [
+                "1 1000 C 1 0 - - - - 100 0 3",
+                "1 1001 C 1 0 - - - - 100 0 3",
+            ]
+        )
+        record = BENCHMARK.parse_process_monitor(
+            output, True, -15, {1000: 0, 1001: 1}
+        )
+        self.assertFalse(record["pass"])
+        self.assertEqual(len(record["unrelated_process_rows"]), 1)
+
+    def test_malformed_non_header_row_fails_closed(self) -> None:
+        output = "\n".join(
+            [
+                "0 1000 C 1 0 - - - - 100 0 3",
+                "1 1001 C 1 0 - - - - 100 0",
+                "malformed-row",
+            ]
+        )
+        record = BENCHMARK.parse_process_monitor(
+            output, True, -15, {1000: 0, 1001: 1}
+        )
+        self.assertFalse(record["pass"])
+        self.assertEqual(record["unrelated_process_rows"], ["malformed-row"])
+
+    def test_monitor_lifecycle_must_be_alive_with_accepted_exit(self) -> None:
+        output = "\n".join(
+            [
+                "0 1000 C 1 0 - - - - 100 0 3",
+                "1 1001 C 1 0 - - - - 100 0",
+            ]
+        )
+        self.assertFalse(
+            BENCHMARK.parse_process_monitor(
+                output, True, 7, {1000: 0, 1001: 1}
+            )["pass"]
+        )
+        self.assertFalse(
+            BENCHMARK.parse_process_monitor(
+                output, False, 0, {1000: 0, 1001: 1}
+            )["pass"]
+        )
+
     def test_unrelated_same_name_pid_fails_closed(self) -> None:
         output = "\n".join(
             [
@@ -507,7 +702,11 @@ class SourceTests(unittest.TestCase):
         matrix = BENCHMARK.configurations(6)
         self.assertEqual(
             {(item["pixels"], item["ranks"]) for item in matrix},
-            {(128, 1), (128, 2), (256, 1), (256, 2)},
+            {(32, 1), (32, 2), (128, 1), (128, 2), (256, 1), (256, 2)},
+        )
+        small = [item for item in matrix if item["pixels"] == 32]
+        self.assertTrue(
+            all(item["warmup_steps"] == 120 and item["steps"] == 800 for item in small)
         )
         self.assertTrue(all(item["repeats"] == 6 for item in matrix))
         self.assertEqual(

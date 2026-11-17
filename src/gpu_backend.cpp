@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cerrno>
 #include <climits>
 #include <cmath>
@@ -45,12 +46,33 @@ bool exact_opt_in_without_disable(const char *enable_name,
          std::getenv(disable_name) == nullptr;
 }
 
+bool zero_state_lorentzian_elision_opted_in() noexcept {
+  return exact_opt_in_without_disable(
+      "MEEP_GPU_ENABLE_ZERO_STATE_LORENTZIAN_ELISION",
+      "MEEP_GPU_DISABLE_ZERO_STATE_LORENTZIAN_ELISION");
+}
+
+enum class sparse_lorentzian_control_token : std::uint8_t {
+  disabled = 0,
+  enabled = 1
+};
+
+sparse_lorentzian_control_token
+sparse_lorentzian_control_from_environment() noexcept {
+  return exact_opt_in_without_disable(
+             "MEEP_GPU_ENABLE_SPARSE_LORENTZIAN_PLAN",
+             "MEEP_GPU_DISABLE_SPARSE_LORENTZIAN_PLAN")
+             ? sparse_lorentzian_control_token::enabled
+             : sparse_lorentzian_control_token::disabled;
+}
+
 phase_batch_mode phase_batch_mode_from_environment(
-    const char *enable_name, const char *disable_name) noexcept {
+    const char *enable_name, const char *disable_name,
+    phase_batch_mode unset_mode) noexcept {
   if (std::getenv(disable_name) != nullptr)
     return phase_batch_mode::disabled;
   const char *enabled = std::getenv(enable_name);
-  if (!enabled) return phase_batch_mode::automatic;
+  if (!enabled) return unset_mode;
   return enabled[0] == '1' && enabled[1] == '\0'
              ? phase_batch_mode::forced
              : phase_batch_mode::disabled;
@@ -69,19 +91,33 @@ bool inject_eigenmode_failure_for_testing(const char *stage) noexcept {
 phase_batch_mode phase_batched_curl_mode() noexcept {
   return phase_batch_mode_from_environment(
       "MEEP_GPU_ENABLE_PHASE_BATCHED_CURL",
-      "MEEP_GPU_DISABLE_PHASE_BATCHED_CURL");
+      "MEEP_GPU_DISABLE_PHASE_BATCHED_CURL",
+      phase_batch_mode::automatic);
+}
+
+bool structured_curl_graph_opted_in() noexcept {
+  if (!exact_opt_in_without_disable(
+          "MEEP_GPU_ENABLE_STRUCTURED_CURL_GRAPH",
+          "MEEP_GPU_DISABLE_STRUCTURED_CURL_GRAPH"))
+    return false;
+  // The historical phase kernel is a distinct implementation with qualified
+  // regressions. If it is explicitly forced, keep that experiment authoritative
+  // instead of silently combining two submission algorithms.
+  return phase_batched_curl_mode() != phase_batch_mode::forced;
 }
 
 phase_batch_mode phase_batched_update_eh_mode() noexcept {
   return phase_batch_mode_from_environment(
       "MEEP_GPU_ENABLE_PHASE_BATCHED_UPDATE_EH",
-      "MEEP_GPU_DISABLE_PHASE_BATCHED_UPDATE_EH");
+      "MEEP_GPU_DISABLE_PHASE_BATCHED_UPDATE_EH",
+      phase_batch_mode::automatic);
 }
 
 phase_batch_mode dft_multi_monitor_batch_mode() noexcept {
   return phase_batch_mode_from_environment(
       "MEEP_GPU_ENABLE_MULTI_MONITOR_DFT_BATCH",
-      "MEEP_GPU_DISABLE_MULTI_MONITOR_DFT_BATCH");
+      "MEEP_GPU_DISABLE_MULTI_MONITOR_DFT_BATCH",
+      phase_batch_mode::automatic);
 }
 
 bool automatic_dft_multi_monitor_batch_selected(
@@ -126,6 +162,32 @@ bool automatic_phase_batch_selected(
     return false;
   return maximum_operation_block_count <= per_operation_limit &&
          logical_block_count <= operation_count * per_operation_limit;
+}
+
+bool automatic_curl_phase_batch_selected(
+    std::size_t operation_count, std::size_t logical_block_count,
+    std::size_t maximum_operation_block_count,
+    int multiprocessor_count) noexcept {
+  // The fused curl kernel saves launches, but its phase-wide block map adds
+  // one lookup to every block and collection itself is not free.  Production
+  // examples show a useful launch-bound region when the *whole* phase fits in
+  // roughly 24 logical blocks per SM.  Unlike the E/H rule above, do not
+  // multiply this budget by operation count: doing so admitted the large
+  // synthetic grids where the historical fused path regressed badly.
+  constexpr std::size_t minimum_operations = 4;
+  constexpr std::size_t maximum_phase_blocks_per_sm = 24;
+  constexpr std::size_t maximum_operation_blocks_per_sm = 12;
+  if (operation_count < minimum_operations || logical_block_count == 0 ||
+      maximum_operation_block_count == 0 || multiprocessor_count <= 0 ||
+      maximum_operation_block_count > logical_block_count)
+    return false;
+  const std::size_t sms = static_cast<std::size_t>(multiprocessor_count);
+  if (sms > std::numeric_limits<std::size_t>::max() /
+                maximum_phase_blocks_per_sm)
+    return false;
+  return logical_block_count <= sms * maximum_phase_blocks_per_sm &&
+         maximum_operation_block_count <=
+             sms * maximum_operation_blocks_per_sm;
 }
 
 std::uint64_t next_saturating_boundary_topology_generation(
@@ -226,9 +288,23 @@ std::vector<std::uint32_t> plan_phase_block_operation_indices(
 }
 
 #if MEEP_HAVE_CUDA
-std::uint64_t next_resident_allocation_generation() noexcept {
+std::atomic<std::uint64_t> &resident_allocation_generation_counter() noexcept {
   static std::atomic<std::uint64_t> generation(0);
-  return generation.fetch_add(1, std::memory_order_relaxed) + 1;
+  return generation;
+}
+
+std::uint64_t next_resident_allocation_generation() noexcept {
+  std::atomic<std::uint64_t> &generation =
+      resident_allocation_generation_counter();
+  std::uint64_t current = generation.load(std::memory_order_relaxed);
+  while (current != std::numeric_limits<std::uint64_t>::max()) {
+    const std::uint64_t next = current + 1;
+    if (generation.compare_exchange_weak(
+            current, next, std::memory_order_relaxed,
+            std::memory_order_relaxed))
+      return next;
+  }
+  return 0;
 }
 
 std::uint64_t next_resident_content_generation() noexcept {
@@ -254,6 +330,18 @@ struct resident_cache {
 
   std::unordered_map<const float *, mirror> mirrors;
   std::map<std::uintptr_t, const float *> mirror_intervals;
+  struct prepared_span_resolution {
+    std::size_t bytes;
+    const float *host_base;
+    mirror *owning_mirror;
+    std::uintptr_t byte_offset;
+  };
+  // Positive exact-range lookups only. Every mirror topology mutation clears
+  // this bounded index BEFORE touching its nodes or device allocations. The
+  // allocation generation alone is insufficient: source-profile replacement
+  // intentionally leaves unrelated descriptor generations unchanged.
+  std::unordered_map<const float *, prepared_span_resolution>
+      prepared_span_resolutions;
   std::vector<std::pair<std::size_t, void *> > recycled_mirror_allocations;
   // Source profiles are replaced far more often than ordinary field and
   // material mirrors. Keep their exact-size reuse pool separate so changing
@@ -447,6 +535,83 @@ struct resident_cache {
       ldos_host_operations;
   double *ldos_reduction_workspace;
   std::size_t ldos_reduction_partial_capacity;
+  enum class sparse_lorentzian_plan_state {
+    observed,
+    sparse,
+    dense_locked,
+    quarantined
+  };
+  struct sparse_lorentzian_identity {
+    const float *host_polarization = nullptr;
+    const float *host_auxiliary = nullptr;
+    const float *host_sigma = nullptr;
+    const float *host_field = nullptr;
+    const void *device_polarization = nullptr;
+    const void *device_auxiliary = nullptr;
+    const void *device_sigma = nullptr;
+    const void *device_field = nullptr;
+    meep_cuda::index_space_fp32 index_space{};
+    std::size_t array_count = 0;
+    std::size_t point_count = 0;
+    std::uint64_t polarization_upload_epoch = 0;
+    std::uint64_t auxiliary_upload_epoch = 0;
+    std::uint64_t sigma_upload_epoch = 0;
+    std::uint64_t field_upload_epoch = 0;
+    std::uint64_t allocation_generation = 0;
+    std::uint64_t control_generation = 0;
+    std::uint32_t gamma_inverse_bits = 0;
+    std::uint32_t gamma_previous_bits = 0;
+    std::uint32_t omega_dt_squared_bits = 0;
+    std::uint32_t omega_dt_squared_denominator_bits = 0;
+    std::uint32_t options = 0;
+    int device_ordinal = -1;
+    bool increment_state = false;
+  };
+  struct sparse_lorentzian_guard_identity {
+    const float *host_field = nullptr;
+    const void *device_field = nullptr;
+    meep_cuda::index_space_fp32 index_space{};
+    std::size_t point_count = 0;
+    std::uint64_t field_upload_epoch = 0;
+    std::uint64_t allocation_generation = 0;
+    std::uint64_t control_generation = 0;
+    int device_ordinal = -1;
+  };
+  struct sparse_lorentzian_guard {
+    sparse_lorentzian_guard_identity identity;
+    std::uint32_t *device_sticky = nullptr;
+    std::uint64_t last_scanned_epoch = 0;
+    std::size_t dependent_plans = 0;
+    bool execution_eligible = false;
+  };
+  struct sparse_lorentzian_plan {
+    sparse_lorentzian_identity identity;
+    sparse_lorentzian_plan_state state =
+        sparse_lorentzian_plan_state::observed;
+    std::ptrdiff_t *device_active_indices = nullptr;
+    std::uint32_t *device_validation_flag = nullptr;
+    std::size_t active_count = 0;
+    std::size_t retained_index_bytes = 0;
+    std::size_t guard_slot = std::numeric_limits<std::size_t>::max();
+    std::uint64_t observation_count = 1;
+    bool execution_eligible = false;
+  };
+  std::vector<sparse_lorentzian_plan> sparse_lorentzian_plans;
+  std::vector<sparse_lorentzian_guard> sparse_lorentzian_guards;
+  meep_cuda::lorentzian_sparse_execution_ledger_fp32
+      *sparse_lorentzian_ledger;
+  sparse_lorentzian_control_token sparse_lorentzian_control;
+  std::uint64_t sparse_lorentzian_control_generation;
+  std::size_t sparse_lorentzian_retained_index_bytes;
+  bool sparse_lorentzian_permanent_dense_lock;
+  bool sparse_lorentzian_teardown_incomplete;
+  // A failed device selection or quiescence means no allocation reachable
+  // from this cache may be reclaimed.  Keep the complete object alive until
+  // process exit so queued CUDA work can never observe freed mirrors or plan
+  // metadata.  quarantine_next is intrusive so the noexcept failure path does
+  // not itself allocate.
+  bool device_storage_quarantined;
+  resident_cache *quarantine_next;
   void *index_pointer;
   std::size_t index_capacity;
   int device_ordinal;
@@ -462,6 +627,14 @@ struct resident_cache {
         ldos_plan_snapshot_valid(false), ldos_plan_descriptor_bytes(0),
         ldos_plan_total_block_count(0), ldos_reduction_workspace(nullptr),
         ldos_reduction_partial_capacity(0),
+        sparse_lorentzian_ledger(nullptr),
+        sparse_lorentzian_control(
+            sparse_lorentzian_control_token::disabled),
+        sparse_lorentzian_control_generation(1),
+        sparse_lorentzian_retained_index_bytes(0),
+        sparse_lorentzian_permanent_dense_lock(false),
+        sparse_lorentzian_teardown_incomplete(false),
+        device_storage_quarantined(false), quarantine_next(nullptr),
         index_pointer(nullptr), index_capacity(0),
         device_ordinal(-1), epoch(0),
         allocation_generation(next_resident_allocation_generation()),
@@ -597,6 +770,7 @@ struct backend_state {
   std::mutex mutex;
   bool configured;
   bool device_ready;
+  bool transition_in_progress;
   backend_mode requested;
   backend_mode active;
   int selected_device;
@@ -604,14 +778,41 @@ struct backend_state {
   std::uint64_t generation;
   std::string configured_environment_signature;
   std::string diagnostic;
+  std::unordered_map<const void *, backend_mode> pinned_owners;
 
   backend_state()
-      : configured(false), device_ready(false),
+      : configured(false), device_ready(false), transition_in_progress(false),
         requested(backend_mode::cpu), active(backend_mode::cpu),
         selected_device(-1), explicit_device_selection(false), generation(0) {}
 };
 
 backend_state state;
+constexpr unsigned char backend_query_unready = 0;
+constexpr unsigned char backend_query_cpu = 1;
+constexpr unsigned char backend_query_cuda = 2;
+std::atomic<unsigned char> backend_query_fast_path_state(
+    backend_query_unready);
+// Resident-cache host synchronization must retain the last active CUDA view
+// while a backend/device transition is synchronizing device-authoritative
+// mirrors.  It is deliberately separate from the public query state, which
+// becomes unready for the duration of that transition.
+std::atomic<bool> resident_cuda_active_fast_path(false);
+
+void invalidate_backend_query_fast_path_locked() noexcept {
+  backend_query_fast_path_state.store(
+      backend_query_unready, std::memory_order_release);
+}
+
+void publish_active_backend_fast_path_locked() noexcept {
+  resident_cuda_active_fast_path.store(
+      state.active == backend_mode::cuda, std::memory_order_release);
+  const unsigned char published =
+      !state.configured || state.transition_in_progress
+          ? backend_query_unready
+          : (state.active == backend_mode::cuda ? backend_query_cuda
+                                                : backend_query_cpu);
+  backend_query_fast_path_state.store(published, std::memory_order_release);
+}
 
 std::atomic<std::uint64_t> cpu_curl_calls(0);
 std::atomic<std::uint64_t> cpu_curl_points(0);
@@ -625,6 +826,69 @@ std::atomic<std::uint64_t> cpu_polarization_calls(0);
 std::atomic<std::uint64_t> cpu_polarization_points(0);
 std::atomic<std::uint64_t> cuda_polarization_calls(0);
 std::atomic<std::uint64_t> cuda_polarization_points(0);
+std::atomic<std::uint64_t> cuda_zero_state_elision_enabled_calls(0);
+std::atomic<std::uint64_t> cuda_zero_state_elision_enabled_points(0);
+std::atomic<std::uint64_t> cuda_zero_state_elision_inspectable_calls(0);
+std::atomic<std::uint64_t> cuda_zero_state_elision_inspectable_points(0);
+struct sparse_lorentzian_host_counters {
+  std::atomic<std::uint64_t> opt_in_calls;
+  std::atomic<std::uint64_t> opt_in_points;
+  std::atomic<std::uint64_t> eligible_calls;
+  std::atomic<std::uint64_t> eligible_points;
+  std::atomic<std::uint64_t> ineligible_calls;
+  std::atomic<std::uint64_t> ineligible_points;
+  std::atomic<std::uint64_t> first_observation_dense_calls;
+  std::atomic<std::uint64_t> first_observation_dense_points;
+  std::atomic<std::uint64_t> plan_build_attempts;
+  std::atomic<std::uint64_t> plan_build_successes;
+  std::atomic<std::uint64_t> plan_build_failures;
+  std::atomic<std::uint64_t> plan_hits;
+  std::atomic<std::uint64_t> plan_invalidations;
+  std::atomic<std::uint64_t> dense_locked_decisions;
+  std::atomic<std::uint64_t> accepted_total_points;
+  std::atomic<std::uint64_t> accepted_active_points;
+  std::atomic<std::uint64_t> sparse_submission_calls;
+  std::atomic<std::uint64_t> sparse_submission_points;
+  std::atomic<std::uint64_t> guard_scan_submissions;
+  std::atomic<std::uint64_t> guard_scan_submission_points;
+  std::atomic<std::uint64_t> cpu_fallback_calls;
+  std::atomic<std::uint64_t> cpu_fallback_points;
+  std::atomic<bool> counter_overflow;
+  std::atomic<bool> teardown_incomplete;
+
+  sparse_lorentzian_host_counters()
+      : opt_in_calls(0), opt_in_points(0), eligible_calls(0),
+        eligible_points(0), ineligible_calls(0), ineligible_points(0),
+        first_observation_dense_calls(0),
+        first_observation_dense_points(0), plan_build_attempts(0),
+        plan_build_successes(0), plan_build_failures(0), plan_hits(0),
+        plan_invalidations(0), dense_locked_decisions(0),
+        accepted_total_points(0), accepted_active_points(0),
+        sparse_submission_calls(0), sparse_submission_points(0),
+        guard_scan_submissions(0), guard_scan_submission_points(0),
+        cpu_fallback_calls(0), cpu_fallback_points(0),
+        counter_overflow(false), teardown_incomplete(false) {}
+};
+
+sparse_lorentzian_host_counters sparse_lorentzian_host_statistics;
+
+struct sparse_lorentzian_folded_ledger {
+  std::uint64_t guard_scan_calls = 0;
+  std::uint64_t guard_scan_points = 0;
+  std::uint64_t sparse_update_calls = 0;
+  std::uint64_t sparse_update_points = 0;
+  std::uint64_t dense_fallback_calls = 0;
+  std::uint64_t dense_fallback_points = 0;
+  bool counter_overflow = false;
+};
+
+sparse_lorentzian_folded_ledger sparse_lorentzian_destroyed_ledger;
+std::mutex &sparse_lorentzian_statistics_mutex() {
+  static std::mutex *mutex = new std::mutex;
+  return *mutex;
+}
+std::atomic<std::uint64_t> sparse_lorentzian_reset_generation(1);
+std::atomic<bool> sparse_lorentzian_reset_exhausted(false);
 std::atomic<std::uint64_t> cpu_source_calls(0);
 std::atomic<std::uint64_t> cpu_source_points(0);
 std::atomic<std::uint64_t> cuda_source_calls(0);
@@ -633,6 +897,35 @@ std::atomic<std::uint64_t> cpu_boundary_calls(0);
 std::atomic<std::uint64_t> cpu_boundary_points(0);
 std::atomic<std::uint64_t> cuda_boundary_calls(0);
 std::atomic<std::uint64_t> cuda_boundary_points(0);
+std::atomic<std::uint64_t> boundary_execution_local_checks(0);
+std::atomic<std::uint64_t> boundary_execution_local_disabled(0);
+std::atomic<std::uint64_t> boundary_execution_local_unready(0);
+std::atomic<std::uint64_t> boundary_execution_local_prepare_invalidations(0);
+std::atomic<std::uint64_t> boundary_execution_local_replay_empty(0);
+std::atomic<std::uint64_t> boundary_execution_local_replay_work(0);
+std::atomic<std::uint64_t> boundary_execution_local_failures(0);
+std::atomic<std::uint64_t> boundary_execution_local_descriptor_rebuild_attempts(0);
+std::atomic<std::uint64_t> boundary_execution_prepare_calls(0);
+std::atomic<std::uint64_t> boundary_execution_prepare_failures(0);
+std::atomic<std::uint64_t> boundary_execution_prepared_arrays(0);
+std::atomic<std::uint64_t> boundary_execution_prepare_host_nanoseconds(0);
+std::atomic<std::uint64_t> boundary_execution_plan_empty(0);
+std::atomic<std::uint64_t> boundary_execution_plan_direct_zero(0);
+std::atomic<std::uint64_t> boundary_execution_plan_direct_local(0);
+std::atomic<std::uint64_t> boundary_execution_plan_graph(0);
+std::atomic<std::uint64_t> boundary_execution_plan_staged(0);
+std::atomic<std::uint64_t> boundary_execution_span_cache_hits(0);
+std::atomic<std::uint64_t> boundary_execution_span_cache_misses(0);
+std::atomic<std::uint64_t> boundary_execution_span_cache_bypasses(0);
+std::atomic<std::uint64_t> point_read_cuda_read_attempts(0);
+std::atomic<std::uint64_t> point_read_cuda_read_completions(0);
+std::atomic<std::uint64_t> point_read_cuda_read_failures(0);
+std::atomic<std::uint64_t> point_read_scalars_copied(0);
+std::atomic<std::uint64_t> point_read_device_to_host_calls(0);
+std::atomic<std::uint64_t> point_read_device_to_host_bytes(0);
+std::atomic<std::uint64_t> point_read_host_nanoseconds(0);
+
+
 std::atomic<std::uint64_t> boundary_gather_fast_replays(0);
 std::atomic<std::uint64_t> boundary_gather_full_validations(0);
 std::atomic<std::uint64_t> boundary_scatter_fast_replays(0);
@@ -799,6 +1092,10 @@ std::atomic<std::uint64_t> finite_check_device_to_host_bytes(0);
 std::atomic<std::uint64_t> host_to_device_bytes_avoided(0);
 std::atomic<std::uint64_t> device_to_host_bytes_avoided(0);
 std::atomic<std::uint64_t> device_buffer_allocations(0);
+std::atomic<std::uint64_t> material_phasing_checks(0);
+std::atomic<std::uint64_t> material_phasing_reused(0);
+std::atomic<std::uint64_t> material_phasing_disabled(0);
+std::atomic<std::uint64_t> material_phasing_ineligible(0);
 std::atomic<std::uint64_t> device_buffer_reuses(0);
 std::atomic<std::uint64_t> boundary_phase_graph_creations(0);
 std::atomic<std::uint64_t> boundary_phase_graph_launches(0);
@@ -852,6 +1149,29 @@ std::atomic<std::uint64_t> phase_curl_replay_generation_misses(0);
 std::atomic<std::uint64_t> phase_curl_replay_mirror_misses(0);
 std::atomic<std::uint64_t>
     curl_phase_replay_launch_failures_for_testing(0);
+std::atomic<std::uint64_t> structured_curl_graph_collection_checks(0);
+std::atomic<std::uint64_t> structured_curl_graph_collection_launches(0);
+std::atomic<std::uint64_t> structured_curl_graph_plan_creations(0);
+std::atomic<std::uint64_t> structured_curl_graph_plan_rebuilds(0);
+std::atomic<std::uint64_t> structured_curl_graph_plan_reuses(0);
+std::atomic<std::uint64_t> structured_curl_graph_plan_destroys(0);
+std::atomic<std::uint64_t> structured_curl_graph_plan_destroy_failures(0);
+std::atomic<std::uint64_t> structured_curl_graph_live_plans(0);
+std::atomic<std::uint64_t> structured_curl_graph_quarantined_plans(0);
+std::atomic<std::uint64_t> structured_curl_graph_logical_operations(0);
+std::atomic<std::uint64_t> structured_curl_graph_unsupported_fallbacks(0);
+std::atomic<std::uint64_t> structured_curl_graph_creation_fallbacks(0);
+std::atomic<std::uint64_t> structured_curl_graph_launch_failures(0);
+std::atomic<std::uint64_t> structured_curl_graph_replay_checks(0);
+std::atomic<std::uint64_t> structured_curl_graph_replay_launches(0);
+std::atomic<std::uint64_t> structured_curl_graph_replay_unready(0);
+std::atomic<std::uint64_t>
+    structured_curl_graph_replay_generation_misses(0);
+std::atomic<std::uint64_t> structured_curl_graph_replay_mirror_misses(0);
+std::atomic<std::uint64_t>
+    structured_curl_graph_creation_failures_for_testing(0);
+std::atomic<int>
+    structured_curl_graph_post_destroy_device_for_testing(-1);
 std::atomic<std::uint64_t> phase_update_eh_automatic_checks(0);
 std::atomic<std::uint64_t> phase_update_eh_automatic_selected(0);
 std::atomic<std::uint64_t> phase_update_eh_automatic_rejected(0);
@@ -872,6 +1192,39 @@ std::atomic<std::uint64_t> &live_device_buffer_count() {
   return *count;
 }
 
+void sparse_lorentzian_saturating_add(
+    std::atomic<std::uint64_t> &counter, std::uint64_t increment) noexcept {
+  std::uint64_t current = counter.load(std::memory_order_relaxed);
+  for (;;) {
+    const bool overflow =
+        increment > std::numeric_limits<std::uint64_t>::max() - current;
+    const std::uint64_t desired =
+        overflow ? std::numeric_limits<std::uint64_t>::max()
+                 : current + increment;
+    if (counter.compare_exchange_weak(
+            current, desired, std::memory_order_relaxed,
+            std::memory_order_relaxed)) {
+      if (overflow)
+        sparse_lorentzian_host_statistics.counter_overflow.store(
+            true, std::memory_order_relaxed);
+      return;
+    }
+  }
+}
+
+#if MEEP_HAVE_CUDA
+void sparse_lorentzian_saturating_add_value(
+    std::uint64_t &counter, std::uint64_t increment,
+    bool &overflow_flag) noexcept {
+  if (increment > std::numeric_limits<std::uint64_t>::max() - counter) {
+    counter = std::numeric_limits<std::uint64_t>::max();
+    overflow_flag = true;
+  }
+  else
+    counter += increment;
+}
+#endif
+
 std::uint64_t next_boundary_plan_generation() noexcept {
   static std::atomic<std::uint64_t> generation(0);
   return generation.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -881,6 +1234,7 @@ std::uint64_t next_boundary_plan_generation() noexcept {
 struct resident_registry {
   std::mutex mutex;
   std::unordered_map<const void *, detail::resident_cache *> caches;
+  detail::resident_cache *quarantine_head = nullptr;
 };
 
 resident_registry &get_resident_registry() {
@@ -891,11 +1245,35 @@ resident_registry &get_resident_registry() {
   return *registry;
 }
 
+void require_resident_cache_accessible(
+    const detail::resident_cache *cache, const char *operation) {
+  if (cache && cache->device_storage_quarantined)
+    throw std::runtime_error(
+        std::string(operation) +
+        " rejected a Meep CUDA resident cache quarantined after failed "
+        "device quiescence");
+}
+
+bool external_device_reclamation_quarantined() noexcept {
+  // Once any owning-device selection/fence has failed, a process-global
+  // external descriptor registry may still contain work which references the
+  // quarantined cache.  Owner/all-clear calls do not carry enough causal
+  // information to prove otherwise, so detach their host metadata but retain
+  // every CUDA allocation/graph/event process-long.  This is an exceptional
+  // fail-closed path; ordinary runs never pay this retention cost.
+  return sparse_lorentzian_host_statistics.teardown_incomplete.load(
+      std::memory_order_relaxed);
+}
+
 void release_dft_materialization_plan(
     detail::resident_cache *cache) noexcept {
   if (!cache) return;
   detail::resident_cache::dft_materialization_plan &plan =
       cache->dft_materialization;
+  if (external_device_reclamation_quarantined()) {
+    plan = detail::resident_cache::dft_materialization_plan();
+    return;
+  }
   if (cache->device_ordinal >= 0) {
     try {
       meep_cuda::select_device(cache->device_ordinal);
@@ -918,6 +1296,10 @@ void release_dft_output_staging_plan(
   if (!cache) return;
   detail::resident_cache::dft_output_staging_plan &plan =
       cache->dft_output_staging;
+  if (external_device_reclamation_quarantined()) {
+    plan = detail::resident_cache::dft_output_staging_plan();
+    return;
+  }
   if (cache->device_ordinal >= 0) {
     try {
       meep_cuda::select_device(cache->device_ordinal);
@@ -1125,6 +1507,10 @@ bool same_near2far_gradient(
 
 void release_near2far_adjoint_plan(
     near2far_adjoint_retained_plan &plan) noexcept {
+  if (external_device_reclamation_quarantined()) {
+    plan = near2far_adjoint_retained_plan();
+    return;
+  }
   if (plan.device_ordinal >= 0) {
     try {
       meep_cuda::select_device(plan.device_ordinal);
@@ -1201,6 +1587,10 @@ bool same_near2far_static_plan(
 }
 
 void release_near2far_plan(near2far_retained_plan &plan) noexcept {
+  if (external_device_reclamation_quarantined()) {
+    plan = near2far_retained_plan();
+    return;
+  }
   if (plan.device_ordinal >= 0) {
     try {
       meep_cuda::select_device(plan.device_ordinal);
@@ -1358,6 +1748,10 @@ bool same_dft_reduction_plan(
 
 void release_dft_reduction_plan(
     dft_reduction_retained_plan &plan) noexcept {
+  if (external_device_reclamation_quarantined()) {
+    plan = dft_reduction_retained_plan();
+    return;
+  }
   if (plan.device_ordinal >= 0) {
     try {
       meep_cuda::select_device(plan.device_ordinal);
@@ -1538,6 +1932,10 @@ bool same_eigenmode_overlap_plan(
 
 void release_eigenmode_overlap_plan(
     eigenmode_overlap_retained_plan &plan) noexcept {
+  if (external_device_reclamation_quarantined()) {
+    plan = eigenmode_overlap_retained_plan();
+    return;
+  }
   if (plan.device_ordinal >= 0) {
     try {
       meep_cuda::select_device(plan.device_ordinal);
@@ -1685,6 +2083,7 @@ struct curl_phase_plan {
   };
 
   void *device_operations = nullptr;
+  meep_cuda::structured_curl_graph_fp32 *structured_graph = nullptr;
   std::size_t capacity_bytes = 0;
   int device_ordinal = -1;
   std::size_t descriptor_bytes = 0;
@@ -1694,6 +2093,9 @@ struct curl_phase_plan {
   std::uint64_t topology_fingerprint = 0;
   std::size_t stable_reuses = 0;
   bool complete_phase = false;
+  bool structured_graph_mode = false;
+  bool quarantined = false;
+  bool automatic_rejected = false;
   detail::phase_batch_mode mode = detail::phase_batch_mode::disabled;
   std::vector<meep_cuda::curl_phase_operation_fp32> host_operations;
   std::vector<detail::resident_cache *> cache_dependencies;
@@ -1727,9 +2129,11 @@ struct curl_phase_collection {
   std::vector<curl_phase_plan::mirror_dependency> writable_mirrors;
   std::size_t flush_count = 0;
   std::size_t batched_flush_count = 0;
+  std::size_t graph_flush_count = 0;
   bool replayed = false;
   bool replay_forbidden = false;
   bool replay_supported = false;
+  bool structured_graph = false;
 };
 
 thread_local curl_phase_collection pending_curl_phase;
@@ -1912,38 +2316,93 @@ bool same_curl_phase_operations(
   return true;
 }
 
-void release_curl_phase_plan(curl_phase_plan &plan) noexcept {
-  if (plan.device_ordinal >= 0) {
-    try {
-      meep_cuda::select_device(plan.device_ordinal);
-    }
-    catch (...) {}
+void quarantine_resident_device_storage(
+    detail::resident_cache *cache) noexcept;
+
+void quarantine_curl_phase_plan(
+    curl_phase_plan &plan) noexcept {
+  for (detail::resident_cache *cache : plan.cache_dependencies)
+    quarantine_resident_device_storage(cache);
+  if (!plan.quarantined) {
+    plan.quarantined = true;
+    if (plan.structured_graph)
+      structured_curl_graph_quarantined_plans.fetch_add(
+          1, std::memory_order_relaxed);
   }
-  meep_cuda::free_device(plan.device_operations);
-  if (plan.device_operations) live_device_buffer_count().fetch_sub(1);
-  plan.device_operations = nullptr;
-  plan.capacity_bytes = 0;
-  plan.device_ordinal = -1;
-  plan.descriptor_bytes = 0;
-  plan.operation_count = 0;
-  plan.total_block_count = 0;
-  plan.point_count = 0;
-  plan.stable_reuses = 0;
   plan.complete_phase = false;
-  plan.mode = detail::phase_batch_mode::disabled;
-  plan.host_operations.clear();
-  plan.cache_dependencies.clear();
-  plan.cache_generations.clear();
-  plan.mirror_dependencies.clear();
-  plan.writable_mirrors.clear();
+  plan.stable_reuses = 0;
+}
+
+bool release_curl_phase_plan(curl_phase_plan &plan) noexcept {
+  if (external_device_reclamation_quarantined()) {
+    const bool device_state_retained =
+        plan.structured_graph != nullptr || plan.device_operations != nullptr;
+    if (device_state_retained) quarantine_curl_phase_plan(plan);
+    // Keep the complete plan object, graph handle, descriptors, and host-side
+    // dependency metadata reachable process-long.  A queued graph may still
+    // need every captured allocation, and destroying the map value would
+    // silently discard the evidence tying those lifetimes together.
+    if (!device_state_retained) plan = curl_phase_plan();
+    return !device_state_retained;
+  }
+  if (plan.structured_graph) {
+    // The runtime destroys only after reselecting the creation device and
+    // proving device-wide completion. A false result leaves the executable
+    // live, so retain every captured allocation process-long as well.
+    if (!meep_cuda::destroy_structured_curl_graph_fp32(
+            plan.structured_graph)) {
+      structured_curl_graph_plan_destroy_failures.fetch_add(
+          1, std::memory_order_relaxed);
+      quarantine_curl_phase_plan(plan);
+      return false;
+    }
+    structured_curl_graph_plan_destroys.fetch_add(
+        1, std::memory_order_relaxed);
+    structured_curl_graph_live_plans.fetch_sub(
+        1, std::memory_order_relaxed);
+    plan.structured_graph = nullptr;
+    const int post_destroy_device =
+        structured_curl_graph_post_destroy_device_for_testing.exchange(
+            -1, std::memory_order_relaxed);
+    if (post_destroy_device >= 0) {
+      try {
+        meep_cuda::select_device(post_destroy_device);
+      }
+      catch (...) {}
+    }
+  }
+  if (plan.device_operations) {
+    try {
+      if (plan.device_ordinal < 0)
+        throw std::logic_error(
+            "Meep CUDA curl phase descriptor has no owning device");
+      meep_cuda::select_device(plan.device_ordinal);
+      meep_cuda::synchronize();
+    }
+    catch (...) {
+      // The descriptor can still be referenced by an asynchronous ordinary
+      // phase launch. Preserve it, its metadata, and all source/destination
+      // allocations when completion cannot be proved.
+      quarantine_curl_phase_plan(plan);
+      return false;
+    }
+    meep_cuda::free_device(plan.device_operations);
+    live_device_buffer_count().fetch_sub(1);
+  }
+  plan = curl_phase_plan();
+  return true;
 }
 
 void clear_all_curl_phase_plans() noexcept {
   curl_phase_registry &registry = get_curl_phase_registry();
   std::lock_guard<std::mutex> lock(registry.mutex);
-  for (auto &entry : registry.plans)
-    release_curl_phase_plan(entry.second);
-  registry.plans.clear();
+  for (auto entry = registry.plans.begin();
+       entry != registry.plans.end();) {
+    if (release_curl_phase_plan(entry->second))
+      entry = registry.plans.erase(entry);
+    else
+      ++entry;
+  }
 }
 
 void clear_curl_phase_plans_for_owner(const void *owner) noexcept {
@@ -1952,18 +2411,21 @@ void clear_curl_phase_plans_for_owner(const void *owner) noexcept {
   for (auto entry = registry.plans.begin();
        entry != registry.plans.end();) {
     if (entry->first.first == owner) {
-      release_curl_phase_plan(entry->second);
-      entry = registry.plans.erase(entry);
+      if (release_curl_phase_plan(entry->second))
+        entry = registry.plans.erase(entry);
+      else
+        ++entry;
     }
     else
       ++entry;
   }
 }
 
-void clear_curl_phase_plans_for_cache(
+bool clear_curl_phase_plans_for_cache(
     detail::resident_cache *cache) noexcept {
   curl_phase_registry &registry = get_curl_phase_registry();
   std::lock_guard<std::mutex> lock(registry.mutex);
+  bool all_released = true;
   for (auto entry = registry.plans.begin();
        entry != registry.plans.end();) {
     const bool depends_on_cache =
@@ -1971,12 +2433,17 @@ void clear_curl_phase_plans_for_cache(
                   entry->second.cache_dependencies.end(), cache) !=
         entry->second.cache_dependencies.end();
     if (depends_on_cache) {
-      release_curl_phase_plan(entry->second);
-      entry = registry.plans.erase(entry);
+      if (release_curl_phase_plan(entry->second))
+        entry = registry.plans.erase(entry);
+      else {
+        all_released = false;
+        ++entry;
+      }
     }
     else
       ++entry;
   }
+  return all_released;
 }
 
 void mark_curl_phase_plan_incomplete(const void *owner, int phase_key) {
@@ -2006,8 +2473,16 @@ void certify_complete_curl_phase_noexcept(
         std::make_pair(collection.owner, collection.phase_key));
     if (found == registry.plans.end()) return;
     curl_phase_plan &plan = found->second;
+    const bool exactly_one_submission =
+        collection.structured_graph
+            ? collection.graph_flush_count == 1 &&
+                  collection.batched_flush_count == 0
+            : collection.batched_flush_count == 1 &&
+                  collection.graph_flush_count == 0;
     plan.complete_phase = collection.flush_count == 1 &&
-                          collection.batched_flush_count == 1 &&
+                          exactly_one_submission &&
+                          plan.structured_graph_mode ==
+                              collection.structured_graph &&
                           !collection.replay_forbidden;
     if (!plan.complete_phase) plan.stable_reuses = 0;
   }
@@ -2077,6 +2552,9 @@ void collect_curl_phase_writable(detail::resident_cache *cache,
       &pending_curl_phase.writable_mirrors, cache, host_pointer, bytes);
 }
 
+bool consume_failure_for_testing(
+    std::atomic<std::uint64_t> &failures) noexcept;
+
 void flush_pending_curl_phase() {
   curl_phase_collection &collection = pending_curl_phase;
   if (!collection.active || collection.operations.empty()) return;
@@ -2085,23 +2563,41 @@ void flush_pending_curl_phase() {
     throw std::logic_error(
         "Meep CUDA phase-batched curl has no device");
   meep_cuda::select_device(collection.device_ordinal);
-  // A singleton cannot save a launch. Preserve the lower-overhead structured
-  // kernel instead of paying for a resident descriptor and block map.
-  if (collection.operations.size() == 1) {
-    const auto &operation = collection.operations.front();
-    meep_cuda::step_curl_material_structured_fp32(
-        operation.field, operation.g1, operation.g2,
-        operation.inline_space, operation.point_count, operation.stride1,
-        operation.stride2, operation.dtdx, operation.material);
-    cuda_curl_calls.fetch_add(1);
-    cuda_curl_points.fetch_add(collection.point_count);
-    phase_curl_unbatched_operations.fetch_add(
-        1, std::memory_order_relaxed);
+
+  const auto clear_collection = [&collection]() noexcept {
     collection.operations.clear();
     collection.cache_dependencies.clear();
     collection.mirror_dependencies.clear();
     collection.writable_mirrors.clear();
     collection.point_count = 0;
+  };
+  const auto submit_sequential = [&collection, &clear_collection]() {
+    for (const auto &operation : collection.operations)
+      meep_cuda::step_curl_material_structured_fp32(
+          operation.field, operation.g1, operation.g2,
+          operation.inline_space, operation.point_count,
+          operation.stride1, operation.stride2, operation.dtdx,
+          operation.material);
+    cuda_curl_calls.fetch_add(
+        static_cast<std::uint64_t>(collection.operations.size()));
+    cuda_curl_points.fetch_add(collection.point_count);
+    if (!collection.structured_graph)
+      phase_curl_unbatched_operations.fetch_add(
+          static_cast<std::uint64_t>(collection.operations.size()),
+          std::memory_order_relaxed);
+    clear_collection();
+  };
+
+  if (collection.structured_graph)
+    structured_curl_graph_collection_checks.fetch_add(
+        1, std::memory_order_relaxed);
+  // A singleton cannot save a launch. Preserve the lower-overhead structured
+  // kernel instead of paying for a resident descriptor and block map.
+  if (collection.operations.size() == 1) {
+    if (collection.structured_graph)
+      structured_curl_graph_unsupported_fallbacks.fetch_add(
+          1, std::memory_order_relaxed);
+    submit_sequential();
     return;
   }
   constexpr std::size_t phase_threads = 256;
@@ -2120,10 +2616,160 @@ void flush_pending_curl_phase() {
     maximum_operation_block_count =
         std::max(maximum_operation_block_count, operation_blocks);
   }
+
+  // A direct beta/BFAST/cylindrical correction split this phase. Replaying or
+  // graphing only the ordinary-prefix portion would violate phase ordering, so
+  // preserve the existing structured submissions and leave the cached plan
+  // incomplete.
+  if (collection.structured_graph && collection.replay_forbidden) {
+    structured_curl_graph_unsupported_fallbacks.fetch_add(
+        1, std::memory_order_relaxed);
+    submit_sequential();
+    return;
+  }
+
+  if (collection.structured_graph) {
+    curl_phase_registry &registry = get_curl_phase_registry();
+    std::lock_guard<std::mutex> lock(registry.mutex);
+    curl_phase_plan &plan = registry.plans[
+        std::make_pair(collection.owner, collection.phase_key)];
+
+    bool generations_match =
+        plan.cache_generations.size() ==
+        collection.cache_dependencies.size();
+    for (std::size_t index = 0;
+         generations_match && index < collection.cache_dependencies.size();
+         ++index)
+      generations_match =
+          plan.cache_generations[index].first ==
+              collection.cache_dependencies[index] &&
+          plan.cache_generations[index].second != 0 &&
+          plan.cache_generations[index].second ==
+              collection.cache_dependencies[index]->allocation_generation;
+    const bool stable_identity =
+        plan.structured_graph && plan.structured_graph_mode &&
+        !plan.quarantined &&
+        plan.device_ordinal == collection.device_ordinal &&
+        plan.mode == collection.mode &&
+        same_curl_phase_operations(plan.host_operations,
+                                   collection.operations) &&
+        generations_match &&
+        plan.topology_fingerprint == collection.topology_fingerprint &&
+        plan.mirror_dependencies == collection.mirror_dependencies &&
+        plan.writable_mirrors == collection.writable_mirrors;
+
+    if (!stable_identity) {
+      curl_phase_plan prepared;
+      try {
+        // Finish all potentially-throwing host metadata allocations before
+        // retiring the old executable.  This leaves the complete old plan in
+        // its registry node if its synchronous lifetime fence fails.
+        prepared.device_ordinal = collection.device_ordinal;
+        prepared.operation_count = collection.operations.size();
+        prepared.total_block_count = total_block_count;
+        prepared.point_count = collection.point_count;
+        prepared.topology_fingerprint = collection.topology_fingerprint;
+        prepared.mode = collection.mode;
+        prepared.structured_graph_mode = true;
+        prepared.host_operations = collection.operations;
+        prepared.cache_dependencies = collection.cache_dependencies;
+        prepared.cache_generations.reserve(
+            collection.cache_dependencies.size());
+        for (detail::resident_cache *cache :
+             collection.cache_dependencies)
+          prepared.cache_generations.push_back(
+              std::make_pair(cache, cache->allocation_generation));
+        prepared.mirror_dependencies = collection.mirror_dependencies;
+        prepared.writable_mirrors = collection.writable_mirrors;
+      }
+      catch (...) {
+        plan.complete_phase = false;
+        plan.stable_reuses = 0;
+        structured_curl_graph_creation_fallbacks.fetch_add(
+            1, std::memory_order_relaxed);
+        submit_sequential();
+        return;
+      }
+
+      const bool rebuilt = plan.structured_graph != nullptr;
+      if (!release_curl_phase_plan(plan))
+        throw std::runtime_error(
+            "Meep CUDA structured curl graph replacement could not "
+            "quiesce the prior executable");
+
+      try {
+        // Destruction reselects the prior graph's creation device.  Always
+        // restore the new collection device before creating or launching its
+        // replacement executable.
+        meep_cuda::select_device(collection.device_ordinal);
+        if (consume_failure_for_testing(
+                structured_curl_graph_creation_failures_for_testing))
+          throw std::runtime_error(
+              "injected structured curl graph creation failure");
+        prepared.structured_graph =
+            meep_cuda::create_structured_curl_graph_fp32(
+                prepared.host_operations.data(),
+                prepared.host_operations.size());
+      }
+      catch (...) {
+        (void)meep_cuda::destroy_structured_curl_graph_fp32(
+            prepared.structured_graph);
+        prepared.structured_graph = nullptr;
+        structured_curl_graph_creation_fallbacks.fetch_add(
+            1, std::memory_order_relaxed);
+        submit_sequential();
+        return;
+      }
+
+      // Count ownership as soon as creation succeeds.  From this point every
+      // path either destroys the executable after a proven fence or retains
+      // it as a live quarantined plan.
+      structured_curl_graph_live_plans.fetch_add(
+          1, std::memory_order_relaxed);
+      (rebuilt ? structured_curl_graph_plan_rebuilds
+               : structured_curl_graph_plan_creations)
+          .fetch_add(1, std::memory_order_relaxed);
+      std::swap(plan, prepared);
+      plan.stable_reuses = 0;
+    }
+    else {
+      structured_curl_graph_plan_reuses.fetch_add(
+          1, std::memory_order_relaxed);
+      if (plan.stable_reuses != std::numeric_limits<std::size_t>::max())
+        ++plan.stable_reuses;
+    }
+
+    plan.complete_phase = false;
+    structured_curl_graph_collection_launches.fetch_add(
+        1, std::memory_order_relaxed);
+    structured_curl_graph_logical_operations.fetch_add(
+        static_cast<std::uint64_t>(collection.operations.size()),
+        std::memory_order_relaxed);
+    try {
+      // Releasing a replaced executable reselects its creation device.
+      // Restore the new collection device immediately before submission.
+      meep_cuda::select_device(collection.device_ordinal);
+      meep_cuda::launch_structured_curl_graph_fp32(plan.structured_graph);
+    }
+    catch (...) {
+      quarantine_curl_phase_plan(plan);
+      collection.replay_forbidden = true;
+      structured_curl_graph_launch_failures.fetch_add(
+          1, std::memory_order_relaxed);
+      throw;
+    }
+    cuda_curl_calls.fetch_add(
+        static_cast<std::uint64_t>(collection.operations.size()));
+    cuda_curl_points.fetch_add(collection.point_count);
+    ++collection.graph_flush_count;
+    clear_collection();
+    return;
+  }
+
   const bool use_phase_kernel =
       collection.mode == detail::phase_batch_mode::forced ||
       (collection.mode == detail::phase_batch_mode::automatic &&
-       detail::automatic_phase_batch_selected(
+       detail::automatic_curl_phase_batch_selected(
            collection.operations.size(), total_block_count,
            maximum_operation_block_count,
            phase_batch_multiprocessor_count(
@@ -2137,23 +2783,42 @@ void flush_pending_curl_phase() {
   else if (collection.mode == detail::phase_batch_mode::forced)
     phase_curl_forced_batches.fetch_add(1, std::memory_order_relaxed);
   if (!use_phase_kernel) {
-    for (const auto &operation : collection.operations)
-      meep_cuda::step_curl_material_structured_fp32(
-          operation.field, operation.g1, operation.g2,
-          operation.inline_space, operation.point_count,
-          operation.stride1, operation.stride2, operation.dtdx,
-          operation.material);
-    cuda_curl_calls.fetch_add(
-        static_cast<std::uint64_t>(collection.operations.size()));
-    cuda_curl_points.fetch_add(collection.point_count);
-    phase_curl_unbatched_operations.fetch_add(
-        static_cast<std::uint64_t>(collection.operations.size()),
-        std::memory_order_relaxed);
-    collection.operations.clear();
-    collection.cache_dependencies.clear();
-    collection.mirror_dependencies.clear();
-    collection.writable_mirrors.clear();
-    collection.point_count = 0;
+    // A stable automatic topology that cannot cross the fused-kernel policy
+    // boundary would otherwise rebuild descriptors and repeat the replay
+    // lookup on every time step.  Retain only the topology verdict; owner and
+    // backend/device teardown clear this registry, while a changed fingerprint
+    // forces an ordinary fresh evaluation.  A split phase is never cached
+    // because a partial prefix does not describe the next complete phase.
+    if (collection.mode == detail::phase_batch_mode::automatic &&
+        collection.flush_count == 1 && !collection.replay_forbidden) {
+      curl_phase_registry &registry = get_curl_phase_registry();
+      std::lock_guard<std::mutex> lock(registry.mutex);
+      const auto key =
+          std::make_pair(collection.owner, collection.phase_key);
+      auto found = registry.plans.find(key);
+      if (found == registry.plans.end()) {
+        // This registry is only an overhead optimization.  Allocation failure
+        // must preserve the pre-cache sequential execution contract rather
+        // than turning an otherwise valid curl phase into a simulation error.
+        try {
+          found = registry.plans.emplace(key, curl_phase_plan{}).first;
+        }
+        catch (const std::bad_alloc &) {
+          found = registry.plans.end();
+        }
+      }
+      if (found != registry.plans.end()) {
+        curl_phase_plan &plan = found->second;
+        if (release_curl_phase_plan(plan)) {
+          plan.automatic_rejected = true;
+          plan.device_ordinal = collection.device_ordinal;
+          plan.operation_count = collection.operations.size();
+          plan.topology_fingerprint = collection.topology_fingerprint;
+          plan.mode = collection.mode;
+        }
+      }
+    }
+    submit_sequential();
     return;
   }
   const std::size_t descriptor_bytes = checked_phase_product(
@@ -2169,8 +2834,9 @@ void flush_pending_curl_phase() {
   std::lock_guard<std::mutex> lock(registry.mutex);
   curl_phase_plan &plan = registry.plans[
       std::make_pair(collection.owner, collection.phase_key)];
-  if (plan.device_operations &&
-      plan.device_ordinal != collection.device_ordinal)
+  if (plan.structured_graph ||
+      (plan.device_operations &&
+       plan.device_ordinal != collection.device_ordinal))
     release_curl_phase_plan(plan);
 
   const bool operations_match =
@@ -2247,6 +2913,8 @@ void flush_pending_curl_phase() {
   plan.point_count = collection.point_count;
   plan.topology_fingerprint = collection.topology_fingerprint;
   plan.complete_phase = false;
+  plan.structured_graph_mode = false;
+  plan.automatic_rejected = false;
   plan.mode = collection.mode;
   if (stable_topology) {
     if (plan.stable_reuses != std::numeric_limits<std::size_t>::max())
@@ -2268,11 +2936,7 @@ void flush_pending_curl_phase() {
       static_cast<std::uint64_t>(collection.operations.size()),
       std::memory_order_relaxed);
   ++collection.batched_flush_count;
-  collection.operations.clear();
-  collection.cache_dependencies.clear();
-  collection.mirror_dependencies.clear();
-  collection.writable_mirrors.clear();
-  collection.point_count = 0;
+  clear_collection();
 }
 
 void flush_pending_curl_phase_before_direct_operation() {
@@ -2321,6 +2985,10 @@ bool same_update_eh_phase_operations(
 }
 
 void release_update_eh_phase_plan(update_eh_phase_plan &plan) noexcept {
+  if (external_device_reclamation_quarantined()) {
+    plan = update_eh_phase_plan();
+    return;
+  }
   if (plan.device_ordinal >= 0) {
     try {
       meep_cuda::select_device(plan.device_ordinal);
@@ -2585,6 +3253,10 @@ bool same_source_phase_operations(
 }
 
 void release_source_phase_plan(source_phase_plan &plan) noexcept {
+  if (external_device_reclamation_quarantined()) {
+    plan = source_phase_plan();
+    return;
+  }
   if (plan.device_ordinal >= 0) {
     try {
       meep_cuda::select_device(plan.device_ordinal);
@@ -2855,6 +3527,10 @@ bool collect_source_phase_operation(
 
 void release_boundary_transfer_plan(
     detail::boundary_exchange_buffer::transfer_plan &plan) noexcept {
+  if (external_device_reclamation_quarantined()) {
+    plan = detail::boundary_exchange_buffer::transfer_plan();
+    return;
+  }
   meep_cuda::free_device(plan.device_pointer);
   if (plan.device_pointer) live_device_buffer_count().fetch_sub(1);
   plan.device_pointer = nullptr;
@@ -2972,6 +3648,12 @@ void record_boundary_completion_event(
 void release_boundary_exchange_buffer(
     detail::boundary_exchange_buffer *buffer) noexcept {
   if (!buffer) return;
+  if (external_device_reclamation_quarantined()) {
+    boundary_lifetime_uncertain_leaks.fetch_add(
+        1, std::memory_order_relaxed);
+    delete buffer;
+    return;
+  }
   if (buffer->device_ordinal >= 0) {
     try {
       meep_cuda::select_device(buffer->device_ordinal);
@@ -3020,6 +3702,10 @@ void release_boundary_exchange_buffer(
 void release_boundary_operation_plan(
     boundary_exchange_owner::operation_plan *plan) noexcept {
   if (!plan) return;
+  if (external_device_reclamation_quarantined()) {
+    delete plan;
+    return;
+  }
   if (plan->device_ordinal >= 0) {
     try {
       meep_cuda::select_device(plan->device_ordinal);
@@ -3067,8 +3753,11 @@ bool boundary_operation_plan_generations_match(
     const boundary_exchange_owner::operation_plan *plan) {
   if (!plan) return false;
   for (const auto &entry : plan->cache_generations)
-    if (!entry.first ||
-        entry.first->allocation_generation != entry.second)
+    if (!entry.first || entry.second == 0 ||
+        entry.first->allocation_generation == 0 ||
+        entry.first->allocation_generation != entry.second ||
+        !entry.first->phase_active ||
+        entry.first->device_storage_quarantined)
       return false;
   return true;
 }
@@ -3151,7 +3840,11 @@ detail::resident_cache *resident_cache_for_owner(const void *owner) {
   resident_registry &registry = get_resident_registry();
   std::lock_guard<std::mutex> lock(registry.mutex);
   const auto found = registry.caches.find(owner);
-  if (found != registry.caches.end()) return found->second;
+  if (found != registry.caches.end()) {
+    require_resident_cache_accessible(
+        found->second, "resident cache access");
+    return found->second;
+  }
 
   detail::resident_cache *created = new detail::resident_cache;
   try {
@@ -3173,24 +3866,14 @@ detail::resident_cache *find_resident_cache_for_owner(
   return found == registry.caches.end() ? nullptr : found->second;
 }
 
-detail::resident_cache *remove_resident_cache_for_owner(const void *owner) noexcept {
-  resident_registry &registry = get_resident_registry();
-  std::lock_guard<std::mutex> lock(registry.mutex);
-  const auto found = registry.caches.find(owner);
-  if (found == registry.caches.end()) return nullptr;
-  detail::resident_cache *cache = found->second;
-  registry.caches.erase(found);
-  return cache;
-}
 #endif
 
 backend_mode parse_mode(const char *value) {
   if (!value || !*value || std::strcmp(value, "cpu") == 0) return backend_mode::cpu;
-  if (std::strcmp(value, "auto") == 0 || std::strcmp(value, "automatic") == 0)
-    return backend_mode::automatic;
   if (std::strcmp(value, "cuda") == 0) return backend_mode::cuda;
   throw std::invalid_argument(std::string("invalid MEEP_GPU_BACKEND='") + value +
-                              "' (expected cpu, auto, or cuda)");
+                              "' (gpmeep v1.1.0 expects cpu or cuda; "
+                              "automatic selection is disabled)");
 }
 
 #if MEEP_HAVE_CUDA
@@ -3255,12 +3938,13 @@ int rank_compatible_device() {
 #endif
 
 void configure_locked(backend_mode requested) {
-  if (requested != backend_mode::cpu && requested != backend_mode::automatic &&
-      requested != backend_mode::cuda)
-    throw std::invalid_argument("invalid Meep GPU backend mode");
+  if (requested != backend_mode::cpu && requested != backend_mode::cuda)
+    throw std::invalid_argument(
+        "gpmeep v1.1.0 backend must be CPU or CUDA; automatic selection is disabled");
 
   state.requested = requested;
   state.active = backend_mode::cpu;
+  publish_active_backend_fast_path_locked();
   state.device_ready = false;
   state.diagnostic.clear();
 
@@ -3281,16 +3965,6 @@ void configure_locked(backend_mode requested) {
   if (explicit_device_environment) (void)parse_device_ordinal(device_value);
   const bool explicit_device =
       explicit_device_environment || state.explicit_device_selection;
-
-  // Automatic selection is intentionally two-stage.  Workload policy runs
-  // before this process calls cudaGetDeviceCount/cudaSetDevice, so a small
-  // CPU-selected owner does not initialize or otherwise touch CUDA.
-  if (requested == backend_mode::automatic && !explicit_device) {
-    state.diagnostic =
-        "automatic backend awaiting host-only workload preflight";
-    state.configured = true;
-    return;
-  }
 
   std::string runtime_diagnostic;
   const int environment_device =
@@ -3337,6 +4011,7 @@ void configure_locked(backend_mode requested) {
   state.selected_device = ordinal;
   state.device_ready = true;
   state.active = backend_mode::cuda;
+  publish_active_backend_fast_path_locked();
   std::ostringstream message;
   message << "CUDA device " << ordinal << " selected for global rank "
           << my_global_rank() << " (node rank " << my_node_rank() << "/"
@@ -3352,19 +4027,37 @@ void configure_locked(backend_mode requested) {
 }
 
 void configure_transaction_locked(backend_mode requested) {
+  if (!state.pinned_owners.empty())
+    throw std::runtime_error(
+        "cannot reconfigure the gpmeep backend while a preflighted fields "
+        "operation is active");
+  // Take every potentially allocating rollback snapshot before changing the
+  // transition/query state.  Rollback swaps these strings back without an
+  // allocation, so even allocation failure cannot strand the backend in an
+  // unready transition.
   const backend_mode previous_requested = state.requested;
   const backend_mode previous_active = state.active;
   const bool previous_configured = state.configured;
   const bool previous_device_ready = state.device_ready;
   const int previous_selected_device = state.selected_device;
-  const std::string previous_environment_signature =
+  std::string previous_environment_signature =
       state.configured_environment_signature;
-  const std::string previous_diagnostic = state.diagnostic;
+  std::string previous_diagnostic = state.diagnostic;
+  // Callers that perform an out-of-lock cache synchronization start the
+  // transition before that phase.  Lazy configuration reaches this function
+  // directly, so own a local transition in that case.  This keeps the query
+  // view unready even when configure_locked() publishes the resident-cache
+  // CUDA bit while the transaction is only partially committed.
+  const bool owns_transition = !state.transition_in_progress;
+  if (owns_transition) state.transition_in_progress = true;
+  invalidate_backend_query_fast_path_locked();
   try {
     configure_locked(requested);
     state.configured_environment_signature =
         backend_configuration_environment_signature();
     ++state.generation;
+    if (owns_transition) state.transition_in_progress = false;
+    publish_active_backend_fast_path_locked();
   }
   catch (...) {
     state.requested = previous_requested;
@@ -3372,14 +4065,19 @@ void configure_transaction_locked(backend_mode requested) {
     state.configured = previous_configured;
     state.device_ready = previous_device_ready;
     state.selected_device = previous_selected_device;
-    state.configured_environment_signature =
-        previous_environment_signature;
-    state.diagnostic = previous_diagnostic;
+    state.configured_environment_signature.swap(
+        previous_environment_signature);
+    state.diagnostic.swap(previous_diagnostic);
+    if (owns_transition) state.transition_in_progress = false;
+    publish_active_backend_fast_path_locked();
     throw;
   }
 }
 
 void ensure_configured_locked() {
+  if (state.transition_in_progress)
+    throw std::runtime_error(
+        "gpmeep backend reconfiguration is already in progress");
   if (!state.configured)
     configure_transaction_locked(parse_mode(std::getenv("MEEP_GPU_BACKEND")));
 }
@@ -3850,6 +4548,695 @@ index_space_bounds validate_gyrotropic_index_space(
   return bounds;
 }
 
+bool sparse_lorentzian_index_space_equal(
+    const meep_cuda::index_space_fp32 &left,
+    const meep_cuda::index_space_fp32 &right) noexcept {
+  return left.field_start == right.field_start &&
+         left.extent1 == right.extent1 &&
+         left.extent2 == right.extent2 &&
+         left.extent3 == right.extent3 &&
+         left.field_stride1 == right.field_stride1 &&
+         left.field_stride2 == right.field_stride2 &&
+         left.field_stride3 == right.field_stride3 &&
+         left.coefficient_start == right.coefficient_start &&
+         left.coefficient_stride1 == right.coefficient_stride1 &&
+         left.coefficient_stride2 == right.coefficient_stride2 &&
+         left.coefficient_stride3 == right.coefficient_stride3 &&
+         left.coefficient2_start == right.coefficient2_start &&
+         left.coefficient2_stride1 == right.coefficient2_stride1 &&
+         left.coefficient2_stride2 == right.coefficient2_stride2 &&
+         left.coefficient2_stride3 == right.coefficient2_stride3;
+}
+
+std::uint32_t sparse_lorentzian_float_bits(float value) noexcept {
+  std::uint32_t bits = 0;
+  static_assert(sizeof(bits) == sizeof(value),
+                "FP32 sparse identity requires 32-bit float");
+  std::memcpy(&bits, &value, sizeof(bits));
+  return bits;
+}
+
+const detail::resident_cache::mirror &sparse_lorentzian_mirror(
+    const detail::resident_cache *cache, const float *host_pointer) {
+  const auto found = cache->mirrors.find(host_pointer);
+  if (found == cache->mirrors.end())
+    throw std::logic_error(
+        "Meep CUDA sparse Lorentzian identity has no resident mirror");
+  return found->second;
+}
+
+bool sparse_lorentzian_identity_equal(
+    const detail::resident_cache::sparse_lorentzian_identity &left,
+    const detail::resident_cache::sparse_lorentzian_identity &right) noexcept {
+  return left.host_polarization == right.host_polarization &&
+         left.host_auxiliary == right.host_auxiliary &&
+         left.host_sigma == right.host_sigma &&
+         left.host_field == right.host_field &&
+         left.device_polarization == right.device_polarization &&
+         left.device_auxiliary == right.device_auxiliary &&
+         left.device_sigma == right.device_sigma &&
+         left.device_field == right.device_field &&
+         sparse_lorentzian_index_space_equal(left.index_space,
+                                             right.index_space) &&
+         left.array_count == right.array_count &&
+         left.point_count == right.point_count &&
+         left.polarization_upload_epoch ==
+             right.polarization_upload_epoch &&
+         left.auxiliary_upload_epoch == right.auxiliary_upload_epoch &&
+         left.sigma_upload_epoch == right.sigma_upload_epoch &&
+         left.field_upload_epoch == right.field_upload_epoch &&
+         left.allocation_generation == right.allocation_generation &&
+         left.control_generation == right.control_generation &&
+         left.gamma_inverse_bits == right.gamma_inverse_bits &&
+         left.gamma_previous_bits == right.gamma_previous_bits &&
+         left.omega_dt_squared_bits == right.omega_dt_squared_bits &&
+         left.omega_dt_squared_denominator_bits ==
+             right.omega_dt_squared_denominator_bits &&
+         left.options == right.options &&
+         left.device_ordinal == right.device_ordinal &&
+         left.increment_state == right.increment_state;
+}
+
+bool sparse_lorentzian_logical_slot_equal(
+    const detail::resident_cache::sparse_lorentzian_identity &left,
+    const detail::resident_cache::sparse_lorentzian_identity &right) noexcept {
+  return left.host_polarization == right.host_polarization &&
+         left.host_auxiliary == right.host_auxiliary &&
+         left.increment_state == right.increment_state;
+}
+
+bool sparse_lorentzian_guard_identity_equal(
+    const detail::resident_cache::sparse_lorentzian_guard_identity &left,
+    const detail::resident_cache::sparse_lorentzian_guard_identity &right)
+    noexcept {
+  return left.host_field == right.host_field &&
+         left.device_field == right.device_field &&
+         sparse_lorentzian_index_space_equal(left.index_space,
+                                             right.index_space) &&
+         left.point_count == right.point_count &&
+         left.field_upload_epoch == right.field_upload_epoch &&
+         left.allocation_generation == right.allocation_generation &&
+         left.control_generation == right.control_generation &&
+         left.device_ordinal == right.device_ordinal;
+}
+
+void *allocate_sparse_lorentzian_device_bytes(std::size_t bytes) {
+  if (bytes == 0) return nullptr;
+  void *pointer = meep_cuda::allocate_device_bytes(bytes);
+  device_buffer_allocations.fetch_add(1, std::memory_order_relaxed);
+  live_device_buffer_count().fetch_add(1, std::memory_order_relaxed);
+  return pointer;
+}
+
+void free_sparse_lorentzian_device_pointer(void *&pointer) noexcept {
+  if (!pointer) return;
+  meep_cuda::free_device(pointer);
+  pointer = nullptr;
+  live_device_buffer_count().fetch_sub(1, std::memory_order_relaxed);
+}
+
+struct sparse_lorentzian_temporary_allocation {
+  void *pointer;
+
+  sparse_lorentzian_temporary_allocation() : pointer(nullptr) {}
+  explicit sparse_lorentzian_temporary_allocation(std::size_t bytes)
+      : pointer(allocate_sparse_lorentzian_device_bytes(bytes)) {}
+  ~sparse_lorentzian_temporary_allocation() {
+    free_sparse_lorentzian_device_pointer(pointer);
+  }
+  sparse_lorentzian_temporary_allocation(
+      const sparse_lorentzian_temporary_allocation &) = delete;
+  sparse_lorentzian_temporary_allocation &operator=(
+      const sparse_lorentzian_temporary_allocation &) = delete;
+  void *release() noexcept {
+    void *result = pointer;
+    pointer = nullptr;
+    return result;
+  }
+};
+
+void mark_sparse_lorentzian_execution_ineligible(
+    detail::resident_cache *cache) noexcept {
+  for (auto &plan : cache->sparse_lorentzian_plans) {
+    plan.execution_eligible = false;
+    plan.state =
+        detail::resident_cache::sparse_lorentzian_plan_state::quarantined;
+  }
+  for (auto &guard : cache->sparse_lorentzian_guards)
+    guard.execution_eligible = false;
+}
+
+void quarantine_resident_device_storage(
+    detail::resident_cache *cache) noexcept {
+  if (!cache) return;
+  cache->prepared_span_resolutions.clear();
+  mark_sparse_lorentzian_execution_ineligible(cache);
+  cache->sparse_lorentzian_permanent_dense_lock = true;
+  cache->sparse_lorentzian_teardown_incomplete = true;
+  cache->device_storage_quarantined = true;
+  // Invalidate every persistent descriptor snapshot without freeing anything.
+  // External plans retain this cache pointer only as a non-owning identity and
+  // must observe a generation mismatch before they can submit again.
+  cache->allocation_generation = 0;
+  cache->phase_active = false;
+  sparse_lorentzian_host_statistics.teardown_incomplete.store(
+      true, std::memory_order_relaxed);
+}
+
+void release_sparse_lorentzian_storage_after_quiescence(
+    detail::resident_cache *cache, bool release_ledger) noexcept {
+  for (auto &plan : cache->sparse_lorentzian_plans) {
+    void *indices = plan.device_active_indices;
+    void *validation = plan.device_validation_flag;
+    free_sparse_lorentzian_device_pointer(indices);
+    free_sparse_lorentzian_device_pointer(validation);
+    plan.device_active_indices = nullptr;
+    plan.device_validation_flag = nullptr;
+  }
+  cache->sparse_lorentzian_plans.clear();
+  for (auto &guard : cache->sparse_lorentzian_guards) {
+    void *sticky = guard.device_sticky;
+    free_sparse_lorentzian_device_pointer(sticky);
+    guard.device_sticky = nullptr;
+  }
+  cache->sparse_lorentzian_guards.clear();
+  cache->sparse_lorentzian_retained_index_bytes = 0;
+  if (release_ledger) {
+    void *ledger = cache->sparse_lorentzian_ledger;
+    free_sparse_lorentzian_device_pointer(ledger);
+    cache->sparse_lorentzian_ledger = nullptr;
+  }
+}
+
+bool fold_sparse_lorentzian_ledger_after_quiescence(
+    detail::resident_cache *cache) noexcept {
+  if (!cache->sparse_lorentzian_ledger) return true;
+  meep_cuda::lorentzian_sparse_execution_ledger_fp32 ledger = {};
+  try {
+    meep_cuda::copy_to_host(
+        &ledger, cache->sparse_lorentzian_ledger, sizeof(ledger));
+  }
+  catch (...) {
+    cache->sparse_lorentzian_teardown_incomplete = true;
+    sparse_lorentzian_host_statistics.teardown_incomplete.store(
+        true, std::memory_order_relaxed);
+    return false;
+  }
+  std::lock_guard<std::mutex> lock(sparse_lorentzian_statistics_mutex());
+  sparse_lorentzian_saturating_add_value(
+      sparse_lorentzian_destroyed_ledger.guard_scan_calls,
+      ledger.guard_scan_calls,
+      sparse_lorentzian_destroyed_ledger.counter_overflow);
+  sparse_lorentzian_saturating_add_value(
+      sparse_lorentzian_destroyed_ledger.guard_scan_points,
+      ledger.guard_scan_points,
+      sparse_lorentzian_destroyed_ledger.counter_overflow);
+  sparse_lorentzian_saturating_add_value(
+      sparse_lorentzian_destroyed_ledger.sparse_update_calls,
+      ledger.sparse_update_calls,
+      sparse_lorentzian_destroyed_ledger.counter_overflow);
+  sparse_lorentzian_saturating_add_value(
+      sparse_lorentzian_destroyed_ledger.sparse_update_points,
+      ledger.sparse_update_points,
+      sparse_lorentzian_destroyed_ledger.counter_overflow);
+  sparse_lorentzian_saturating_add_value(
+      sparse_lorentzian_destroyed_ledger.dense_fallback_calls,
+      ledger.dense_fallback_calls,
+      sparse_lorentzian_destroyed_ledger.counter_overflow);
+  sparse_lorentzian_saturating_add_value(
+      sparse_lorentzian_destroyed_ledger.dense_fallback_points,
+      ledger.dense_fallback_points,
+      sparse_lorentzian_destroyed_ledger.counter_overflow);
+  if (ledger.counter_overflow)
+    sparse_lorentzian_destroyed_ledger.counter_overflow = true;
+  return true;
+}
+
+bool sparse_lorentzian_failure_injected(const char *stage) noexcept;
+
+bool quiesce_resident_device_storage_checked(
+    detail::resident_cache *cache) noexcept {
+  if (!cache || cache->device_storage_quarantined) return false;
+  try {
+    if (cache->device_ordinal < 0)
+      throw std::logic_error(
+          "resident device storage has no owning CUDA device");
+    meep_cuda::select_device(cache->device_ordinal);
+    if (sparse_lorentzian_failure_injected("quiescence"))
+      throw std::runtime_error(
+          "injected sparse Lorentzian quiescence failure");
+    meep_cuda::synchronize();
+    return true;
+  }
+  catch (...) {
+    // A failed device selection is just as unsafe as a failed fence.  Keep
+    // every allocation and every descriptor which could still be referenced
+    // by queued work, and make all later launch validation fail closed.
+    quarantine_resident_device_storage(cache);
+    return false;
+  }
+}
+
+bool retire_sparse_lorentzian_state_checked(
+    detail::resident_cache *cache, bool release_ledger = false,
+    bool device_already_quiesced = false) noexcept {
+  if (!cache || cache->device_storage_quarantined) return false;
+  std::uint64_t invalidated = 0;
+  for (const auto &plan : cache->sparse_lorentzian_plans)
+    if (plan.state !=
+        detail::resident_cache::sparse_lorentzian_plan_state::quarantined)
+      ++invalidated;
+  if (invalidated)
+    sparse_lorentzian_saturating_add(
+        sparse_lorentzian_host_statistics.plan_invalidations,
+        invalidated);
+  mark_sparse_lorentzian_execution_ineligible(cache);
+  if (cache->sparse_lorentzian_plans.empty() &&
+      cache->sparse_lorentzian_guards.empty() &&
+      (!release_ledger || !cache->sparse_lorentzian_ledger))
+    return true;
+  if (!device_already_quiesced &&
+      !quiesce_resident_device_storage_checked(cache))
+    return false;
+  const bool ledger_folded =
+      !release_ledger || fold_sparse_lorentzian_ledger_after_quiescence(cache);
+  release_sparse_lorentzian_storage_after_quiescence(
+      cache, release_ledger);
+  if (!ledger_folded) {
+    cache->sparse_lorentzian_permanent_dense_lock = true;
+    return false;
+  }
+  return true;
+}
+
+bool update_sparse_lorentzian_control(
+    detail::resident_cache *cache) noexcept {
+  const detail::sparse_lorentzian_control_token requested =
+      detail::sparse_lorentzian_control_from_environment();
+  if (requested == cache->sparse_lorentzian_control) return true;
+  if (!retire_sparse_lorentzian_state_checked(cache, true)) return false;
+  cache->sparse_lorentzian_control = requested;
+  if (cache->sparse_lorentzian_control_generation ==
+      std::numeric_limits<std::uint64_t>::max()) {
+    cache->sparse_lorentzian_permanent_dense_lock = true;
+    return true;
+  }
+  ++cache->sparse_lorentzian_control_generation;
+  return true;
+}
+
+bool sparse_lorentzian_failure_injected(const char *stage) noexcept {
+  const char *requested =
+      std::getenv("MEEP_GPU_TEST_SPARSE_LORENTZIAN_FAIL_STAGE");
+  return requested && std::strcmp(requested, stage) == 0;
+}
+
+detail::resident_cache::sparse_lorentzian_identity
+make_sparse_lorentzian_identity(
+    const detail::resident_cache *cache, const float *host_polarization,
+    const float *host_auxiliary, const float *host_sigma,
+    const float *host_field, const void *device_polarization,
+    const void *device_auxiliary, const void *device_sigma,
+    const void *device_field,
+    const meep_cuda::index_space_fp32 &index_space,
+    std::size_t array_count, std::size_t point_count,
+    const meep_cuda::lorentzian_material_fp32 &material,
+    bool increment_state) {
+  detail::resident_cache::sparse_lorentzian_identity identity;
+  identity.host_polarization = host_polarization;
+  identity.host_auxiliary = host_auxiliary;
+  identity.host_sigma = host_sigma;
+  identity.host_field = host_field;
+  identity.device_polarization = device_polarization;
+  identity.device_auxiliary = device_auxiliary;
+  identity.device_sigma = device_sigma;
+  identity.device_field = device_field;
+  identity.index_space = index_space;
+  identity.array_count = array_count;
+  identity.point_count = point_count;
+  identity.polarization_upload_epoch =
+      sparse_lorentzian_mirror(cache, host_polarization).uploaded_epoch;
+  identity.auxiliary_upload_epoch =
+      sparse_lorentzian_mirror(cache, host_auxiliary).uploaded_epoch;
+  identity.sigma_upload_epoch =
+      sparse_lorentzian_mirror(cache, host_sigma).uploaded_epoch;
+  identity.field_upload_epoch =
+      sparse_lorentzian_mirror(cache, host_field).uploaded_epoch;
+  identity.allocation_generation = cache->allocation_generation;
+  identity.control_generation =
+      cache->sparse_lorentzian_control_generation;
+  identity.gamma_inverse_bits =
+      sparse_lorentzian_float_bits(material.gamma_inverse);
+  identity.gamma_previous_bits =
+      sparse_lorentzian_float_bits(material.gamma_previous);
+  identity.omega_dt_squared_bits =
+      sparse_lorentzian_float_bits(material.omega_dt_squared);
+  identity.omega_dt_squared_denominator_bits =
+      sparse_lorentzian_float_bits(
+          material.omega_dt_squared_denominator);
+  identity.options = material.options;
+  identity.device_ordinal = cache->device_ordinal;
+  identity.increment_state = increment_state;
+  return identity;
+}
+
+detail::resident_cache::sparse_lorentzian_guard_identity
+make_sparse_lorentzian_guard_identity(
+    const detail::resident_cache::sparse_lorentzian_identity &identity) {
+  detail::resident_cache::sparse_lorentzian_guard_identity result;
+  result.host_field = identity.host_field;
+  result.device_field = identity.device_field;
+  result.index_space = identity.index_space;
+  result.point_count = identity.point_count;
+  result.field_upload_epoch = identity.field_upload_epoch;
+  result.allocation_generation = identity.allocation_generation;
+  result.control_generation = identity.control_generation;
+  result.device_ordinal = identity.device_ordinal;
+  return result;
+}
+
+bool sparse_lorentzian_active_fraction_selected(
+    std::size_t active_count, std::size_t point_count) noexcept {
+  constexpr std::size_t maximum_percent = 35;
+  constexpr std::size_t denominator = 100;
+  const std::size_t quotient = point_count / denominator;
+  const std::size_t remainder = point_count % denominator;
+  const std::size_t threshold =
+      quotient * maximum_percent +
+      (remainder * maximum_percent) / denominator;
+  return active_count <= threshold;
+}
+
+bool sparse_lorentzian_memory_budget_selected(
+    const detail::resident_cache *cache, std::size_t index_bytes) noexcept {
+  std::size_t mirror_bytes = 0;
+  for (const auto &entry : cache->mirrors) {
+    if (entry.second.bytes >
+        std::numeric_limits<std::size_t>::max() - mirror_bytes)
+      return false;
+    mirror_bytes += entry.second.bytes;
+  }
+  const std::size_t retained =
+      cache->sparse_lorentzian_retained_index_bytes;
+  if (index_bytes > std::numeric_limits<std::size_t>::max() - retained)
+    return false;
+  // Exact integer form of retained + candidate <= 5% of mirror bytes.
+  return retained + index_bytes <= mirror_bytes / 20;
+}
+
+std::size_t find_sparse_lorentzian_guard(
+    const detail::resident_cache *cache,
+    const detail::resident_cache::sparse_lorentzian_guard_identity
+        &identity) noexcept {
+  for (std::size_t index = 0;
+       index < cache->sparse_lorentzian_guards.size(); ++index) {
+    const auto &guard = cache->sparse_lorentzian_guards[index];
+    if (guard.execution_eligible &&
+        sparse_lorentzian_guard_identity_equal(guard.identity, identity))
+      return index;
+  }
+  return std::numeric_limits<std::size_t>::max();
+}
+
+bool build_sparse_lorentzian_plan_transactionally(
+    detail::resident_cache *cache, std::size_t plan_slot,
+    const meep_cuda::lorentzian_material_fp32 &material) noexcept {
+  if (plan_slot >= cache->sparse_lorentzian_plans.size()) return false;
+  auto &plan = cache->sparse_lorentzian_plans[plan_slot];
+  const auto identity = plan.identity;
+  sparse_lorentzian_saturating_add(
+      sparse_lorentzian_host_statistics.plan_build_attempts, 1);
+  try {
+    const std::size_t logical_blocks =
+        meep_cuda::lorentzian_sparse_compaction_block_count(
+            identity.point_count);
+    const std::size_t count_bytes = checked_bytes(
+        logical_blocks, sizeof(std::uint32_t),
+        "sparse Lorentzian block counts");
+    if (sparse_lorentzian_failure_injected("count-allocation"))
+      throw std::runtime_error(
+          "injected sparse Lorentzian count allocation failure");
+    sparse_lorentzian_temporary_allocation device_counts(count_bytes);
+    sparse_lorentzian_temporary_allocation device_validation(
+        sizeof(std::uint32_t));
+    const std::uint32_t zero = 0;
+    meep_cuda::copy_to_device(
+        device_validation.pointer, &zero, sizeof(zero));
+    meep_cuda::count_lorentzian_sparse_active_blocks_fp32(
+        static_cast<const float *>(identity.device_polarization),
+        static_cast<const float *>(identity.device_auxiliary),
+        identity.index_space, identity.point_count, material,
+        identity.increment_state,
+        static_cast<std::uint32_t *>(device_counts.pointer),
+        static_cast<std::uint32_t *>(device_validation.pointer));
+    if (sparse_lorentzian_failure_injected("count-copy"))
+      throw std::runtime_error(
+          "injected sparse Lorentzian count copy failure");
+    std::vector<std::uint32_t> counts(logical_blocks, 0);
+    meep_cuda::copy_to_host(
+        counts.data(), device_counts.pointer, count_bytes);
+    std::uint32_t validation = 0;
+    meep_cuda::copy_to_host(
+        &validation, device_validation.pointer, sizeof(validation));
+    if (validation != 0)
+      throw std::runtime_error(
+          "sparse Lorentzian coefficient validation failed closed");
+    if (sparse_lorentzian_failure_injected("prefix"))
+      throw std::runtime_error(
+          "injected sparse Lorentzian prefix failure");
+    std::vector<std::uint64_t> offsets(logical_blocks, 0);
+    std::uint64_t active_count64 = 0;
+    for (std::size_t block = 0; block < logical_blocks; ++block) {
+      offsets[block] = active_count64;
+      if (counts[block] >
+          std::numeric_limits<std::uint64_t>::max() - active_count64)
+        throw std::overflow_error(
+            "sparse Lorentzian active-count prefix overflow");
+      active_count64 += counts[block];
+    }
+    if (active_count64 >
+        static_cast<std::uint64_t>(
+            std::numeric_limits<std::size_t>::max()))
+      throw std::overflow_error(
+          "sparse Lorentzian active count is not host-addressable");
+    const std::size_t active_count =
+        static_cast<std::size_t>(active_count64);
+    if (identity.point_count < 65536 ||
+        !sparse_lorentzian_active_fraction_selected(
+            active_count, identity.point_count)) {
+      plan.state =
+          detail::resident_cache::sparse_lorentzian_plan_state::dense_locked;
+      plan.execution_eligible = false;
+      sparse_lorentzian_saturating_add(
+          sparse_lorentzian_host_statistics.dense_locked_decisions, 1);
+      return false;
+    }
+    const std::size_t index_bytes = checked_bytes(
+        active_count, sizeof(std::ptrdiff_t),
+        "sparse Lorentzian active indices");
+    if (!sparse_lorentzian_memory_budget_selected(cache, index_bytes)) {
+      plan.state =
+          detail::resident_cache::sparse_lorentzian_plan_state::dense_locked;
+      plan.execution_eligible = false;
+      sparse_lorentzian_saturating_add(
+          sparse_lorentzian_host_statistics.dense_locked_decisions, 1);
+      return false;
+    }
+    const std::size_t offset_bytes = checked_bytes(
+        logical_blocks, sizeof(std::uint64_t),
+        "sparse Lorentzian block offsets");
+    if (sparse_lorentzian_failure_injected("offset-upload"))
+      throw std::runtime_error(
+          "injected sparse Lorentzian offset upload failure");
+    sparse_lorentzian_temporary_allocation device_offsets(offset_bytes);
+    meep_cuda::copy_to_device(
+        device_offsets.pointer, offsets.data(), offset_bytes);
+    if (sparse_lorentzian_failure_injected("index-allocation"))
+      throw std::runtime_error(
+          "injected sparse Lorentzian index allocation failure");
+    sparse_lorentzian_temporary_allocation device_indices(index_bytes);
+    if (sparse_lorentzian_failure_injected("fill"))
+      throw std::runtime_error(
+          "injected sparse Lorentzian fill failure");
+    meep_cuda::fill_lorentzian_sparse_active_indices_fp32(
+        static_cast<const float *>(identity.device_polarization),
+        static_cast<const float *>(identity.device_auxiliary),
+        identity.index_space, identity.point_count, material,
+        identity.increment_state,
+        static_cast<const std::uint64_t *>(device_offsets.pointer),
+        active_count,
+        static_cast<std::ptrdiff_t *>(device_indices.pointer),
+        static_cast<std::uint32_t *>(device_validation.pointer));
+    if (sparse_lorentzian_failure_injected("completion"))
+      throw std::runtime_error(
+          "injected sparse Lorentzian completion failure");
+    meep_cuda::synchronize();
+    meep_cuda::copy_to_host(
+        &validation, device_validation.pointer, sizeof(validation));
+    if (validation != 0)
+      throw std::runtime_error(
+          "sparse Lorentzian fill validation failed closed");
+    if (cache->sparse_lorentzian_control !=
+            detail::sparse_lorentzian_control_token::enabled ||
+        detail::sparse_lorentzian_control_from_environment() !=
+            detail::sparse_lorentzian_control_token::enabled ||
+        cache->sparse_lorentzian_permanent_dense_lock ||
+        !sparse_lorentzian_identity_equal(plan.identity, identity))
+      throw std::runtime_error(
+          "sparse Lorentzian identity changed before plan commit");
+    const auto guard_identity =
+        make_sparse_lorentzian_guard_identity(identity);
+    std::size_t guard_slot =
+        find_sparse_lorentzian_guard(cache, guard_identity);
+    const bool create_guard =
+        guard_slot == std::numeric_limits<std::size_t>::max();
+    if (index_bytes > std::numeric_limits<std::size_t>::max() -
+                          cache->sparse_lorentzian_retained_index_bytes)
+      throw std::overflow_error(
+          "sparse Lorentzian retained-index byte count overflow");
+    if (!create_guard &&
+        cache->sparse_lorentzian_guards[guard_slot].dependent_plans ==
+            std::numeric_limits<std::size_t>::max())
+      throw std::overflow_error(
+          "sparse Lorentzian guard dependency count overflow");
+
+    // Prepare every persistent allocation and every potentially throwing host
+    // capacity change before publishing any member into the resident cache.
+    // A failed build must therefore leave only the pre-existing observed plan,
+    // never an orphan ledger or guard.
+    if (!cache->sparse_lorentzian_ledger &&
+        sparse_lorentzian_failure_injected("ledger-allocation"))
+      throw std::runtime_error(
+          "injected sparse Lorentzian ledger allocation failure");
+    sparse_lorentzian_temporary_allocation replacement_ledger(
+        cache->sparse_lorentzian_ledger
+            ? 0
+            : sizeof(meep_cuda::lorentzian_sparse_execution_ledger_fp32));
+    const meep_cuda::lorentzian_sparse_execution_ledger_fp32 zero_ledger = {};
+    if (replacement_ledger.pointer)
+      meep_cuda::copy_to_device(
+          replacement_ledger.pointer, &zero_ledger, sizeof(zero_ledger));
+
+    if (create_guard &&
+        sparse_lorentzian_failure_injected("guard-allocation"))
+      throw std::runtime_error(
+          "injected sparse Lorentzian guard allocation failure");
+    sparse_lorentzian_temporary_allocation replacement_sticky(
+        create_guard ? sizeof(std::uint32_t) : 0);
+    const std::uint32_t zero_sticky = 0;
+    if (replacement_sticky.pointer)
+      meep_cuda::copy_to_device(
+          replacement_sticky.pointer, &zero_sticky, sizeof(zero_sticky));
+    if (create_guard)
+      cache->sparse_lorentzian_guards.reserve(
+          cache->sparse_lorentzian_guards.size() + 1);
+
+    // From this point through plan publication every operation is nonthrowing:
+    // vector capacity is reserved and the guard has an implicit noexcept move.
+    if (create_guard) {
+      detail::resident_cache::sparse_lorentzian_guard created;
+      created.identity = guard_identity;
+      created.device_sticky = static_cast<std::uint32_t *>(
+          replacement_sticky.pointer);
+      created.last_scanned_epoch = 0;
+      created.dependent_plans = 1;
+      created.execution_eligible = true;
+      cache->sparse_lorentzian_guards.push_back(std::move(created));
+      (void)replacement_sticky.release();
+      guard_slot = cache->sparse_lorentzian_guards.size() - 1;
+    }
+    else {
+      ++cache->sparse_lorentzian_guards[guard_slot].dependent_plans;
+    }
+    if (replacement_ledger.pointer)
+      cache->sparse_lorentzian_ledger = static_cast<
+          meep_cuda::lorentzian_sparse_execution_ledger_fp32 *>(
+          replacement_ledger.release());
+    plan.device_active_indices =
+        static_cast<std::ptrdiff_t *>(device_indices.release());
+    plan.device_validation_flag =
+        static_cast<std::uint32_t *>(device_validation.release());
+    plan.active_count = active_count;
+    plan.retained_index_bytes = index_bytes;
+    plan.guard_slot = guard_slot;
+    ++plan.observation_count;
+    plan.execution_eligible = true;
+    plan.state =
+        detail::resident_cache::sparse_lorentzian_plan_state::sparse;
+    cache->sparse_lorentzian_retained_index_bytes += index_bytes;
+    sparse_lorentzian_saturating_add(
+        sparse_lorentzian_host_statistics.plan_build_successes, 1);
+    sparse_lorentzian_saturating_add(
+        sparse_lorentzian_host_statistics.accepted_total_points,
+        static_cast<std::uint64_t>(identity.point_count));
+    sparse_lorentzian_saturating_add(
+        sparse_lorentzian_host_statistics.accepted_active_points,
+        static_cast<std::uint64_t>(active_count));
+    return true;
+  }
+  catch (...) {
+    if (plan_slot < cache->sparse_lorentzian_plans.size()) {
+      auto &failed = cache->sparse_lorentzian_plans[plan_slot];
+      failed.state =
+          detail::resident_cache::sparse_lorentzian_plan_state::dense_locked;
+      failed.execution_eligible = false;
+    }
+    sparse_lorentzian_saturating_add(
+        sparse_lorentzian_host_statistics.plan_build_failures, 1);
+    return false;
+  }
+}
+
+bool execute_sparse_lorentzian_plan(
+    detail::resident_cache *cache, std::size_t plan_slot,
+    float *device_polarization, float *device_auxiliary,
+    const float *device_field,
+    const meep_cuda::lorentzian_material_fp32 &material) {
+  if (plan_slot >= cache->sparse_lorentzian_plans.size()) return false;
+  auto &plan = cache->sparse_lorentzian_plans[plan_slot];
+  if (!plan.execution_eligible ||
+      plan.state !=
+          detail::resident_cache::sparse_lorentzian_plan_state::sparse ||
+      plan.guard_slot >= cache->sparse_lorentzian_guards.size() ||
+      !cache->sparse_lorentzian_ledger)
+    return false;
+  auto &guard = cache->sparse_lorentzian_guards[plan.guard_slot];
+  if (!guard.execution_eligible || !guard.device_sticky) return false;
+  if (guard.last_scanned_epoch != cache->epoch) {
+    if (sparse_lorentzian_failure_injected("guard-scan")) return false;
+    meep_cuda::scan_lorentzian_sparse_field_finite_fp32(
+        device_field, plan.identity.index_space,
+        plan.identity.point_count, guard.device_sticky,
+        cache->sparse_lorentzian_ledger);
+    guard.last_scanned_epoch = cache->epoch;
+    sparse_lorentzian_saturating_add(
+        sparse_lorentzian_host_statistics.guard_scan_submissions, 1);
+    sparse_lorentzian_saturating_add(
+        sparse_lorentzian_host_statistics.guard_scan_submission_points,
+        static_cast<std::uint64_t>(plan.identity.point_count));
+  }
+  if (plan.identity.increment_state)
+    meep_cuda::update_lorentzian_increment_sparse_guarded_fp32(
+        device_polarization, device_auxiliary, device_field,
+        plan.device_active_indices, plan.active_count,
+        plan.identity.index_space, plan.identity.point_count, material,
+        plan.device_validation_flag, guard.device_sticky,
+        cache->sparse_lorentzian_ledger);
+  else
+    meep_cuda::update_lorentzian_sparse_guarded_fp32(
+        device_polarization, device_auxiliary, device_field,
+        plan.device_active_indices, plan.active_count,
+        plan.identity.index_space, plan.identity.point_count, material,
+        plan.device_validation_flag, guard.device_sticky,
+        cache->sparse_lorentzian_ledger);
+  sparse_lorentzian_saturating_add(
+      sparse_lorentzian_host_statistics.sparse_submission_calls, 1);
+  sparse_lorentzian_saturating_add(
+      sparse_lorentzian_host_statistics.sparse_submission_points,
+      static_cast<std::uint64_t>(plan.active_count));
+  return true;
+}
+
 int active_cuda_device_ordinal() {
   std::lock_guard<std::mutex> lock(state.mutex);
   ensure_configured_locked();
@@ -3858,7 +5245,16 @@ int active_cuda_device_ordinal() {
   return state.selected_device;
 }
 
-void clear_device_buffers(detail::resident_cache *cache) noexcept {
+void clear_device_buffers(detail::resident_cache *cache,
+                          bool sparse_storage_quiesced = true) noexcept {
+  mark_sparse_lorentzian_execution_ineligible(cache);
+  if (!sparse_storage_quiesced ||
+      external_device_reclamation_quarantined()) {
+    quarantine_resident_device_storage(cache);
+    return;
+  }
+  (void)fold_sparse_lorentzian_ledger_after_quiescence(cache);
+  release_sparse_lorentzian_storage_after_quiescence(cache, true);
   std::uint64_t released =
       static_cast<std::uint64_t>(cache->mirrors.size()) +
       static_cast<std::uint64_t>(
@@ -3879,6 +5275,7 @@ void clear_device_buffers(detail::resident_cache *cache) noexcept {
       (cache->ldos_plan_buffers[0].device_pointer ? 1u : 0u) +
       (cache->ldos_plan_buffers[1].device_pointer ? 1u : 0u) +
       (cache->index_pointer ? 1u : 0u);
+  cache->prepared_span_resolutions.clear();
   for (auto &entry : cache->mirrors)
     meep_cuda::free_device(entry.second.device_pointer);
   cache->mirrors.clear();
@@ -3953,6 +5350,7 @@ void clear_device_buffers(detail::resident_cache *cache) noexcept {
 void sync_resident_mirrors_to_host(detail::resident_cache *cache);
 
 void select_cache_device(detail::resident_cache *cache) {
+  require_resident_cache_accessible(cache, "resident cache device selection");
   const int ordinal = active_cuda_device_ordinal();
   if (cache->device_ordinal >= 0 && cache->device_ordinal != ordinal) {
     // A plan in another result cache may contain a nested pointer into this
@@ -3962,15 +5360,34 @@ void select_cache_device(detail::resident_cache *cache) {
     std::lock_guard<std::mutex> ldos_lock(get_ldos_reduction_mutex());
     resident_registry &registry = get_resident_registry();
     std::lock_guard<std::mutex> registry_lock(registry.mutex);
+    try {
+      meep_cuda::select_device(cache->device_ordinal);
+      if (sparse_lorentzian_failure_injected("quiescence"))
+        throw std::runtime_error(
+            "injected sparse Lorentzian quiescence failure");
+      // Device-dirty mirrors may be the only authoritative copy. Migrate them
+      // transactionally through the host before releasing old-device storage.
+      // This begins with a device-wide fence and publishes host state only
+      // after every D2H succeeds.
+      sync_resident_mirrors_to_host(cache);
+    }
+    catch (...) {
+      // No descriptor or allocation has been released yet. Preserve the
+      // complete old-device cache and make the attempted migration fail.
+      quarantine_resident_device_storage(cache);
+      throw;
+    }
     invalidate_all_ldos_plan_snapshots_locked(registry);
     clear_dft_reduction_plans_for_cache(cache);
     clear_eigenmode_overlap_plans_for_cache(cache);
     clear_near2far_plans_for_cache(cache);
-    meep_cuda::select_device(cache->device_ordinal);
-    // Device-dirty mirrors may be the only authoritative copy. Migrate them
-    // transactionally through the host before releasing old-device storage.
-    sync_resident_mirrors_to_host(cache);
     clear_device_buffers(cache);
+    // Process-global external descriptor quarantine can make the otherwise
+    // successful migration cleanup retain the old allocation set.  Never
+    // relabel that storage as belonging to the newly selected device or let a
+    // subsequent phase reactivate it.
+    require_resident_cache_accessible(
+        cache, "resident cache device migration");
   }
   meep_cuda::select_device(ordinal);
   cache->device_ordinal = ordinal;
@@ -3979,8 +5396,17 @@ void select_cache_device(detail::resident_cache *cache) {
 void begin_resident_phase(detail::resident_cache *cache) {
   if (cache->phase_active)
     throw std::logic_error("nested Meep CUDA resident curl phases are not supported");
+  if (cache->device_storage_quarantined)
+    throw std::runtime_error(
+        "Meep CUDA resident cache is quarantined after failed quiescence");
   select_cache_device(cache);
+  require_resident_cache_accessible(cache, "resident phase activation");
   if (cache->epoch == std::numeric_limits<std::uint64_t>::max()) {
+    if (!retire_sparse_lorentzian_state_checked(cache))
+      throw std::runtime_error(
+          "Meep CUDA could not quiesce sparse Lorentzian state at epoch "
+          "exhaustion");
+    cache->sparse_lorentzian_permanent_dense_lock = true;
     for (auto &entry : cache->mirrors)
       entry.second.uploaded_epoch = 0;
     cache->epoch = 1;
@@ -3999,6 +5425,21 @@ void *ensure_resident_mirror(
     std::atomic<std::int64_t> *failure_countdown_for_testing = nullptr) {
   auto found = cache->mirrors.find(host_pointer);
   if (found != cache->mirrors.end() && found->second.bytes != bytes) {
+    // Size replacement frees the old address and is therefore a cache-wide
+    // lifetime boundary even when no sparse plan happens to be live.  Remote
+    // boundary, phase, DFT, and source descriptors may still reference the
+    // old mirror. Prove an owning-device fence before any pointer or retained
+    // metadata can be released.
+    if (!quiesce_resident_device_storage_checked(cache))
+      throw std::runtime_error(
+          "Meep CUDA could not quiesce resident storage before replacing a "
+          "mirror");
+    if (invalidates_address_plans &&
+        !retire_sparse_lorentzian_state_checked(cache, true, true))
+      throw std::runtime_error(
+          "Meep CUDA could not retire sparse Lorentzian state before "
+          "replacing a resident mirror");
+    cache->prepared_span_resolutions.clear();
     meep_cuda::free_device(found->second.device_pointer);
     cache->mirror_intervals.erase(
         reinterpret_cast<std::uintptr_t>(host_pointer));
@@ -4033,6 +5474,7 @@ void *ensure_resident_mirror(
             ? (*selected_pool)[recycled_index].second
             : meep_cuda::allocate_device_bytes(bytes);
     created.bytes = bytes;
+    cache->prepared_span_resolutions.clear();
     try {
       found = cache->mirrors.emplace(host_pointer, created).first;
       cache->mirror_intervals.emplace(
@@ -4186,6 +5628,52 @@ resolved_resident_range resolve_resident_range(
   return resolved;
 }
 
+resolved_resident_range resolve_prepared_resident_span(
+    detail::resident_cache *cache, const float *host_address,
+    std::size_t bytes) {
+  // The caller has checked active phase, pointer and byte-count overflow.
+  // Still perform the original scan when caching is explicitly disabled or
+  // allocation identities have saturated. A hit reuses only range validation;
+  // the caller must check host/device authority on every invocation.
+  const bool enabled = cache->allocation_generation != 0 &&
+      std::getenv("MEEP_GPU_DISABLE_BOUNDARY_SPAN_CACHE") == nullptr;
+  if (!enabled) {
+    boundary_execution_span_cache_bypasses.fetch_add(1, std::memory_order_relaxed);
+    return resolve_resident_range(cache, host_address, bytes, true,
+                                 "Meep CUDA prepared resident span");
+  }
+  if (cache->mirror_intervals.size() != cache->mirrors.size())
+    throw std::logic_error(
+        "Meep CUDA resident mirror interval count is inconsistent");
+  const auto found = cache->prepared_span_resolutions.find(host_address);
+  if (found != cache->prepared_span_resolutions.end() &&
+      found->second.bytes == bytes) {
+    boundary_execution_span_cache_hits.fetch_add(1, std::memory_order_relaxed);
+    resolved_resident_range result;
+    result.host_base = found->second.host_base;
+    result.mirror = found->second.owning_mirror;
+    result.byte_offset = found->second.byte_offset;
+    return result;
+  }
+  boundary_execution_span_cache_misses.fetch_add(1, std::memory_order_relaxed);
+  const resolved_resident_range result = resolve_resident_range(
+      cache, host_address, bytes, true, "Meep CUDA prepared resident span");
+  if (result.mirror) {
+    // Bound optional host storage, including applications requesting many
+    // interior ranges. Missing and rejected ranges are never cached.
+    if (cache->prepared_span_resolutions.size() >= 128)
+      cache->prepared_span_resolutions.clear();
+    try {
+      cache->prepared_span_resolutions[host_address] =
+          {bytes, result.host_base, result.mirror, result.byte_offset};
+    }
+    catch (const std::bad_alloc &) {
+      // Cache storage is optional; the fully validated result remains usable.
+    }
+  }
+  return result;
+}
+
 void *resident_device_address(detail::resident_cache *cache,
                               const float *host_address, bool writable) {
   const resolved_resident_range resolved = resolve_resident_range(
@@ -4306,10 +5794,7 @@ void sync_and_invalidate_all_resident_caches() {
 
 void discard_resident_phase(detail::resident_cache *cache) noexcept {
   if (!cache || !cache->phase_active) return;
-  try {
-    meep_cuda::synchronize();
-  }
-  catch (...) {}
+  if (!quiesce_resident_device_storage_checked(cache)) return;
   // Never clear device_dirty here: a retained mirror from an earlier time
   // step may be the only authoritative copy. Runtime failure is propagated,
   // and a later explicit sync can still recover successfully completed work.
@@ -4378,18 +5863,48 @@ std::string compiled_architectures() {
 
 void select_device(int ordinal) {
 #if MEEP_HAVE_CUDA
-  sync_and_invalidate_all_resident_caches();
-  meep_cuda::select_device(ordinal);
-  std::lock_guard<std::mutex> lock(state.mutex);
-  state.selected_device = ordinal;
-  state.explicit_device_selection = true;
-  state.device_ready = true;
-  ++state.generation;
-  if (state.configured && state.requested != backend_mode::cpu) {
-    state.active = backend_mode::cuda;
-    std::ostringstream message;
-    message << "CUDA device " << ordinal << " selected";
-    state.diagnostic = message.str();
+  {
+    std::lock_guard<std::mutex> lock(state.mutex);
+    if (state.transition_in_progress)
+      throw std::runtime_error(
+          "gpmeep backend reconfiguration is already in progress");
+    if (!state.pinned_owners.empty()) {
+      if (state.configured && state.active == backend_mode::cuda &&
+          state.selected_device == ordinal)
+        return;
+      throw std::runtime_error(
+          "cannot change the gpmeep CUDA device while a preflighted fields "
+          "operation is active");
+    }
+    state.transition_in_progress = true;
+    invalidate_backend_query_fast_path_locked();
+  }
+  try {
+    sync_and_invalidate_all_resident_caches();
+    meep_cuda::select_device(ordinal);
+    std::lock_guard<std::mutex> lock(state.mutex);
+    state.selected_device = ordinal;
+    state.explicit_device_selection = true;
+    state.device_ready = true;
+    ++state.generation;
+    if (state.configured && state.requested != backend_mode::cpu) {
+      state.active = backend_mode::cuda;
+      publish_active_backend_fast_path_locked();
+      std::ostringstream message;
+      message << "CUDA device " << ordinal << " selected";
+      state.diagnostic = message.str();
+    }
+    state.transition_in_progress = false;
+    publish_active_backend_fast_path_locked();
+  }
+  catch (...) {
+    try {
+      std::lock_guard<std::mutex> lock(state.mutex);
+      state.transition_in_progress = false;
+      publish_active_backend_fast_path_locked();
+    }
+    catch (...) {}
+    throw;
   }
 #else
   (void)ordinal;
@@ -4398,15 +5913,49 @@ void select_device(int ordinal) {
 }
 
 void set_backend(backend_mode mode) {
+  {
+    std::lock_guard<std::mutex> lock(state.mutex);
+    if (state.transition_in_progress)
+      throw std::runtime_error(
+          "gpmeep backend reconfiguration is already in progress");
+    if (!state.pinned_owners.empty()) {
+      bool every_pin_matches = true;
+      for (const auto &entry : state.pinned_owners)
+        every_pin_matches = every_pin_matches && entry.second == mode;
+      if (state.configured && state.requested == mode &&
+          state.active == mode && every_pin_matches)
+        return;
+      throw std::runtime_error(
+          "cannot change the gpmeep backend while a preflighted fields "
+          "operation is active");
+    }
+    state.transition_in_progress = true;
+    invalidate_backend_query_fast_path_locked();
+  }
+  try {
 #if MEEP_HAVE_CUDA
-  // Preserve device-authoritative simulation state before CPU execution or a
-  // different selected device can observe the host arrays.
-  sync_and_invalidate_all_resident_caches();
+    // Preserve device-authoritative simulation state before CPU execution or
+    // a different selected device can observe the host arrays. The transition
+    // flag prevents a fields owner from becoming pinned between this sync and
+    // the configuration commit.
+    sync_and_invalidate_all_resident_caches();
 #endif
-  if (mode == backend_mode::cpu)
-    release_distributed_device_identifier();
-  std::lock_guard<std::mutex> lock(state.mutex);
-  configure_transaction_locked(mode);
+    if (mode == backend_mode::cpu)
+      release_distributed_device_identifier();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    configure_transaction_locked(mode);
+    state.transition_in_progress = false;
+    publish_active_backend_fast_path_locked();
+  }
+  catch (...) {
+    try {
+      std::lock_guard<std::mutex> lock(state.mutex);
+      state.transition_in_progress = false;
+      publish_active_backend_fast_path_locked();
+    }
+    catch (...) {}
+    throw;
+  }
 }
 
 backend_mode requested_backend() {
@@ -4475,7 +6024,294 @@ field_update_statistics get_field_update_statistics() noexcept {
 
 polarization_statistics get_polarization_statistics() noexcept {
   return {cpu_polarization_calls.load(), cpu_polarization_points.load(),
-          cuda_polarization_calls.load(), cuda_polarization_points.load()};
+          cuda_polarization_calls.load(), cuda_polarization_points.load(),
+          cuda_zero_state_elision_enabled_calls.load(),
+          cuda_zero_state_elision_enabled_points.load(),
+          cuda_zero_state_elision_inspectable_calls.load(),
+          cuda_zero_state_elision_inspectable_points.load()};
+}
+
+sparse_lorentzian_statistics get_sparse_lorentzian_statistics() {
+#if MEEP_HAVE_CUDA
+  resident_registry &registry = get_resident_registry();
+  std::lock_guard<std::mutex> registry_lock(registry.mutex);
+  for (const auto &entry : registry.caches)
+    if (entry.second->phase_active)
+      throw std::logic_error(
+          "cannot query sparse Lorentzian statistics during an active "
+          "resident phase");
+  std::lock_guard<std::mutex> statistics_lock(
+      sparse_lorentzian_statistics_mutex());
+  sparse_lorentzian_folded_ledger device =
+      sparse_lorentzian_destroyed_ledger;
+  std::uint64_t live_plans = 0;
+  std::uint64_t live_guards = 0;
+  std::uint64_t retained_index_bytes = 0;
+  bool teardown_incomplete =
+      sparse_lorentzian_host_statistics.teardown_incomplete.load(
+          std::memory_order_relaxed);
+  for (const auto &entry : registry.caches) {
+    detail::resident_cache *const cache = entry.second;
+    teardown_incomplete =
+        teardown_incomplete || cache->sparse_lorentzian_teardown_incomplete;
+    // A failed owning-device fence makes every subsequent CUDA access to
+    // this cache unsafe, including a seemingly read-only ledger copy.  Its
+    // plans have already been made ineligible; report only the sticky host
+    // evidence and leave all quarantined device storage untouched.
+    if (cache->device_storage_quarantined) continue;
+    for (const auto &plan : cache->sparse_lorentzian_plans)
+      if (plan.execution_eligible &&
+          plan.state ==
+              detail::resident_cache::sparse_lorentzian_plan_state::sparse)
+        sparse_lorentzian_saturating_add_value(
+            live_plans, 1, device.counter_overflow);
+    for (const auto &guard : cache->sparse_lorentzian_guards)
+      if (guard.execution_eligible)
+        sparse_lorentzian_saturating_add_value(
+            live_guards, 1, device.counter_overflow);
+    sparse_lorentzian_saturating_add_value(
+        retained_index_bytes,
+        static_cast<std::uint64_t>(
+            cache->sparse_lorentzian_retained_index_bytes),
+        device.counter_overflow);
+    if (!cache->sparse_lorentzian_ledger) continue;
+    if (cache->device_ordinal < 0)
+      throw std::logic_error(
+          "sparse Lorentzian ledger has no owning CUDA device");
+    meep_cuda::select_device(cache->device_ordinal);
+    meep_cuda::lorentzian_sparse_execution_ledger_fp32 live = {};
+    if (sparse_lorentzian_failure_injected("statistics-query-copy"))
+      throw std::runtime_error(
+          "injected sparse Lorentzian statistics query copy failure");
+    meep_cuda::copy_to_host(
+        &live, cache->sparse_lorentzian_ledger, sizeof(live));
+    sparse_lorentzian_saturating_add_value(
+        device.guard_scan_calls, live.guard_scan_calls,
+        device.counter_overflow);
+    sparse_lorentzian_saturating_add_value(
+        device.guard_scan_points, live.guard_scan_points,
+        device.counter_overflow);
+    sparse_lorentzian_saturating_add_value(
+        device.sparse_update_calls, live.sparse_update_calls,
+        device.counter_overflow);
+    sparse_lorentzian_saturating_add_value(
+        device.sparse_update_points, live.sparse_update_points,
+        device.counter_overflow);
+    sparse_lorentzian_saturating_add_value(
+        device.dense_fallback_calls, live.dense_fallback_calls,
+        device.counter_overflow);
+    sparse_lorentzian_saturating_add_value(
+        device.dense_fallback_points, live.dense_fallback_points,
+        device.counter_overflow);
+    if (live.counter_overflow) device.counter_overflow = true;
+  }
+#else
+  const sparse_lorentzian_folded_ledger device = {};
+  const std::uint64_t live_plans = 0;
+  const std::uint64_t live_guards = 0;
+  const std::uint64_t retained_index_bytes = 0;
+  const bool teardown_incomplete =
+      sparse_lorentzian_host_statistics.teardown_incomplete.load(
+          std::memory_order_relaxed);
+#endif
+  return {
+      sparse_lorentzian_host_statistics.opt_in_calls.load(),
+      sparse_lorentzian_host_statistics.opt_in_points.load(),
+      sparse_lorentzian_host_statistics.eligible_calls.load(),
+      sparse_lorentzian_host_statistics.eligible_points.load(),
+      sparse_lorentzian_host_statistics.ineligible_calls.load(),
+      sparse_lorentzian_host_statistics.ineligible_points.load(),
+      sparse_lorentzian_host_statistics.first_observation_dense_calls.load(),
+      sparse_lorentzian_host_statistics.first_observation_dense_points.load(),
+      sparse_lorentzian_host_statistics.plan_build_attempts.load(),
+      sparse_lorentzian_host_statistics.plan_build_successes.load(),
+      sparse_lorentzian_host_statistics.plan_build_failures.load(),
+      sparse_lorentzian_host_statistics.plan_hits.load(),
+      sparse_lorentzian_host_statistics.plan_invalidations.load(),
+      sparse_lorentzian_host_statistics.dense_locked_decisions.load(),
+      sparse_lorentzian_host_statistics.accepted_total_points.load(),
+      sparse_lorentzian_host_statistics.accepted_active_points.load(),
+      sparse_lorentzian_host_statistics.sparse_submission_calls.load(),
+      sparse_lorentzian_host_statistics.sparse_submission_points.load(),
+      sparse_lorentzian_host_statistics.guard_scan_submissions.load(),
+      sparse_lorentzian_host_statistics.guard_scan_submission_points.load(),
+      sparse_lorentzian_host_statistics.cpu_fallback_calls.load(),
+      sparse_lorentzian_host_statistics.cpu_fallback_points.load(),
+      device.guard_scan_calls,
+      device.guard_scan_points,
+      device.sparse_update_calls,
+      device.sparse_update_points,
+      device.dense_fallback_calls,
+      device.dense_fallback_points,
+      live_plans,
+      live_guards,
+      retained_index_bytes,
+      sparse_lorentzian_reset_generation.load(std::memory_order_relaxed),
+      device.counter_overflow ||
+          sparse_lorentzian_host_statistics.counter_overflow.load(
+              std::memory_order_relaxed),
+      teardown_incomplete};
+}
+
+void reset_sparse_lorentzian_statistics() {
+#if MEEP_HAVE_CUDA
+  resident_registry &registry = get_resident_registry();
+  std::lock_guard<std::mutex> registry_lock(registry.mutex);
+  for (const auto &entry : registry.caches) {
+    if (entry.second->phase_active)
+      throw std::logic_error(
+          "cannot reset sparse Lorentzian statistics during an active "
+          "resident phase");
+    if (entry.second->device_storage_quarantined ||
+        entry.second->sparse_lorentzian_teardown_incomplete)
+      throw std::runtime_error(
+          "cannot reset sparse Lorentzian statistics after incomplete "
+          "device teardown");
+  }
+#else
+  // CUDA builds serialize resets and destruction with registry.mutex.  A
+  // CPU-only build has no registry, so use the statistics mutex itself as the
+  // reset transaction lock.
+  std::unique_lock<std::mutex> cpu_statistics_lock(
+      sparse_lorentzian_statistics_mutex());
+#endif
+  if (sparse_lorentzian_host_statistics.teardown_incomplete.load(
+          std::memory_order_relaxed))
+    throw std::runtime_error(
+        "cannot reset sparse Lorentzian statistics after incomplete device "
+        "teardown");
+  if (sparse_lorentzian_reset_exhausted.load(std::memory_order_relaxed))
+    throw std::overflow_error(
+        "sparse Lorentzian statistics reset generation is exhausted");
+  const std::uint64_t current =
+      sparse_lorentzian_reset_generation.load(std::memory_order_relaxed);
+  if (current == std::numeric_limits<std::uint64_t>::max()) {
+    sparse_lorentzian_reset_exhausted.store(
+        true, std::memory_order_relaxed);
+    throw std::overflow_error(
+        "sparse Lorentzian statistics reset generation is exhausted");
+  }
+#if MEEP_HAVE_CUDA
+  if (sparse_lorentzian_failure_injected("statistics-reset"))
+    throw std::runtime_error(
+        "injected sparse Lorentzian statistics reset failure");
+  for (const auto &entry : registry.caches) {
+    detail::resident_cache *const cache = entry.second;
+    if (!cache->sparse_lorentzian_ledger) continue;
+    if (cache->device_ordinal < 0)
+      throw std::logic_error(
+          "sparse Lorentzian ledger has no owning CUDA device");
+    meep_cuda::select_device(cache->device_ordinal);
+    meep_cuda::synchronize();
+  }
+
+  struct ledger_replacement {
+    detail::resident_cache *cache;
+    void *pointer;
+    int device_ordinal;
+  };
+  std::vector<ledger_replacement> replacements;
+  replacements.reserve(registry.caches.size());
+  const meep_cuda::lorentzian_sparse_execution_ledger_fp32 zero_ledger = {};
+  try {
+    for (const auto &entry : registry.caches) {
+      detail::resident_cache *const cache = entry.second;
+      if (!cache->sparse_lorentzian_ledger) continue;
+      meep_cuda::select_device(cache->device_ordinal);
+      if (sparse_lorentzian_failure_injected(
+              "statistics-reset-allocation"))
+        throw std::runtime_error(
+            "injected sparse Lorentzian statistics ledger allocation "
+            "failure");
+      void *replacement = allocate_sparse_lorentzian_device_bytes(
+          sizeof(zero_ledger));
+      replacements.push_back(
+          {cache, replacement, cache->device_ordinal});
+      if (sparse_lorentzian_failure_injected("statistics-reset-copy"))
+        throw std::runtime_error(
+            "injected sparse Lorentzian statistics ledger copy failure");
+      meep_cuda::copy_to_device(
+          replacement, &zero_ledger, sizeof(zero_ledger));
+    }
+  }
+  catch (...) {
+    for (auto &replacement : replacements) {
+      try {
+        meep_cuda::select_device(replacement.device_ordinal);
+        free_sparse_lorentzian_device_pointer(replacement.pointer);
+      }
+      catch (...) {
+        sparse_lorentzian_host_statistics.teardown_incomplete.store(
+            true, std::memory_order_relaxed);
+      }
+    }
+    throw;
+  }
+
+  // Commit every zero ledger by pointer swap before reclaiming any old one.
+  // The swaps cannot fail, so all live caches cross the reset boundary as one
+  // logical transaction even when more than one CUDA device is represented.
+  for (auto &replacement : replacements) {
+    void *const new_pointer = replacement.pointer;
+    replacement.pointer = replacement.cache->sparse_lorentzian_ledger;
+    replacement.cache->sparse_lorentzian_ledger = static_cast<
+        meep_cuda::lorentzian_sparse_execution_ledger_fp32 *>(new_pointer);
+  }
+  for (auto &replacement : replacements) {
+    try {
+      if (sparse_lorentzian_failure_injected(
+              "statistics-reset-reclaim"))
+        throw std::runtime_error(
+            "injected sparse Lorentzian old-ledger reclaim failure");
+      meep_cuda::select_device(replacement.device_ordinal);
+      free_sparse_lorentzian_device_pointer(replacement.pointer);
+    }
+    catch (...) {
+      // The all-cache pointer swap is the reset commit point.  A failure
+      // after it cannot be reported as a failed reset without violating the
+      // promise that failed resets leave queryable totals unchanged.  The old
+      // ledger was fenced before the commit, so retain it process-long, keep
+      // its live-buffer gauge, publish sticky incomplete-teardown evidence,
+      // and complete this reset generation successfully.
+      sparse_lorentzian_host_statistics.teardown_incomplete.store(
+          true, std::memory_order_relaxed);
+    }
+  }
+#endif
+#if MEEP_HAVE_CUDA
+  std::lock_guard<std::mutex> statistics_lock(
+      sparse_lorentzian_statistics_mutex());
+#endif
+  sparse_lorentzian_destroyed_ledger = {};
+#define MEEP_RESET_SPARSE_COUNTER(name) \
+  sparse_lorentzian_host_statistics.name.store(0, std::memory_order_relaxed)
+  MEEP_RESET_SPARSE_COUNTER(opt_in_calls);
+  MEEP_RESET_SPARSE_COUNTER(opt_in_points);
+  MEEP_RESET_SPARSE_COUNTER(eligible_calls);
+  MEEP_RESET_SPARSE_COUNTER(eligible_points);
+  MEEP_RESET_SPARSE_COUNTER(ineligible_calls);
+  MEEP_RESET_SPARSE_COUNTER(ineligible_points);
+  MEEP_RESET_SPARSE_COUNTER(first_observation_dense_calls);
+  MEEP_RESET_SPARSE_COUNTER(first_observation_dense_points);
+  MEEP_RESET_SPARSE_COUNTER(plan_build_attempts);
+  MEEP_RESET_SPARSE_COUNTER(plan_build_successes);
+  MEEP_RESET_SPARSE_COUNTER(plan_build_failures);
+  MEEP_RESET_SPARSE_COUNTER(plan_hits);
+  MEEP_RESET_SPARSE_COUNTER(plan_invalidations);
+  MEEP_RESET_SPARSE_COUNTER(dense_locked_decisions);
+  MEEP_RESET_SPARSE_COUNTER(accepted_total_points);
+  MEEP_RESET_SPARSE_COUNTER(accepted_active_points);
+  MEEP_RESET_SPARSE_COUNTER(sparse_submission_calls);
+  MEEP_RESET_SPARSE_COUNTER(sparse_submission_points);
+  MEEP_RESET_SPARSE_COUNTER(guard_scan_submissions);
+  MEEP_RESET_SPARSE_COUNTER(guard_scan_submission_points);
+  MEEP_RESET_SPARSE_COUNTER(cpu_fallback_calls);
+  MEEP_RESET_SPARSE_COUNTER(cpu_fallback_points);
+#undef MEEP_RESET_SPARSE_COUNTER
+  sparse_lorentzian_host_statistics.counter_overflow.store(
+      false, std::memory_order_relaxed);
+  sparse_lorentzian_reset_generation.store(
+      current + 1, std::memory_order_relaxed);
 }
 
 source_statistics get_source_statistics() noexcept {
@@ -4486,6 +6322,48 @@ source_statistics get_source_statistics() noexcept {
 boundary_statistics get_boundary_statistics() noexcept {
   return {cpu_boundary_calls.load(), cpu_boundary_points.load(),
           cuda_boundary_calls.load(), cuda_boundary_points.load()};
+}
+
+boundary_execution_statistics get_boundary_execution_statistics() noexcept {
+  return {
+      boundary_execution_local_checks.load(std::memory_order_relaxed),
+      boundary_execution_local_disabled.load(std::memory_order_relaxed),
+      boundary_execution_local_unready.load(std::memory_order_relaxed),
+      boundary_execution_local_prepare_invalidations.load(std::memory_order_relaxed),
+      boundary_execution_local_replay_empty.load(std::memory_order_relaxed),
+      boundary_execution_local_replay_work.load(std::memory_order_relaxed),
+      boundary_execution_local_failures.load(std::memory_order_relaxed),
+      boundary_execution_local_descriptor_rebuild_attempts.load(std::memory_order_relaxed),
+      boundary_execution_prepare_calls.load(std::memory_order_relaxed),
+      boundary_execution_prepare_failures.load(std::memory_order_relaxed),
+      boundary_execution_prepared_arrays.load(std::memory_order_relaxed),
+      boundary_execution_prepare_host_nanoseconds.load(std::memory_order_relaxed),
+      boundary_execution_plan_empty.load(std::memory_order_relaxed),
+      boundary_execution_plan_direct_zero.load(std::memory_order_relaxed),
+      boundary_execution_plan_direct_local.load(std::memory_order_relaxed),
+      boundary_execution_plan_graph.load(std::memory_order_relaxed),
+      boundary_execution_plan_staged.load(std::memory_order_relaxed),
+      boundary_execution_span_cache_hits.load(std::memory_order_relaxed),
+      boundary_execution_span_cache_misses.load(std::memory_order_relaxed),
+      boundary_execution_span_cache_bypasses.load(std::memory_order_relaxed)};
+}
+
+material_phasing_statistics get_material_phasing_statistics() noexcept {
+  return {material_phasing_checks.load(std::memory_order_relaxed),
+          material_phasing_reused.load(std::memory_order_relaxed),
+          material_phasing_disabled.load(std::memory_order_relaxed),
+          material_phasing_ineligible.load(std::memory_order_relaxed)};
+}
+
+resident_point_read_statistics get_resident_point_read_statistics() noexcept {
+  return {
+      point_read_cuda_read_attempts.load(std::memory_order_relaxed),
+      point_read_cuda_read_completions.load(std::memory_order_relaxed),
+      point_read_cuda_read_failures.load(std::memory_order_relaxed),
+      point_read_scalars_copied.load(std::memory_order_relaxed),
+      point_read_device_to_host_calls.load(std::memory_order_relaxed),
+      point_read_device_to_host_bytes.load(std::memory_order_relaxed),
+      point_read_host_nanoseconds.load(std::memory_order_relaxed)};
 }
 
 dft_statistics get_dft_statistics() noexcept {
@@ -4784,6 +6662,39 @@ get_curl_phase_replay_statistics() noexcept {
       phase_curl_replay_mirror_misses.load(std::memory_order_relaxed)};
 }
 
+structured_curl_graph_statistics
+get_structured_curl_graph_statistics() noexcept {
+  return {
+      structured_curl_graph_collection_checks.load(
+          std::memory_order_relaxed),
+      structured_curl_graph_collection_launches.load(
+          std::memory_order_relaxed),
+      structured_curl_graph_plan_creations.load(std::memory_order_relaxed),
+      structured_curl_graph_plan_rebuilds.load(std::memory_order_relaxed),
+      structured_curl_graph_plan_reuses.load(std::memory_order_relaxed),
+      structured_curl_graph_plan_destroys.load(std::memory_order_relaxed),
+      structured_curl_graph_plan_destroy_failures.load(
+          std::memory_order_relaxed),
+      structured_curl_graph_live_plans.load(std::memory_order_relaxed),
+      structured_curl_graph_quarantined_plans.load(
+          std::memory_order_relaxed),
+      structured_curl_graph_logical_operations.load(
+          std::memory_order_relaxed),
+      structured_curl_graph_unsupported_fallbacks.load(
+          std::memory_order_relaxed),
+      structured_curl_graph_creation_fallbacks.load(
+          std::memory_order_relaxed),
+      structured_curl_graph_launch_failures.load(
+          std::memory_order_relaxed),
+      structured_curl_graph_replay_checks.load(std::memory_order_relaxed),
+      structured_curl_graph_replay_launches.load(std::memory_order_relaxed),
+      structured_curl_graph_replay_unready.load(std::memory_order_relaxed),
+      structured_curl_graph_replay_generation_misses.load(
+          std::memory_order_relaxed),
+      structured_curl_graph_replay_mirror_misses.load(
+          std::memory_order_relaxed)};
+}
+
 boundary_descriptor_replay_statistics
 get_boundary_descriptor_replay_statistics() noexcept {
   return {
@@ -4828,6 +6739,10 @@ void reset_dispatch_statistics() noexcept {
   cpu_polarization_points.store(0);
   cuda_polarization_calls.store(0);
   cuda_polarization_points.store(0);
+  cuda_zero_state_elision_enabled_calls.store(0);
+  cuda_zero_state_elision_enabled_points.store(0);
+  cuda_zero_state_elision_inspectable_calls.store(0);
+  cuda_zero_state_elision_inspectable_points.store(0);
   cpu_source_calls.store(0);
   cpu_source_points.store(0);
   cuda_source_calls.store(0);
@@ -4836,6 +6751,35 @@ void reset_dispatch_statistics() noexcept {
   cpu_boundary_points.store(0);
   cuda_boundary_calls.store(0);
   cuda_boundary_points.store(0);
+  boundary_execution_local_checks.store(0, std::memory_order_relaxed);
+  boundary_execution_local_disabled.store(0, std::memory_order_relaxed);
+  boundary_execution_local_unready.store(0, std::memory_order_relaxed);
+  boundary_execution_local_prepare_invalidations.store(0, std::memory_order_relaxed);
+  boundary_execution_local_replay_empty.store(0, std::memory_order_relaxed);
+  boundary_execution_local_replay_work.store(0, std::memory_order_relaxed);
+  boundary_execution_local_failures.store(0, std::memory_order_relaxed);
+  boundary_execution_local_descriptor_rebuild_attempts.store(0, std::memory_order_relaxed);
+  boundary_execution_prepare_calls.store(0, std::memory_order_relaxed);
+  boundary_execution_prepare_failures.store(0, std::memory_order_relaxed);
+  boundary_execution_prepared_arrays.store(0, std::memory_order_relaxed);
+  boundary_execution_prepare_host_nanoseconds.store(0, std::memory_order_relaxed);
+  boundary_execution_plan_empty.store(0, std::memory_order_relaxed);
+  boundary_execution_plan_direct_zero.store(0, std::memory_order_relaxed);
+  boundary_execution_plan_direct_local.store(0, std::memory_order_relaxed);
+  boundary_execution_plan_graph.store(0, std::memory_order_relaxed);
+  boundary_execution_plan_staged.store(0, std::memory_order_relaxed);
+  boundary_execution_span_cache_hits.store(0, std::memory_order_relaxed);
+  boundary_execution_span_cache_misses.store(0, std::memory_order_relaxed);
+  boundary_execution_span_cache_bypasses.store(0, std::memory_order_relaxed);
+  point_read_cuda_read_attempts.store(0, std::memory_order_relaxed);
+  point_read_cuda_read_completions.store(0, std::memory_order_relaxed);
+  point_read_cuda_read_failures.store(0, std::memory_order_relaxed);
+  point_read_scalars_copied.store(0, std::memory_order_relaxed);
+  point_read_device_to_host_calls.store(0, std::memory_order_relaxed);
+  point_read_device_to_host_bytes.store(0, std::memory_order_relaxed);
+  point_read_host_nanoseconds.store(0, std::memory_order_relaxed);
+
+
   reset_boundary_descriptor_replay_statistics();
   cpu_dft_calls.store(0);
   cpu_dft_points.store(0);
@@ -5032,6 +6976,10 @@ void reset_dispatch_statistics() noexcept {
   host_to_device_bytes_avoided.store(0);
   device_to_host_bytes_avoided.store(0);
   device_buffer_allocations.store(0);
+  material_phasing_checks.store(0);
+  material_phasing_reused.store(0);
+  material_phasing_disabled.store(0);
+  material_phasing_ineligible.store(0);
   device_buffer_reuses.store(0);
   boundary_phase_graph_creations.store(0);
   boundary_phase_graph_launches.store(0);
@@ -5096,6 +7044,40 @@ void reset_dispatch_statistics() noexcept {
   phase_curl_replay_mirror_misses.store(0, std::memory_order_relaxed);
   curl_phase_replay_launch_failures_for_testing.store(
       0, std::memory_order_relaxed);
+  structured_curl_graph_collection_checks.store(
+      0, std::memory_order_relaxed);
+  structured_curl_graph_collection_launches.store(
+      0, std::memory_order_relaxed);
+  structured_curl_graph_plan_creations.store(0, std::memory_order_relaxed);
+  structured_curl_graph_plan_rebuilds.store(0, std::memory_order_relaxed);
+  structured_curl_graph_plan_reuses.store(0, std::memory_order_relaxed);
+  structured_curl_graph_plan_destroys.store(0, std::memory_order_relaxed);
+  structured_curl_graph_plan_destroy_failures.store(
+      0, std::memory_order_relaxed);
+  structured_curl_graph_logical_operations.store(
+      0, std::memory_order_relaxed);
+  structured_curl_graph_unsupported_fallbacks.store(
+      0, std::memory_order_relaxed);
+  structured_curl_graph_creation_fallbacks.store(
+      0, std::memory_order_relaxed);
+  structured_curl_graph_launch_failures.store(
+      0, std::memory_order_relaxed);
+  structured_curl_graph_replay_checks.store(0, std::memory_order_relaxed);
+  structured_curl_graph_replay_launches.store(0, std::memory_order_relaxed);
+  structured_curl_graph_replay_unready.store(0, std::memory_order_relaxed);
+  structured_curl_graph_replay_generation_misses.store(
+      0, std::memory_order_relaxed);
+  structured_curl_graph_replay_mirror_misses.store(
+      0, std::memory_order_relaxed);
+  structured_curl_graph_creation_failures_for_testing.store(
+      0, std::memory_order_relaxed);
+  structured_curl_graph_post_destroy_device_for_testing.store(
+      -1, std::memory_order_relaxed);
+#if MEEP_HAVE_CUDA
+  meep_cuda::set_structured_curl_graph_launch_api_failures_for_testing(0);
+  meep_cuda::set_structured_curl_graph_post_enqueue_failures_for_testing(0);
+  meep_cuda::set_structured_curl_graph_destroy_sync_failures_for_testing(0);
+#endif
   phase_update_eh_automatic_checks.store(0, std::memory_order_relaxed);
   phase_update_eh_automatic_selected.store(0, std::memory_order_relaxed);
   phase_update_eh_automatic_rejected.store(0, std::memory_order_relaxed);
@@ -5116,17 +7098,37 @@ get_curl_phase_replay_plan_snapshot_for_testing(
     std::lock_guard<std::mutex> lock(registry.mutex);
     const auto found = registry.plans.find(
         std::make_pair(owner, phase_key));
-    if (found == registry.plans.end()) return {false, false, 0};
+    if (found == registry.plans.end())
+      return {false, false, 0, false, false, false, 0, 0, 0, -1,
+              false, 0, 0};
+    std::size_t quarantined_dependencies = 0;
+    for (const detail::resident_cache *cache :
+         found->second.cache_dependencies)
+      if (cache && cache->device_storage_quarantined &&
+          cache->allocation_generation == 0)
+        ++quarantined_dependencies;
     return {true, found->second.complete_phase,
-            found->second.stable_reuses};
+            found->second.stable_reuses,
+            found->second.structured_graph_mode,
+            found->second.structured_graph != nullptr,
+            found->second.quarantined,
+            found->second.cache_dependencies.size(),
+            found->second.writable_mirrors.size(),
+            quarantined_dependencies,
+            found->second.device_ordinal,
+            found->second.automatic_rejected,
+            found->second.topology_fingerprint,
+            found->second.operation_count};
   }
   catch (...) {
-    return {false, false, 0};
+    return {false, false, 0, false, false, false, 0, 0, 0, -1,
+            false, 0, 0};
   }
 #else
   (void)owner;
   (void)phase_key;
-  return {false, false, 0};
+  return {false, false, 0, false, false, false, 0, 0, 0, -1,
+          false, 0, 0};
 #endif
 }
 
@@ -5134,6 +7136,18 @@ void set_curl_phase_replay_launch_failures_for_testing(
     std::uint64_t count) noexcept {
   curl_phase_replay_launch_failures_for_testing.store(
       count, std::memory_order_relaxed);
+}
+
+void set_structured_curl_graph_creation_failures_for_testing(
+    std::uint64_t count) noexcept {
+  structured_curl_graph_creation_failures_for_testing.store(
+      count, std::memory_order_relaxed);
+}
+
+void set_structured_curl_graph_post_destroy_device_for_testing(
+    int device_ordinal) noexcept {
+  structured_curl_graph_post_destroy_device_for_testing.store(
+      device_ordinal, std::memory_order_relaxed);
 }
 
 void set_boundary_event_record_failures_for_testing(
@@ -5180,6 +7194,45 @@ get_boundary_lifetime_fallback_statistics() noexcept {
           std::memory_order_relaxed),
       boundary_lifetime_uncertain_leaks.load(
           std::memory_order_relaxed)};
+}
+
+void record_local_boundary_path(local_boundary_path path) noexcept {
+  boundary_execution_local_checks.fetch_add(1, std::memory_order_relaxed);
+  switch (path) {
+    case local_boundary_path::disabled:
+      boundary_execution_local_disabled.fetch_add(1, std::memory_order_relaxed);
+      break;
+    case local_boundary_path::unready:
+      boundary_execution_local_unready.fetch_add(1, std::memory_order_relaxed);
+      break;
+    case local_boundary_path::prepare_invalidated:
+      boundary_execution_local_prepare_invalidations.fetch_add(1, std::memory_order_relaxed);
+      break;
+    case local_boundary_path::replay_empty:
+      boundary_execution_local_replay_empty.fetch_add(1, std::memory_order_relaxed);
+      break;
+    case local_boundary_path::replay_work:
+      boundary_execution_local_replay_work.fetch_add(1, std::memory_order_relaxed);
+      break;
+    case local_boundary_path::failed:
+      boundary_execution_local_failures.fetch_add(1, std::memory_order_relaxed);
+      break;
+  }
+}
+
+void record_local_boundary_rebuild_attempt() noexcept {
+  boundary_execution_local_descriptor_rebuild_attempts.fetch_add(
+      1, std::memory_order_relaxed);
+}
+
+void record_boundary_prepare(std::uint64_t arrays, std::uint64_t nanoseconds,
+                             bool succeeded) noexcept {
+  boundary_execution_prepare_calls.fetch_add(1, std::memory_order_relaxed);
+  if (!succeeded)
+    boundary_execution_prepare_failures.fetch_add(1, std::memory_order_relaxed);
+  boundary_execution_prepared_arrays.fetch_add(arrays, std::memory_order_relaxed);
+  boundary_execution_prepare_host_nanoseconds.fetch_add(
+      nanoseconds, std::memory_order_relaxed);
 }
 
 void record_boundary_eh_overlap_check() noexcept {
@@ -5384,9 +7437,52 @@ std::size_t finite_check_descriptor_bytes(
 #endif
 }
 
-bool cuda_active() { return active_backend() == backend_mode::cuda; }
+bool cuda_active() {
+  const unsigned char published =
+      backend_query_fast_path_state.load(std::memory_order_acquire);
+  if (published != backend_query_unready)
+    return published == backend_query_cuda;
+  return active_backend() == backend_mode::cuda;
+}
 
-bool cuda_required() { return requested_backend() == backend_mode::cuda; }
+void pin_backend_for_owner(const void *owner, backend_mode execution) {
+  if (!owner)
+    throw std::invalid_argument(
+        "gpmeep backend pin owner must be non-null");
+  if (execution != backend_mode::cpu && execution != backend_mode::cuda)
+    throw std::invalid_argument(
+        "gpmeep backend pin must select CPU or CUDA");
+  std::lock_guard<std::mutex> lock(state.mutex);
+  if (state.transition_in_progress)
+    throw std::runtime_error(
+        "cannot preflight fields while gpmeep backend reconfiguration is "
+        "in progress");
+  ensure_configured_locked();
+  if (state.active != execution)
+    throw std::runtime_error(
+        "gpmeep backend pin disagrees with the active process backend");
+  const auto found = state.pinned_owners.find(owner);
+  if (found != state.pinned_owners.end()) {
+    if (found->second != execution)
+      throw std::runtime_error(
+          "gpmeep fields owner attempted to change its pinned backend");
+    return;
+  }
+  for (const auto &entry : state.pinned_owners)
+    if (entry.second != execution)
+      throw std::runtime_error(
+          "gpmeep process cannot pin fields owners to different backends");
+  state.pinned_owners.emplace(owner, execution);
+}
+
+void unpin_backend_for_owner(const void *owner) noexcept {
+  if (!owner) return;
+  try {
+    std::lock_guard<std::mutex> lock(state.mutex);
+    state.pinned_owners.erase(owner);
+  }
+  catch (...) {}
+}
 
 std::uint64_t backend_generation() {
   std::lock_guard<std::mutex> lock(state.mutex);
@@ -5395,15 +7491,13 @@ std::uint64_t backend_generation() {
 
 backend_preflight_status probe_backend_for_distributed_step() {
   backend_preflight_status status =
-      {false, false, false, false, false, false, std::string()};
+      {false, false, false, false, std::string()};
   try {
 #if MEEP_HAVE_CUDA
-    // set_backend(auto) validates the environment transactionally, but users
-    // can legitimately change policy variables before a later fields step.
-    // An owner cache compares the same raw values before entering this probe;
-    // refresh the process configuration here so a malformed new value cannot
-    // be hidden by an old device selection. Preserve device-authoritative
-    // state before changing or clearing that selection.
+    // Users can legitimately change CUDA configuration variables before a
+    // later fields step. An owner cache compares the same raw values before
+    // entering this probe; refresh the process configuration here so a
+    // malformed new value cannot be hidden by an old device selection.
     const std::string current_environment_signature =
         backend_configuration_environment_signature();
     bool refresh_configuration = false;
@@ -5415,20 +7509,51 @@ backend_preflight_status probe_backend_for_distributed_step() {
               current_environment_signature;
     }
     if (refresh_configuration) {
-      sync_and_invalidate_all_resident_caches();
-      // Retain the current MPI-world claim until the new configuration has
-      // passed both parsing and device selection.  A failed refresh restores
-      // the previous backend generation/state transactionally; releasing the
-      // claim here would let the corresponding fields-owner cache become
-      // valid again after the environment is restored without ever reclaiming
-      // its physical GPU.  A successful refresh invalidates that owner cache
-      // through the generation bump, and the later distributed assignment
-      // preflight releases/replaces the old claim as one collective set.
-      std::lock_guard<std::mutex> lock(state.mutex);
-      if (state.configured && state.requested != backend_mode::cpu &&
-          state.configured_environment_signature !=
-              current_environment_signature)
-        configure_transaction_locked(state.requested);
+      bool transition_started = false;
+      {
+        std::lock_guard<std::mutex> lock(state.mutex);
+        refresh_configuration =
+            state.configured && state.requested != backend_mode::cpu &&
+            state.configured_environment_signature !=
+                current_environment_signature;
+        if (refresh_configuration) {
+          if (state.transition_in_progress)
+            throw std::runtime_error(
+                "gpmeep backend reconfiguration is already in progress");
+          if (!state.pinned_owners.empty())
+            throw std::runtime_error(
+                "cannot refresh gpmeep CUDA configuration while a "
+                "preflighted fields owner is active");
+          state.transition_in_progress = true;
+          invalidate_backend_query_fast_path_locked();
+          transition_started = true;
+        }
+      }
+      if (transition_started) {
+        try {
+          sync_and_invalidate_all_resident_caches();
+          // Retain the current MPI-world claim until the new configuration
+          // has passed both parsing and device selection. A failed refresh
+          // restores the previous generation/state transactionally; a
+          // successful refresh invalidates the old owner cache by generation.
+          std::lock_guard<std::mutex> lock(state.mutex);
+          if (state.configured && state.requested != backend_mode::cpu &&
+              state.configured_environment_signature !=
+                  current_environment_signature)
+            configure_transaction_locked(state.requested);
+          state.transition_in_progress = false;
+          publish_active_backend_fast_path_locked();
+        }
+        catch (...) {
+          try {
+            std::lock_guard<std::mutex> lock(state.mutex);
+            state.transition_in_progress = false;
+            publish_active_backend_fast_path_locked();
+          }
+          catch (...) {}
+          throw;
+        }
+      }
     }
 #endif
     std::lock_guard<std::mutex> lock(state.mutex);
@@ -5436,26 +7561,13 @@ backend_preflight_status probe_backend_for_distributed_step() {
     if (!state.configured)
       requested = parse_mode(std::getenv("MEEP_GPU_BACKEND"));
     status.cuda_required = requested == backend_mode::cuda;
-    status.automatic_requested =
-        requested == backend_mode::automatic;
     status.cpu_requested = requested == backend_mode::cpu;
-    const char *device_value = std::getenv("MEEP_GPU_DEVICE");
-    status.explicit_device_requested =
-        (device_value && *device_value) || state.explicit_device_selection;
     ensure_configured_locked();
     status.configuration_ok = true;
-    // Automatic owner decisions may publish CPU as the last active backend,
-    // but the already-selected device remains a CUDA candidate for another
-    // owner.  Candidate availability and current execution are deliberately
-    // separate here.
     status.cuda_active =
         state.requested != backend_mode::cpu && state.device_ready;
     status.cuda_required = state.requested == backend_mode::cuda;
-    status.automatic_requested =
-        state.requested == backend_mode::automatic;
     status.cpu_requested = state.requested == backend_mode::cpu;
-    status.explicit_device_requested =
-        (device_value && *device_value) || state.explicit_device_selection;
     status.diagnostic = state.diagnostic;
   }
   catch (const std::exception &error) {
@@ -5465,117 +7577,6 @@ backend_preflight_status probe_backend_for_distributed_step() {
     status.diagnostic = "unknown CUDA backend configuration error";
   }
   return status;
-}
-
-backend_preflight_status prepare_cuda_candidate_for_distributed_step() {
-  backend_preflight_status status =
-      {false, false, false, false, false, false, std::string()};
-  try {
-    std::lock_guard<std::mutex> lock(state.mutex);
-    ensure_configured_locked();
-    status.cuda_required = state.requested == backend_mode::cuda;
-    status.automatic_requested =
-        state.requested == backend_mode::automatic;
-    status.cpu_requested = state.requested == backend_mode::cpu;
-    const char *device_value = std::getenv("MEEP_GPU_DEVICE");
-    status.explicit_device_requested =
-        (device_value && *device_value) || state.explicit_device_selection;
-    if (state.requested == backend_mode::automatic &&
-        !state.device_ready) {
-#if MEEP_HAVE_CUDA
-      std::string runtime_diagnostic;
-      const bool explicit_device_environment = device_value && *device_value;
-      const bool explicit_device =
-          explicit_device_environment || state.explicit_device_selection;
-      const int environment_device = explicit_device_environment
-                                         ? parse_device_ordinal(device_value)
-                                         : -1;
-      const bool runtime_is_available =
-          meep_cuda::runtime_available(&runtime_diagnostic);
-      int ordinal = state.selected_device;
-      std::string selection_error;
-      if (!runtime_is_available) {
-        if (explicit_device)
-          throw std::runtime_error(
-              "explicit CUDA device selection failed: " +
-              runtime_diagnostic);
-        selection_error = runtime_diagnostic;
-      }
-      else {
-        try {
-          if (explicit_device_environment) ordinal = environment_device;
-          if (ordinal < 0) ordinal = rank_compatible_device();
-          if (ordinal < 0)
-            throw std::runtime_error(
-                "CUDA runtime found no compatible device");
-          meep_cuda::select_device(ordinal);
-        }
-        catch (const std::exception &error) {
-          if (explicit_device)
-            throw std::runtime_error(
-                "explicit CUDA device selection failed: " +
-                std::string(error.what()));
-          selection_error = error.what();
-        }
-      }
-      if (selection_error.empty()) {
-        state.selected_device = ordinal;
-        state.device_ready = true;
-        std::ostringstream message;
-        message << "CUDA device " << ordinal
-                << " prepared for automatic fields preflight on global rank "
-                << my_global_rank() << " (node rank " << my_node_rank()
-                << "/" << count_node_processors() << ")";
-        state.diagnostic = message.str();
-      }
-      else
-        state.diagnostic = selection_error;
-#else
-      state.diagnostic = "Meep was built without CUDA support";
-#endif
-    }
-    status.configuration_ok = true;
-    status.cuda_active =
-        state.requested != backend_mode::cpu && state.device_ready;
-    status.diagnostic = state.diagnostic;
-  }
-  catch (const std::exception &error) {
-    status.diagnostic = error.what();
-  }
-  catch (...) {
-    status.diagnostic = "unknown CUDA candidate configuration error";
-  }
-  return status;
-}
-
-automatic_device_policy_facts selected_automatic_device_policy_facts() {
-#if MEEP_HAVE_CUDA
-  int ordinal = -1;
-  {
-    std::lock_guard<std::mutex> lock(state.mutex);
-    ensure_configured_locked();
-    if (!state.device_ready || state.selected_device < 0)
-      throw std::runtime_error(
-          "automatic CUDA policy requires a selected compatible device");
-    ordinal = state.selected_device;
-  }
-  const std::vector<meep_cuda::device_info> devices =
-      meep_cuda::enumerate_devices();
-  for (const meep_cuda::device_info &device : devices)
-    if (device.ordinal == ordinal) {
-      const meep_cuda::device_memory_info memory =
-          meep_cuda::selected_device_memory_info();
-      return {device.compute_major, device.compute_minor,
-              device.multiprocessor_count,
-              device.memory_bandwidth_bytes_per_second,
-              memory.free_bytes, memory.total_bytes};
-    }
-  throw std::runtime_error(
-      "selected CUDA device disappeared during automatic policy preflight");
-#else
-  throw std::runtime_error(
-      "automatic CUDA policy is unavailable in a CPU-only build");
-#endif
 }
 
 void activate_backend_for_owner(backend_mode execution,
@@ -5596,7 +7597,16 @@ void activate_backend_for_owner(backend_mode execution,
   if (execution == backend_mode::cuda && !state.device_ready)
     throw std::logic_error(
         "fields owner cannot activate an unconfigured CUDA device");
+  // v1.1.0 is explicit-selection-only.  The checks above establish
+  // execution == requested, while a committed configuration establishes
+  // active == requested.  Fail closed here so a future automatic/fallback
+  // policy cannot turn this diagnostic-only owner path into an unguarded
+  // backend transition.
+  if (state.active != execution)
+    throw std::logic_error(
+        "fields owner execution violates the explicit-only backend invariant");
   state.active = execution;
+  publish_active_backend_fast_path_locked();
   state.diagnostic = diagnostic.empty()
                          ? (execution == backend_mode::cuda
                                 ? "fields owner selected CUDA"
@@ -5709,6 +7719,14 @@ void record_cpu_update_eh(std::size_t points) noexcept {
 void record_cpu_polarization(std::size_t points) noexcept {
   cpu_polarization_calls.fetch_add(1);
   cpu_polarization_points.fetch_add(static_cast<std::uint64_t>(points));
+  if (sparse_lorentzian_control_from_environment() ==
+      sparse_lorentzian_control_token::enabled) {
+    sparse_lorentzian_saturating_add(
+        sparse_lorentzian_host_statistics.cpu_fallback_calls, 1);
+    sparse_lorentzian_saturating_add(
+        sparse_lorentzian_host_statistics.cpu_fallback_points,
+        static_cast<std::uint64_t>(points));
+  }
 }
 
 void record_cpu_source(std::size_t points) noexcept {
@@ -6026,10 +8044,11 @@ void resident_curl_session::finish(bool synchronize_to_host) {
 
 resident_curl_phase_batch::resident_curl_phase_batch(
     const void *owner, int phase_key, phase_batch_mode mode,
-    std::uint64_t topology_fingerprint, bool replay_supported)
+    std::uint64_t topology_fingerprint, bool replay_supported,
+    bool structured_graph)
     : active_(false) {
 #if MEEP_HAVE_CUDA
-  if (mode == phase_batch_mode::disabled) return;
+  if (mode == phase_batch_mode::disabled && !structured_graph) return;
   if (!owner)
     throw std::invalid_argument(
         "Meep CUDA phase-batched curl owner must be non-null");
@@ -6037,6 +8056,27 @@ resident_curl_phase_batch::resident_curl_phase_batch(
   if (collection.active)
     throw std::logic_error(
         "nested Meep CUDA phase-batched curls are not supported");
+  if (mode == phase_batch_mode::automatic && !structured_graph) {
+    curl_phase_registry &registry = get_curl_phase_registry();
+    std::lock_guard<std::mutex> lock(registry.mutex);
+    const auto found = registry.plans.find(
+        std::make_pair(owner, phase_key));
+    if (found != registry.plans.end() &&
+        found->second.automatic_rejected &&
+        found->second.mode == mode &&
+        found->second.operation_count > 0 &&
+        found->second.topology_fingerprint == topology_fingerprint) {
+      // Preserve logical policy accounting while avoiding descriptor
+      // collection, device enumeration, and replay probes for a topology
+      // whose automatic rejection was already established.
+      phase_curl_automatic_checks.fetch_add(1, std::memory_order_relaxed);
+      phase_curl_automatic_rejected.fetch_add(1, std::memory_order_relaxed);
+      phase_curl_unbatched_operations.fetch_add(
+          static_cast<std::uint64_t>(found->second.operation_count),
+          std::memory_order_relaxed);
+      return;
+    }
+  }
   collection.active = true;
   collection.mode = mode;
   collection.owner = owner;
@@ -6050,16 +8090,19 @@ resident_curl_phase_batch::resident_curl_phase_batch(
   collection.writable_mirrors.clear();
   collection.flush_count = 0;
   collection.batched_flush_count = 0;
+  collection.graph_flush_count = 0;
   collection.replayed = false;
   collection.replay_forbidden = false;
   collection.replay_supported = replay_supported;
+  collection.structured_graph = structured_graph;
   active_ = true;
 #else
   (void)owner;
   (void)phase_key;
   (void)topology_fingerprint;
   (void)replay_supported;
-  if (mode != phase_batch_mode::disabled)
+  (void)structured_graph;
+  if (mode != phase_batch_mode::disabled || structured_graph)
     throw std::runtime_error(
         "Meep CUDA phase-batched curl called in a CPU-only build");
 #endif
@@ -6084,22 +8127,45 @@ resident_curl_phase_batch::~resident_curl_phase_batch() {
   collection.topology_fingerprint = 0;
   collection.flush_count = 0;
   collection.batched_flush_count = 0;
+  collection.graph_flush_count = 0;
   collection.replayed = false;
   collection.replay_forbidden = false;
   collection.replay_supported = false;
+  collection.structured_graph = false;
 #endif
 }
 
 bool resident_curl_phase_batch::replay_if_ready() {
 #if MEEP_HAVE_CUDA
+  const char *explicit_enable =
+      std::getenv("MEEP_GPU_ENABLE_CURL_PHASE_REPLAY");
   if (!active_ ||
-      std::getenv("MEEP_GPU_DISABLE_CURL_PHASE_REPLAY") != nullptr)
+      std::getenv("MEEP_GPU_DISABLE_CURL_PHASE_REPLAY") != nullptr ||
+      (explicit_enable && std::strcmp(explicit_enable, "1") != 0))
     return false;
-  phase_curl_replay_checks.fetch_add(1, std::memory_order_relaxed);
   curl_phase_collection &collection = pending_curl_phase;
+  const bool structured_graph = collection.structured_graph;
+  (structured_graph ? structured_curl_graph_replay_checks
+                    : phase_curl_replay_checks)
+      .fetch_add(1, std::memory_order_relaxed);
+  const auto record_unready = [structured_graph]() noexcept {
+    (structured_graph ? structured_curl_graph_replay_unready
+                      : phase_curl_replay_unready)
+        .fetch_add(1, std::memory_order_relaxed);
+  };
+  const auto record_generation_miss = [structured_graph]() noexcept {
+    (structured_graph ? structured_curl_graph_replay_generation_misses
+                      : phase_curl_replay_generation_misses)
+        .fetch_add(1, std::memory_order_relaxed);
+  };
+  const auto record_mirror_miss = [structured_graph]() noexcept {
+    (structured_graph ? structured_curl_graph_replay_mirror_misses
+                      : phase_curl_replay_mirror_misses)
+        .fetch_add(1, std::memory_order_relaxed);
+  };
   if (!collection.active || !collection.operations.empty() ||
       !collection.replay_supported) {
-    phase_curl_replay_unready.fetch_add(1, std::memory_order_relaxed);
+    record_unready();
     return false;
   }
 
@@ -6108,36 +8174,43 @@ bool resident_curl_phase_batch::replay_if_ready() {
   const auto found = registry.plans.find(
       std::make_pair(collection.owner, collection.phase_key));
   if (found == registry.plans.end()) {
-    phase_curl_replay_unready.fetch_add(1, std::memory_order_relaxed);
+    record_unready();
     return false;
   }
   curl_phase_plan &plan = found->second;
+  const bool submission_ready =
+      structured_graph
+          ? plan.structured_graph_mode && plan.structured_graph &&
+                !plan.device_operations && !plan.quarantined
+          : !plan.structured_graph_mode && !plan.structured_graph &&
+                plan.device_operations && plan.descriptor_bytes != 0 &&
+                !plan.quarantined;
   if (!plan.complete_phase || plan.mode != collection.mode ||
+      plan.structured_graph_mode != structured_graph ||
       plan.topology_fingerprint != collection.topology_fingerprint ||
-      !plan.device_operations ||
-      plan.device_ordinal < 0 ||
+      !submission_ready || plan.device_ordinal < 0 ||
       plan.stable_reuses < 2 || plan.operation_count < 2 ||
-      plan.total_block_count == 0 || plan.descriptor_bytes == 0 ||
-      plan.cache_generations.empty() ||
+      plan.total_block_count == 0 || plan.cache_generations.empty() ||
       plan.mirror_dependencies.empty() || plan.writable_mirrors.empty()) {
-    phase_curl_replay_unready.fetch_add(1, std::memory_order_relaxed);
+    record_unready();
     return false;
   }
 
   for (const auto &generation : plan.cache_generations)
     if (!generation.first || !generation.first->phase_active ||
+        generation.second == 0 ||
+        generation.first->allocation_generation == 0 ||
+        generation.first->device_storage_quarantined ||
         generation.first->device_ordinal != plan.device_ordinal ||
         generation.first->allocation_generation != generation.second) {
-      phase_curl_replay_generation_misses.fetch_add(
-          1, std::memory_order_relaxed);
+      record_generation_miss();
       return false;
     }
   for (const curl_phase_plan::mirror_dependency &dependency :
        plan.mirror_dependencies) {
     if (!dependency.cache || !dependency.host_pointer ||
         dependency.bytes == 0) {
-      phase_curl_replay_mirror_misses.fetch_add(
-          1, std::memory_order_relaxed);
+      record_mirror_miss();
       return false;
     }
     const auto mirror =
@@ -6146,8 +8219,7 @@ bool resident_curl_phase_batch::replay_if_ready() {
         mirror->second.bytes != dependency.bytes ||
         (!mirror->second.device_dirty &&
          mirror->second.uploaded_epoch == 0)) {
-      phase_curl_replay_mirror_misses.fetch_add(
-          1, std::memory_order_relaxed);
+      record_mirror_miss();
       return false;
     }
   }
@@ -6157,57 +8229,90 @@ bool resident_curl_phase_batch::replay_if_ready() {
   for (const curl_phase_plan::mirror_dependency &writable :
        plan.writable_mirrors) {
     if (!writable.cache || !writable.host_pointer || writable.bytes == 0) {
-      phase_curl_replay_mirror_misses.fetch_add(
-          1, std::memory_order_relaxed);
+      record_mirror_miss();
       return false;
     }
     const auto mirror = writable.cache->mirrors.find(writable.host_pointer);
     if (mirror == writable.cache->mirrors.end() ||
         mirror->second.bytes != writable.bytes) {
-      phase_curl_replay_mirror_misses.fetch_add(
-          1, std::memory_order_relaxed);
+      record_mirror_miss();
       return false;
     }
   }
 
+  bool graph_submission_counted = false;
+  bool graph_runtime_entered = false;
   try {
     meep_cuda::select_device(plan.device_ordinal);
     if (consume_failure_for_testing(
             curl_phase_replay_launch_failures_for_testing))
       throw std::runtime_error(
           "injected CUDA curl phase replay launch failure");
-    meep_cuda::step_curl_material_phase_batched_fp32(
-        static_cast<const meep_cuda::curl_phase_operation_fp32 *>(
-            plan.device_operations),
-        reinterpret_cast<const std::uint32_t *>(
-            static_cast<const unsigned char *>(plan.device_operations) +
-            plan.descriptor_bytes),
-        plan.operation_count, plan.total_block_count);
+    if (structured_graph) {
+      structured_curl_graph_replay_launches.fetch_add(
+          1, std::memory_order_relaxed);
+      structured_curl_graph_logical_operations.fetch_add(
+          static_cast<std::uint64_t>(plan.operation_count),
+          std::memory_order_relaxed);
+      graph_submission_counted = true;
+      graph_runtime_entered = true;
+      meep_cuda::launch_structured_curl_graph_fp32(
+          plan.structured_graph);
+    }
+    else
+      meep_cuda::step_curl_material_phase_batched_fp32(
+          static_cast<const meep_cuda::curl_phase_operation_fp32 *>(
+              plan.device_operations),
+          reinterpret_cast<const std::uint32_t *>(
+              static_cast<const unsigned char *>(plan.device_operations) +
+              plan.descriptor_bytes),
+          plan.operation_count, plan.total_block_count);
   }
   catch (...) {
     plan.complete_phase = false;
     plan.stable_reuses = 0;
     collection.replay_forbidden = true;
-    phase_curl_replay_unready.fetch_add(1, std::memory_order_relaxed);
+    if (structured_graph) {
+      // A failure raised after entering the runtime launch boundary cannot
+      // prove whether CUDA accepted or completed the graph.  Never retry or
+      // publish writable mirrors; quarantine the graph and every captured
+      // cache allocation instead.  The explicit pre-call injection above is
+      // known not to have submitted work and remains recoverable.
+      if (graph_runtime_entered) quarantine_curl_phase_plan(plan);
+      structured_curl_graph_launch_failures.fetch_add(
+          1, std::memory_order_relaxed);
+      if (!graph_submission_counted) record_unready();
+    }
+    else
+      record_unready();
     throw;
   }
   for (const curl_phase_plan::mirror_dependency &writable :
        plan.writable_mirrors)
     mark_device_dirty(
         writable.cache, writable.host_pointer, writable.bytes);
-  cuda_curl_calls.fetch_add(1);
+  cuda_curl_calls.fetch_add(
+      structured_graph
+          ? static_cast<std::uint64_t>(plan.operation_count)
+          : 1u);
   cuda_curl_points.fetch_add(plan.point_count);
-  phase_curl_batched_operations.fetch_add(
-      static_cast<std::uint64_t>(plan.operation_count),
-      std::memory_order_relaxed);
-  if (collection.mode == phase_batch_mode::automatic) {
-    phase_curl_automatic_checks.fetch_add(1, std::memory_order_relaxed);
-    phase_curl_automatic_selected.fetch_add(1, std::memory_order_relaxed);
+  if (structured_graph) {
+    structured_curl_graph_plan_reuses.fetch_add(
+        1, std::memory_order_relaxed);
   }
-  else if (collection.mode == phase_batch_mode::forced)
-    phase_curl_forced_batches.fetch_add(1, std::memory_order_relaxed);
-  device_buffer_reuses.fetch_add(1);
-  phase_curl_replay_hits.fetch_add(1, std::memory_order_relaxed);
+  else {
+    phase_curl_batched_operations.fetch_add(
+        static_cast<std::uint64_t>(plan.operation_count),
+        std::memory_order_relaxed);
+    if (collection.mode == phase_batch_mode::automatic) {
+      phase_curl_automatic_checks.fetch_add(1, std::memory_order_relaxed);
+      phase_curl_automatic_selected.fetch_add(1, std::memory_order_relaxed);
+    }
+    else if (collection.mode == phase_batch_mode::forced)
+      phase_curl_forced_batches.fetch_add(1, std::memory_order_relaxed);
+    device_buffer_reuses.fetch_add(1);
+    phase_curl_replay_hits.fetch_add(1, std::memory_order_relaxed);
+  }
   if (plan.stable_reuses != std::numeric_limits<std::size_t>::max())
     ++plan.stable_reuses;
   collection.replayed = true;
@@ -6243,8 +8348,11 @@ void resident_curl_phase_batch::finish() {
     collection.point_count = 0;
     collection.flush_count = 0;
     collection.batched_flush_count = 0;
+    collection.graph_flush_count = 0;
     collection.replayed = false;
     collection.replay_forbidden = false;
+    collection.replay_supported = false;
+    collection.structured_graph = false;
     active_ = false;
     throw;
   }
@@ -6257,8 +8365,11 @@ void resident_curl_phase_batch::finish() {
   pending_curl_phase.writable_mirrors.clear();
   pending_curl_phase.flush_count = 0;
   pending_curl_phase.batched_flush_count = 0;
+  pending_curl_phase.graph_flush_count = 0;
   pending_curl_phase.replayed = false;
   pending_curl_phase.replay_forbidden = false;
+  pending_curl_phase.replay_supported = false;
+  pending_curl_phase.structured_graph = false;
   active_ = false;
 #else
   if (active_)
@@ -6630,6 +8741,10 @@ void destroy_resident_cw_vector_plan(
     resident_cw_vector_plan *plan) noexcept {
   if (!plan) return;
 #if MEEP_HAVE_CUDA
+  if (external_device_reclamation_quarantined()) {
+    delete plan;
+    return;
+  }
   if (plan->device_ordinal >= 0) {
     try {
       meep_cuda::select_device(plan->device_ordinal);
@@ -6724,30 +8839,85 @@ void destroy_resident_cache_for_owner_impl(const void *owner,
   // being removed.  Exclude reductions for the complete remove/invalidate/
   // free transaction, always before taking the resident registry mutex.
   std::lock_guard<std::mutex> ldos_lock(get_ldos_reduction_mutex());
-  resident_cache *cache = remove_resident_cache_for_owner(owner);
-  if (!cache) return;
+  resident_registry &registry = get_resident_registry();
+  resident_cache *cache = nullptr;
+  bool device_storage_quiesced = false;
   {
-    resident_registry &registry = get_resident_registry();
+    // Keep registry ownership until quiescence and ledger attribution are
+    // complete.  Statistics reset/query take this same lock first, so a
+    // destroyed ledger can belong wholly to either side of a reset boundary,
+    // never disappear between registry removal and folding.
     std::lock_guard<std::mutex> registry_lock(registry.mutex);
+    const auto found = registry.caches.find(owner);
+    if (found == registry.caches.end()) return;
+    cache = found->second;
     invalidate_all_ldos_plan_snapshots_locked(registry);
+    mark_sparse_lorentzian_execution_ineligible(cache);
+    device_storage_quiesced = cache->device_ordinal < 0;
+    if (external_device_reclamation_quarantined()) {
+      quarantine_resident_device_storage(cache);
+      device_storage_quiesced = false;
+    }
+    if (!cache->device_storage_quarantined && cache->device_ordinal >= 0) {
+      try {
+        meep_cuda::select_device(cache->device_ordinal);
+        if (sparse_lorentzian_failure_injected("quiescence"))
+          throw std::runtime_error(
+              "injected sparse Lorentzian quiescence failure");
+        if (publish_to_host)
+          sync_resident_mirrors_to_host(cache);
+        else
+          meep_cuda::synchronize();
+        device_storage_quiesced = true;
+      }
+      catch (...) {
+        quarantine_resident_device_storage(cache);
+      }
+    }
+
+    if (device_storage_quiesced) {
+      // Fold while the cache is still visible under registry.mutex.  Release
+      // only after device-wide quiescence; a readback failure is sticky
+      // telemetry loss but cannot create a device lifetime hazard.
+      (void)fold_sparse_lorentzian_ledger_after_quiescence(cache);
+      release_sparse_lorentzian_storage_after_quiescence(cache, true);
+    }
+    registry.caches.erase(found);
+    if (!device_storage_quiesced) {
+      // Intrusive, allocation-free process-long quarantine.  Do not clear any
+      // dependent descriptor registry or any cache allocation: all of them may
+      // still be referenced by queued work on a runtime that could not prove
+      // quiescence.
+      cache->quarantine_next = registry.quarantine_head;
+      registry.quarantine_head = cache;
+      return;
+    }
   }
   // Boundary operation and remote gather/scatter plans keep cache pointers
   // only as non-owning descriptor identities. Drop every such plan while the
   // cache is still alive so later generation validation can never dereference
   // a destroyed cache after zero_fields(), source repair, initialization, or
   // another host-side lifecycle transition.
-  if (cache->device_ordinal >= 0) {
-    try {
-      meep_cuda::select_device(cache->device_ordinal);
-      if (publish_to_host) sync_resident_mirrors_to_host(cache);
-    }
-    catch (...) {}
-  }
   // Invalidate only persistent plans which captured this cache.  Other live
   // fields owners retain their boundary/curl/EH plans and device residency;
   // an owner choosing CPU must never flush an unrelated CUDA simulation.
+  // Retire a graph before touching any other cache-dependent plan or the
+  // cache's allocations. A failed graph fence leaves the executable live and
+  // release_curl_phase_plan() quarantines every captured dependency. Propagate
+  // that result to the cache owner teardown instead of deleting the host cache
+  // object out from under the retained plan's dependency metadata.
+  const bool curl_plans_released = clear_curl_phase_plans_for_cache(cache);
+  {
+    std::lock_guard<std::mutex> registry_lock(registry.mutex);
+    if (!curl_plans_released || cache->device_storage_quarantined ||
+        external_device_reclamation_quarantined()) {
+      quarantine_resident_device_storage(cache);
+      cache->quarantine_next = registry.quarantine_head;
+      registry.quarantine_head = cache;
+      return;
+    }
+  }
   clear_boundary_exchange_plans_for_cache(cache);
-  clear_curl_phase_plans_for_cache(cache);
   clear_update_eh_phase_plans_for_cache(cache);
   clear_source_phase_plans_for_cache(cache);
   clear_dft_reduction_plans_for_cache(cache);
@@ -6788,6 +8958,107 @@ resident_cache_snapshot_for_testing get_resident_cache_snapshot_for_testing(
   return snapshot;
 }
 
+resident_cache_registry_snapshot_for_testing
+get_resident_cache_registry_snapshot_for_testing() noexcept {
+#if MEEP_HAVE_CUDA
+  resident_registry &registry = get_resident_registry();
+  std::lock_guard<std::mutex> lock(registry.mutex);
+  resident_cache_registry_snapshot_for_testing snapshot = {
+      registry.caches.size(), 0, 0};
+  for (const auto &entry : registry.caches)
+    if (entry.second && entry.second->device_storage_quarantined)
+      ++snapshot.active_quarantined_caches;
+  for (resident_cache *cache = registry.quarantine_head; cache;
+       cache = cache->quarantine_next)
+    ++snapshot.detached_quarantined_caches;
+  return snapshot;
+#else
+  return {0, 0, 0};
+#endif
+}
+
+sparse_lorentzian_generation_snapshot_for_testing
+get_sparse_lorentzian_generation_snapshot_for_testing(
+    const void *owner) noexcept {
+  sparse_lorentzian_generation_snapshot_for_testing snapshot = {
+      false, false, false, 0, 0, 0};
+#if MEEP_HAVE_CUDA
+  if (!owner) return snapshot;
+  resident_registry &registry = get_resident_registry();
+  std::lock_guard<std::mutex> lock(registry.mutex);
+  const auto found = registry.caches.find(owner);
+  if (found == registry.caches.end() || !found->second) return snapshot;
+  snapshot.exists = true;
+  snapshot.permanent_dense_lock =
+      found->second->sparse_lorentzian_permanent_dense_lock;
+  snapshot.device_storage_quarantined =
+      found->second->device_storage_quarantined;
+  snapshot.epoch = found->second->epoch;
+  snapshot.allocation_generation = found->second->allocation_generation;
+  snapshot.control_generation =
+      found->second->sparse_lorentzian_control_generation;
+#else
+  (void)owner;
+#endif
+  return snapshot;
+}
+
+void set_resident_epoch_for_testing(const void *owner,
+                                    std::uint64_t value) noexcept {
+#if MEEP_HAVE_CUDA
+  resident_registry &registry = get_resident_registry();
+  std::lock_guard<std::mutex> lock(registry.mutex);
+  const auto found = registry.caches.find(owner);
+  if (found != registry.caches.end() && found->second)
+    found->second->epoch = value;
+#else
+  (void)owner;
+  (void)value;
+#endif
+}
+
+void set_sparse_lorentzian_control_generation_for_testing(
+    const void *owner, std::uint64_t value) noexcept {
+#if MEEP_HAVE_CUDA
+  resident_registry &registry = get_resident_registry();
+  std::lock_guard<std::mutex> lock(registry.mutex);
+  const auto found = registry.caches.find(owner);
+  if (found != registry.caches.end() && found->second)
+    found->second->sparse_lorentzian_control_generation = value;
+#else
+  (void)owner;
+  (void)value;
+#endif
+}
+
+void set_resident_allocation_generation_counter_for_testing(
+    std::uint64_t value) noexcept {
+#if MEEP_HAVE_CUDA
+  resident_allocation_generation_counter().store(
+      value, std::memory_order_relaxed);
+#else
+  (void)value;
+#endif
+}
+
+void set_sparse_lorentzian_reset_generation_for_testing(
+    std::uint64_t value) noexcept {
+  sparse_lorentzian_reset_generation.store(value, std::memory_order_relaxed);
+  sparse_lorentzian_reset_exhausted.store(
+      value == std::numeric_limits<std::uint64_t>::max(),
+      std::memory_order_relaxed);
+}
+
+void set_sparse_lorentzian_host_opt_in_counters_for_testing(
+    std::uint64_t calls, std::uint64_t points) noexcept {
+  sparse_lorentzian_host_statistics.opt_in_calls.store(
+      calls, std::memory_order_relaxed);
+  sparse_lorentzian_host_statistics.opt_in_points.store(
+      points, std::memory_order_relaxed);
+  sparse_lorentzian_host_statistics.counter_overflow.store(
+      false, std::memory_order_relaxed);
+}
+
 void destroy_resident_cache_for_owner(const void *owner) noexcept {
   destroy_resident_cache_for_owner_impl(owner, true);
 }
@@ -6798,6 +9069,8 @@ void discard_resident_cache_for_owner(const void *owner) noexcept {
 
 void sync_resident_cache_for_owner(const void *owner) {
 #if MEEP_HAVE_CUDA
+  if (!resident_cuda_active_fast_path.load(std::memory_order_acquire))
+    return;
   resident_cache *cache = nullptr;
   {
     resident_registry &registry = get_resident_registry();
@@ -6806,6 +9079,7 @@ void sync_resident_cache_for_owner(const void *owner) {
     if (found != registry.caches.end()) cache = found->second;
   }
   if (!cache || cache->device_ordinal < 0) return;
+  require_resident_cache_accessible(cache, "resident cache synchronization");
   if (cache->phase_active)
     throw std::logic_error(
         "cannot synchronize a Meep CUDA cache during an active resident "
@@ -6815,6 +9089,16 @@ void sync_resident_cache_for_owner(const void *owner) {
 #else
   (void)owner;
 #endif
+}
+
+void record_material_phasing(bool reused, bool disabled) noexcept {
+  material_phasing_checks.fetch_add(1, std::memory_order_relaxed);
+  if (reused)
+    material_phasing_reused.fetch_add(1, std::memory_order_relaxed);
+  else if (disabled)
+    material_phasing_disabled.fetch_add(1, std::memory_order_relaxed);
+  else
+    material_phasing_ineligible.fetch_add(1, std::memory_order_relaxed);
 }
 
 void prepare_resident_host_writes_for_owner(
@@ -6830,6 +9114,7 @@ void prepare_resident_host_writes_for_owner(
   const auto cache_entry = registry.caches.find(owner);
   if (cache_entry == registry.caches.end()) return;
   resident_cache *cache = cache_entry->second;
+  require_resident_cache_accessible(cache, "resident host-write preparation");
   if (cache->phase_active)
     throw std::logic_error(
         "cannot prepare host writes during an active Meep CUDA phase");
@@ -6871,14 +9156,27 @@ void reset_resident_cache_for_owner_reusing_allocations(
   resident_cache *const cache =
       found == registry.caches.end() ? nullptr : found->second;
   if (!cache) return;
+  require_resident_cache_accessible(cache, "resident cache reset");
   if (cache->phase_active)
     throw std::logic_error(
         "cannot reset a Meep CUDA cache during an active resident "
         "phase");
   if (cache->device_ordinal >= 0) {
-    meep_cuda::select_device(cache->device_ordinal);
-    sync_resident_mirrors_to_host(cache);
+    try {
+      meep_cuda::select_device(cache->device_ordinal);
+      if (sparse_lorentzian_failure_injected("quiescence"))
+        throw std::runtime_error(
+            "injected sparse Lorentzian quiescence failure");
+      sync_resident_mirrors_to_host(cache);
+    }
+    catch (...) {
+      quarantine_resident_device_storage(cache);
+      throw;
+    }
   }
+  mark_sparse_lorentzian_execution_ineligible(cache);
+  (void)fold_sparse_lorentzian_ledger_after_quiescence(cache);
+  release_sparse_lorentzian_storage_after_quiescence(cache, true);
 
   // Boundary and structured descriptors carry host/device addresses. Rebuild
   // those plans exactly as a full cache destruction would, while pooling only
@@ -6897,6 +9195,7 @@ void reset_resident_cache_for_owner_reusing_allocations(
     cache->recycled_mirror_allocations.push_back(
         std::make_pair(entry.second.bytes,
                        entry.second.device_pointer));
+  cache->prepared_span_resolutions.clear();
   cache->mirrors.clear();
   cache->mirror_intervals.clear();
   cache->validated_source_profiles.clear();
@@ -6953,6 +9252,7 @@ unsigned int read_resident_field_point_fp32_for_owner(
   const auto cache_entry = registry.caches.find(owner);
   if (cache_entry == registry.caches.end()) return 0;
   resident_cache *cache = cache_entry->second;
+  require_resident_cache_accessible(cache, "resident scalar readback");
 
   const auto real_mirror =
       real_host_base ? cache->mirrors.find(real_host_base)
@@ -6967,6 +9267,28 @@ unsigned int read_resident_field_point_fp32_for_owner(
       imaginary_mirror != cache->mirrors.end() &&
       imaginary_mirror->second.device_dirty;
   if (!real_dirty && !imaginary_dirty) return 0;
+  struct point_read_observation {
+    std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
+    std::uint64_t scalars = 0;
+    std::uint64_t calls = 0;
+    std::uint64_t bytes = 0;
+    bool completed = false;
+    ~point_read_observation() noexcept {
+      const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now() - started).count();
+      point_read_cuda_read_attempts.fetch_add(1, std::memory_order_relaxed);
+      if (completed)
+        point_read_cuda_read_completions.fetch_add(1, std::memory_order_relaxed);
+      else
+        point_read_cuda_read_failures.fetch_add(1, std::memory_order_relaxed);
+      point_read_scalars_copied.fetch_add(scalars, std::memory_order_relaxed);
+      point_read_device_to_host_calls.fetch_add(calls, std::memory_order_relaxed);
+      point_read_device_to_host_bytes.fetch_add(bytes, std::memory_order_relaxed);
+      point_read_host_nanoseconds.fetch_add(
+          elapsed > 0 ? static_cast<std::uint64_t>(elapsed) : 0,
+          std::memory_order_relaxed);
+    }
+  } observation;
   if ((real_dirty && !real_value) ||
       (imaginary_dirty && !imaginary_value))
     throw std::invalid_argument(
@@ -7007,12 +9329,18 @@ unsigned int read_resident_field_point_fp32_for_owner(
     meep_cuda::copy_to_host(
         &staged_real, real_device_scalar, sizeof(staged_real));
     device_to_host_bytes.fetch_add(sizeof(staged_real));
+    ++observation.scalars;
+    ++observation.calls;
+    observation.bytes += sizeof(staged_real);
   }
   if (imaginary_dirty) {
     meep_cuda::copy_to_host(
         &staged_imaginary, imaginary_device_scalar,
         sizeof(staged_imaginary));
     device_to_host_bytes.fetch_add(sizeof(staged_imaginary));
+    ++observation.scalars;
+    ++observation.calls;
+    observation.bytes += sizeof(staged_imaginary);
   }
 
   unsigned int copied = 0;
@@ -7026,6 +9354,7 @@ unsigned int read_resident_field_point_fp32_for_owner(
   }
   // In particular, do not clear device_dirty or write either host array:
   // the full resident mirror remains authoritative for subsequent steps.
+  observation.completed = true;
   return copied;
 #else
   (void)owner;
@@ -7058,6 +9387,7 @@ resident_range_readback stage_resident_range_fp32_for_owner(
     return {false, 0};
   }
   resident_cache *cache = cache_entry->second;
+  require_resident_cache_accessible(cache, "resident checkpoint readback");
   if (cache->phase_active)
     throw std::logic_error(
         "cannot stage a DFT checkpoint during an active Meep CUDA phase");
@@ -7127,6 +9457,8 @@ resident_checkpoint_traffic summarize_resident_checkpoint_ranges_fp32(
     const auto cache_entry = registry.caches.find(range.owner);
     if (cache_entry == registry.caches.end()) continue;
     resident_cache *const cache = cache_entry->second;
+    require_resident_cache_accessible(
+        cache, "resident checkpoint range summary");
     if (cache->phase_active)
       throw std::logic_error(
           "cannot summarize a DFT checkpoint during an active Meep CUDA "
@@ -7302,9 +9634,16 @@ void discard_resident_mirror_for_owner(const void *owner,
   const auto cache_entry = registry.caches.find(owner);
   if (cache_entry == registry.caches.end()) return;
   resident_cache *cache = cache_entry->second;
+  if (cache->device_storage_quarantined) return;
   const auto mirror =
       cache->mirrors.find(static_cast<const float *>(host_pointer));
   if (mirror == cache->mirrors.end()) return;
+  // Prove device-wide quiescence before releasing even the first retained
+  // descriptor.  A descriptor may contain this mirror address, and its own
+  // noexcept release helper cannot establish an owning-device fence after a
+  // runtime/device-selection failure.
+  if (!quiesce_resident_device_storage_checked(cache)) return;
+  if (!retire_sparse_lorentzian_state_checked(cache, true, true)) return;
   // Any result cache may retain this device address as a nested LDOS
   // descriptor pointer, including when the removed buffer is later recycled
   // at the same address (the ABA case).
@@ -7313,12 +9652,7 @@ void discard_resident_mirror_for_owner(const void *owner,
   clear_eigenmode_overlap_plans_for_cache(cache);
   clear_near2far_plans_for_cache(cache);
   clear_dft_materialization_plans_for_cache_locked(registry, cache);
-  if (cache->device_ordinal >= 0) {
-    try {
-      meep_cuda::select_device(cache->device_ordinal);
-    }
-    catch (...) {}
-  }
+  cache->prepared_span_resolutions.clear();
   meep_cuda::free_device(mirror->second.device_pointer);
   cache->mirror_intervals.erase(
       reinterpret_cast<std::uintptr_t>(host_pointer));
@@ -7343,6 +9677,7 @@ void discard_resident_source_profile_for_owner(
   const auto cache_entry = registry.caches.find(owner);
   if (cache_entry == registry.caches.end()) return;
   resident_cache *cache = cache_entry->second;
+  require_resident_cache_accessible(cache, "resident source-profile discard");
   if (cache->phase_active)
     throw std::logic_error(
         "cannot replace a Meep CUDA source profile during an active "
@@ -7366,8 +9701,11 @@ void discard_resident_source_profile_for_owner(
 
   if ((index_mirror != cache->mirrors.end() ||
        amplitude_mirror != cache->mirrors.end()) &&
-      cache->device_ordinal >= 0)
-    meep_cuda::select_device(cache->device_ordinal);
+      cache->device_ordinal >= 0) {
+    if (!quiesce_resident_device_storage_checked(cache))
+      throw std::runtime_error(
+          "Meep CUDA could not quiesce resident source-profile storage");
+  }
 
   // Persistent source-phase and LDOS descriptors may retain nested pointers
   // to either profile mirror. Invalidate only their host identity snapshots;
@@ -7382,6 +9720,7 @@ void discard_resident_source_profile_for_owner(
     if (!key) return;
     const auto mirror = cache->mirrors.find(key);
     if (mirror == cache->mirrors.end()) return;
+    cache->prepared_span_resolutions.clear();
     // Retain enough exact-size buffers for common multi-profile replacement,
     // but bound both count and bytes for applications that change a volume
     // source's extent indefinitely. Oversized profiles are freed immediately.
@@ -7605,6 +9944,9 @@ void resident_gather_boundary_fp32(
     for (const auto &entry : plan.cache_generations)
       if (!entry.first ||
           !entry.first->phase_active ||
+          entry.second == 0 ||
+          entry.first->allocation_generation == 0 ||
+          entry.first->device_storage_quarantined ||
           entry.first->device_ordinal != buffer->device_ordinal ||
           entry.first->allocation_generation != entry.second)
         fast_replay = false;
@@ -7636,6 +9978,9 @@ void resident_gather_boundary_fp32(
     if (plan_matches)
       for (const auto &entry : plan.cache_generations)
         if (!entry.first || !entry.first->phase_active ||
+            entry.second == 0 ||
+            entry.first->allocation_generation == 0 ||
+            entry.first->device_storage_quarantined ||
             entry.first->device_ordinal != buffer->device_ordinal ||
             entry.first->allocation_generation != entry.second)
           plan_matches = false;
@@ -7749,8 +10094,11 @@ bool boundary_transfer_plan_generations_match(
     const boundary_exchange_buffer::transfer_plan &plan) noexcept {
   if (!plan.device_pointer || plan.generation == 0) return false;
   for (const auto &entry : plan.cache_generations)
-    if (!entry.first ||
-        entry.first->allocation_generation != entry.second)
+    if (!entry.first || entry.second == 0 ||
+        entry.first->allocation_generation == 0 ||
+        entry.first->allocation_generation != entry.second ||
+        !entry.first->phase_active ||
+        entry.first->device_storage_quarantined)
       return false;
   return true;
 }
@@ -8012,6 +10360,15 @@ void resident_synchronize_boundary_phase_graph_send_ready(
 void destroy_boundary_phase_graph(boundary_phase_graph *graph) noexcept {
   if (!graph) return;
 #if MEEP_HAVE_CUDA
+  if (external_device_reclamation_quarantined()) {
+    // The graph may capture operation descriptors, transfer-plan storage,
+    // and completion events tied to a cache whose owning device could not be
+    // fenced. Detach host metadata only; retain every CUDA handle.
+    boundary_lifetime_uncertain_leaks.fetch_add(
+        1, std::memory_order_relaxed);
+    delete graph;
+    return;
+  }
   if (graph->device_ordinal >= 0) {
     try {
       meep_cuda::select_device(graph->device_ordinal);
@@ -8154,6 +10511,9 @@ void resident_scatter_boundary_fp32(
     for (const auto &entry : plan.cache_generations)
       if (!entry.first ||
           !entry.first->phase_active ||
+          entry.second == 0 ||
+          entry.first->allocation_generation == 0 ||
+          entry.first->device_storage_quarantined ||
           entry.first->device_ordinal != buffer->device_ordinal ||
           entry.first->allocation_generation != entry.second)
         fast_replay = false;
@@ -8184,6 +10544,9 @@ void resident_scatter_boundary_fp32(
     if (plan_matches)
       for (const auto &entry : plan.cache_generations)
         if (!entry.first || !entry.first->phase_active ||
+            entry.second == 0 ||
+            entry.first->allocation_generation == 0 ||
+            entry.first->device_storage_quarantined ||
             entry.first->device_ordinal != buffer->device_ordinal ||
             entry.first->allocation_generation != entry.second)
           plan_matches = false;
@@ -9539,6 +11902,10 @@ void resident_update_lorentzian_fp32(
   if (!field)
     throw std::invalid_argument(
         "Meep CUDA Lorentzian field must be non-null");
+  if (!update_sparse_lorentzian_control(cache))
+    throw std::runtime_error(
+        "Meep CUDA could not quiesce sparse Lorentzian state during a "
+        "control transition");
   const index_space_bounds bounds = validate_lorentzian_index_space(
       index_space, array_count, field1, field2, field_stride, stride1,
       stride2, material);
@@ -9565,6 +11932,22 @@ void resident_update_lorentzian_fp32(
       material.offdiagonal2
           ? ensure_resident_mirror(cache, material.offdiagonal2, field_bytes)
           : nullptr;
+  if (cache->allocation_generation == 0 &&
+      !cache->sparse_lorentzian_permanent_dense_lock) {
+    if (!retire_sparse_lorentzian_state_checked(cache, true))
+      throw std::runtime_error(
+          "Meep CUDA could not quiesce sparse Lorentzian state after "
+          "allocation-generation exhaustion");
+    cache->sparse_lorentzian_permanent_dense_lock = true;
+  }
+  const bool zero_state_elision_enabled =
+      zero_state_lorentzian_elision_opted_in();
+  const bool zero_state_elision_inspectable =
+      zero_state_elision_enabled && !material.offdiagonal1 &&
+      !material.offdiagonal2 && std::isfinite(material.gamma_inverse) &&
+      std::isfinite(material.gamma_previous) &&
+      std::isfinite(material.omega_dt_squared) &&
+      std::isfinite(material.omega_dt_squared_denominator);
   const meep_cuda::lorentzian_material_fp32 device_material = {
       static_cast<const float *>(device_sigma),
       static_cast<const float *>(device_sigma1),
@@ -9572,30 +11955,186 @@ void resident_update_lorentzian_fp32(
       material.gamma_inverse,
       material.gamma_previous,
       material.omega_dt_squared,
-      material.omega_dt_squared_denominator};
-  if (state_kind == lorentzian_state_kind::increment)
-    meep_cuda::update_lorentzian_increment_structured_fp32(
-        static_cast<float *>(device_polarization),
-        static_cast<float *>(device_auxiliary),
-        static_cast<const float *>(device_field),
-        static_cast<const float *>(device_field1),
-        static_cast<const float *>(device_field2),
-        device_index_space(index_space), index_count, field_stride, stride1,
-        stride2, device_material);
-  else
-    meep_cuda::update_lorentzian_structured_fp32(
-        static_cast<float *>(device_polarization),
-        static_cast<float *>(device_auxiliary),
-        static_cast<const float *>(device_field),
-        static_cast<const float *>(device_field1),
-        static_cast<const float *>(device_field2),
-        device_index_space(index_space), index_count, field_stride, stride1,
-        stride2, device_material);
+      material.omega_dt_squared_denominator,
+      zero_state_elision_enabled
+          ? meep_cuda::lorentzian_elide_bit_identical_positive_zero_fp32
+          : 0U};
+  const bool increment_state =
+      state_kind == lorentzian_state_kind::increment;
+  const meep_cuda::detail::lorentzian_coefficients_fp32 coefficients = {
+      device_material.gamma_inverse,
+      device_material.gamma_previous,
+      device_material.omega_dt_squared,
+      device_material.omega_dt_squared_denominator};
+  const meep_cuda::index_space_fp32 sparse_index_space =
+      device_index_space(index_space);
+  // Meep supplies neighboring component pointers whenever those components
+  // exist, even for diagonal/isotropic susceptibilities.  They are operands
+  // only when the corresponding off-diagonal sigma is present; eligibility
+  // therefore follows the coefficients, not the otherwise-unused pointers.
+  const bool sparse_candidate =
+      cache->sparse_lorentzian_control ==
+          detail::sparse_lorentzian_control_token::enabled &&
+      !cache->sparse_lorentzian_permanent_dense_lock &&
+      cache->allocation_generation != 0 && cache->epoch != 0 &&
+      index_count >= 65536 && !material.offdiagonal1 &&
+      !material.offdiagonal2 &&
+      meep_cuda::detail::lorentzian_sparse_coefficients_safe_fp32(
+          coefficients, increment_state);
+  const bool sparse_opted_in =
+      cache->sparse_lorentzian_control ==
+      detail::sparse_lorentzian_control_token::enabled;
+  if (sparse_opted_in) {
+    sparse_lorentzian_saturating_add(
+        sparse_lorentzian_host_statistics.opt_in_calls, 1);
+    sparse_lorentzian_saturating_add(
+        sparse_lorentzian_host_statistics.opt_in_points,
+        static_cast<std::uint64_t>(index_count));
+    sparse_lorentzian_saturating_add(
+        sparse_candidate
+            ? sparse_lorentzian_host_statistics.eligible_calls
+            : sparse_lorentzian_host_statistics.ineligible_calls,
+        1);
+    sparse_lorentzian_saturating_add(
+        sparse_candidate
+            ? sparse_lorentzian_host_statistics.eligible_points
+            : sparse_lorentzian_host_statistics.ineligible_points,
+        static_cast<std::uint64_t>(index_count));
+  }
+  bool sparse_dispatched = false;
+  // Eligibility is part of the scientific identity.  An unsafe coefficient,
+  // signed-zero, off-diagonal, or short-domain dense step may mutate a point
+  // omitted by an older plan.  Retire all retained sparse state before that
+  // dense recurrence so returning to an earlier safe identity must observe and
+  // rebuild from the new state instead of reusing stale indices.
+  if (sparse_opted_in && !sparse_candidate &&
+      (!cache->sparse_lorentzian_plans.empty() ||
+       !cache->sparse_lorentzian_guards.empty())) {
+    if (!retire_sparse_lorentzian_state_checked(cache, true))
+      throw std::runtime_error(
+          "Meep CUDA could not quiesce an ineligible sparse Lorentzian "
+          "transition");
+  }
+  if (sparse_candidate) {
+    const auto identity = make_sparse_lorentzian_identity(
+        cache, polarization, polarization_auxiliary, material.sigma,
+        field, device_polarization, device_auxiliary, device_sigma,
+        device_field, sparse_index_space, array_count, index_count,
+        device_material, increment_state);
+    std::size_t plan_slot = std::numeric_limits<std::size_t>::max();
+    for (std::size_t index = 0;
+         index < cache->sparse_lorentzian_plans.size(); ++index)
+      if (sparse_lorentzian_logical_slot_equal(
+              cache->sparse_lorentzian_plans[index].identity,
+              identity)) {
+        plan_slot = index;
+        break;
+      }
+    if (plan_slot != std::numeric_limits<std::size_t>::max() &&
+        !sparse_lorentzian_identity_equal(
+            cache->sparse_lorentzian_plans[plan_slot].identity,
+            identity)) {
+      const bool retired = retire_sparse_lorentzian_state_checked(cache);
+      plan_slot = std::numeric_limits<std::size_t>::max();
+      if (!retired)
+        throw std::runtime_error(
+            "Meep CUDA could not quiesce a changed sparse Lorentzian "
+            "identity");
+    }
+    if (!cache->sparse_lorentzian_permanent_dense_lock &&
+        plan_slot < cache->sparse_lorentzian_plans.size() &&
+        cache->sparse_lorentzian_plans[plan_slot].state ==
+            detail::resident_cache::sparse_lorentzian_plan_state::sparse)
+      sparse_lorentzian_saturating_add(
+          sparse_lorentzian_host_statistics.plan_hits, 1);
+    if (!cache->sparse_lorentzian_permanent_dense_lock &&
+        plan_slot == std::numeric_limits<std::size_t>::max()) {
+      detail::resident_cache::sparse_lorentzian_plan observed;
+      observed.identity = identity;
+      observed.state =
+          detail::resident_cache::sparse_lorentzian_plan_state::observed;
+      observed.observation_count = 1;
+      observed.execution_eligible = false;
+      try {
+        cache->sparse_lorentzian_plans.push_back(observed);
+        plan_slot = cache->sparse_lorentzian_plans.size() - 1;
+        sparse_lorentzian_saturating_add(
+            sparse_lorentzian_host_statistics.first_observation_dense_calls,
+            1);
+        sparse_lorentzian_saturating_add(
+            sparse_lorentzian_host_statistics.first_observation_dense_points,
+            static_cast<std::uint64_t>(index_count));
+      }
+      catch (...) {
+        // Sparse bookkeeping is an optional optimization. Host allocation
+        // failure must lock it out for this cache and preserve the dense CUDA
+        // recurrence rather than fail the scientific time step.
+        cache->sparse_lorentzian_permanent_dense_lock = true;
+        plan_slot = std::numeric_limits<std::size_t>::max();
+        sparse_lorentzian_saturating_add(
+            sparse_lorentzian_host_statistics.dense_locked_decisions, 1);
+      }
+    }
+    else if (!cache->sparse_lorentzian_permanent_dense_lock &&
+             cache->sparse_lorentzian_plans[plan_slot].state ==
+                 detail::resident_cache::sparse_lorentzian_plan_state::
+                     observed) {
+      (void)build_sparse_lorentzian_plan_transactionally(
+          cache, plan_slot, device_material);
+    }
+    if (!cache->sparse_lorentzian_permanent_dense_lock &&
+        plan_slot < cache->sparse_lorentzian_plans.size() &&
+        cache->sparse_lorentzian_plans[plan_slot].state ==
+            detail::resident_cache::sparse_lorentzian_plan_state::sparse) {
+      sparse_dispatched = execute_sparse_lorentzian_plan(
+          cache, plan_slot,
+          static_cast<float *>(device_polarization),
+          static_cast<float *>(device_auxiliary),
+          static_cast<const float *>(device_field), device_material);
+      if (!sparse_dispatched) {
+        if (!retire_sparse_lorentzian_state_checked(cache, true))
+          throw std::runtime_error(
+              "Meep CUDA could not quiesce a rejected sparse Lorentzian "
+              "submission");
+        cache->sparse_lorentzian_permanent_dense_lock = true;
+      }
+    }
+  }
+  if (!sparse_dispatched) {
+    if (increment_state)
+      meep_cuda::update_lorentzian_increment_structured_fp32(
+          static_cast<float *>(device_polarization),
+          static_cast<float *>(device_auxiliary),
+          static_cast<const float *>(device_field),
+          static_cast<const float *>(device_field1),
+          static_cast<const float *>(device_field2),
+          sparse_index_space, index_count, field_stride, stride1,
+          stride2, device_material);
+    else
+      meep_cuda::update_lorentzian_structured_fp32(
+          static_cast<float *>(device_polarization),
+          static_cast<float *>(device_auxiliary),
+          static_cast<const float *>(device_field),
+          static_cast<const float *>(device_field1),
+          static_cast<const float *>(device_field2),
+          sparse_index_space, index_count, field_stride, stride1,
+          stride2, device_material);
+  }
   mark_device_dirty(cache, polarization, field_bytes);
   mark_device_dirty(cache, polarization_auxiliary, field_bytes);
   cuda_polarization_calls.fetch_add(1);
   cuda_polarization_points.fetch_add(
       static_cast<std::uint64_t>(index_count));
+  if (zero_state_elision_enabled) {
+    cuda_zero_state_elision_enabled_calls.fetch_add(1);
+    cuda_zero_state_elision_enabled_points.fetch_add(
+        static_cast<std::uint64_t>(index_count));
+  }
+  if (zero_state_elision_inspectable) {
+    cuda_zero_state_elision_inspectable_calls.fetch_add(1);
+    cuda_zero_state_elision_inspectable_points.fetch_add(
+        static_cast<std::uint64_t>(index_count));
+  }
 #else
   (void)cache;
   (void)polarization;
@@ -10462,9 +13001,8 @@ void resident_ensure_span_fp32(resident_cache *cache, float *host_pointer,
   if (count == 0) return;
   const std::size_t bytes =
       checked_bytes(count, sizeof(float), "prepared resident span");
-  const resolved_resident_range resolved = resolve_resident_range(
-      cache, host_pointer, bytes, true,
-      "Meep CUDA prepared resident span");
+  const resolved_resident_range resolved = resolve_prepared_resident_span(
+      cache, host_pointer, bytes);
   if (resolved.mirror) {
     device_buffer_reuses.fetch_add(1);
     if (!resolved.mirror->device_dirty &&
@@ -10534,7 +13072,10 @@ bool resident_launch_boundary_plan(const void *owner,
   if (!boundary_operation_plan_generations_match(plan))
     throw std::logic_error(
         "Meep CUDA boundary plan references stale resident storage");
-  if (plan->operation_count == 0) return false;
+  if (plan->operation_count == 0) {
+    boundary_execution_plan_empty.fetch_add(1, std::memory_order_relaxed);
+    return false;
+  }
   mark_boundary_plan_destinations_dirty(plan);
 
   const std::size_t operation_bytes =
@@ -10543,21 +13084,27 @@ bool resident_launch_boundary_plan(const void *owner,
                     "boundary operations");
   meep_cuda::select_device(plan->device_ordinal);
   if (plan->all_sources_null &&
-      std::getenv("MEEP_GPU_DISABLE_DIRECT_BOUNDARY_ZERO") == nullptr)
+      std::getenv("MEEP_GPU_DISABLE_DIRECT_BOUNDARY_ZERO") == nullptr) {
     meep_cuda::zero_boundary_fp32(
         static_cast<const meep_cuda::boundary_operation_fp32 *>(
             plan->device_pointer),
         plan->operation_count);
+    boundary_execution_plan_direct_zero.fetch_add(1, std::memory_order_relaxed);
+  }
   else if (plan->nonalias_safe &&
-           std::getenv("MEEP_GPU_DISABLE_DIRECT_LOCAL_BOUNDARY") == nullptr)
+           std::getenv("MEEP_GPU_DISABLE_DIRECT_LOCAL_BOUNDARY") == nullptr) {
     meep_cuda::apply_nonalias_boundary_fp32(
         static_cast<const meep_cuda::boundary_operation_fp32 *>(
             plan->device_pointer),
         plan->operation_count);
+    boundary_execution_plan_direct_local.fetch_add(1, std::memory_order_relaxed);
+  }
   else if (plan->execution_graph &&
-      std::getenv("MEEP_GPU_DISABLE_BOUNDARY_GRAPH") == nullptr)
+           std::getenv("MEEP_GPU_DISABLE_BOUNDARY_GRAPH") == nullptr) {
     meep_cuda::launch_boundary_graph_fp32(plan->execution_graph);
-  else
+    boundary_execution_plan_graph.fetch_add(1, std::memory_order_relaxed);
+  }
+  else {
     meep_cuda::apply_boundary_fp32(
         static_cast<const meep_cuda::boundary_operation_fp32 *>(
             plan->device_pointer),
@@ -10565,6 +13112,8 @@ bool resident_launch_boundary_plan(const void *owner,
             static_cast<unsigned char *>(plan->device_pointer) +
             operation_bytes),
         plan->operation_count);
+    boundary_execution_plan_staged.fetch_add(1, std::memory_order_relaxed);
+  }
   cuda_boundary_calls.fetch_add(1);
   cuda_boundary_points.fetch_add(
       static_cast<std::uint64_t>(plan->scalar_count));
@@ -10611,6 +13160,7 @@ void resident_apply_boundary_fp32(
       plans.operation_plans.emplace(plan_token, plan);
       created.release();
     }
+    boundary_execution_plan_empty.fetch_add(1, std::memory_order_relaxed);
     return;
   }
 
@@ -10862,21 +13412,27 @@ void resident_apply_boundary_fp32(
 
   meep_cuda::select_device(plan->device_ordinal);
   if (plan->all_sources_null &&
-      std::getenv("MEEP_GPU_DISABLE_DIRECT_BOUNDARY_ZERO") == nullptr)
+      std::getenv("MEEP_GPU_DISABLE_DIRECT_BOUNDARY_ZERO") == nullptr) {
     meep_cuda::zero_boundary_fp32(
         static_cast<const meep_cuda::boundary_operation_fp32 *>(
             plan->device_pointer),
         operation_count);
+    boundary_execution_plan_direct_zero.fetch_add(1, std::memory_order_relaxed);
+  }
   else if (plan->nonalias_safe &&
-           std::getenv("MEEP_GPU_DISABLE_DIRECT_LOCAL_BOUNDARY") == nullptr)
+           std::getenv("MEEP_GPU_DISABLE_DIRECT_LOCAL_BOUNDARY") == nullptr) {
     meep_cuda::apply_nonalias_boundary_fp32(
         static_cast<const meep_cuda::boundary_operation_fp32 *>(
             plan->device_pointer),
         operation_count);
+    boundary_execution_plan_direct_local.fetch_add(1, std::memory_order_relaxed);
+  }
   else if (plan->execution_graph &&
-      std::getenv("MEEP_GPU_DISABLE_BOUNDARY_GRAPH") == nullptr)
+           std::getenv("MEEP_GPU_DISABLE_BOUNDARY_GRAPH") == nullptr) {
     meep_cuda::launch_boundary_graph_fp32(plan->execution_graph);
-  else
+    boundary_execution_plan_graph.fetch_add(1, std::memory_order_relaxed);
+  }
+  else {
     meep_cuda::apply_boundary_fp32(
         static_cast<const meep_cuda::boundary_operation_fp32 *>(
             plan->device_pointer),
@@ -10884,6 +13440,8 @@ void resident_apply_boundary_fp32(
             static_cast<unsigned char *>(plan->device_pointer) +
             operation_bytes),
         operation_count);
+    boundary_execution_plan_staged.fetch_add(1, std::memory_order_relaxed);
+  }
   cuda_boundary_calls.fetch_add(1);
   cuda_boundary_points.fetch_add(
       static_cast<std::uint64_t>(scalar_count));
@@ -17662,6 +20220,7 @@ bool resident_dft_norm2_fp32_for_owner(
     if (found != registry.caches.end()) cache = found->second;
   }
   if (!cache || cache->device_ordinal < 0) return false;
+  require_resident_cache_accessible(cache, "resident DFT norm reduction");
   select_cache_device(cache);
   const resolved_resident_range resolved = resolve_resident_range(
       cache, dft_real_imag, output_bytes, true,

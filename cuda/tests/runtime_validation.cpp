@@ -348,7 +348,7 @@ int main() {
   });
 
   const meep_cuda::lorentzian_material_fp32 empty_lorentzian = {
-      &sigma, nullptr, nullptr, 1.0f, 1.0f, 0.1f, 0.1f};
+      &sigma, nullptr, nullptr, 1.0f, 1.0f, 0.1f, 0.1f, 0};
   const auto invoke_lorentzian =
       [&](const meep_cuda::lorentzian_material_fp32 &lorentzian) {
         meep_cuda::update_lorentzian_fp32(
@@ -369,9 +369,34 @@ int main() {
   lorentzian.offdiagonal1 = &inverse;
   expect_invalid("Lorentzian off-diagonal without field", "requires its field",
                  [&] { invoke_lorentzian(lorentzian); });
+  lorentzian = empty_lorentzian;
+  lorentzian.options = 1U << 7;
+  expect_invalid("unsupported Lorentzian option", "unsupported", [&] {
+    invoke_lorentzian(lorentzian);
+  });
 
   // A valid zero-work Lorentzian update must not query a CUDA device.
   invoke_lorentzian(empty_lorentzian);
+
+  // Public source-compatibility regression: before the options field was
+  // added, callers could default-construct the descriptor and assign the
+  // original seven members individually.  That unchanged source must select
+  // the legacy path deterministically, for every Lorentzian entry point.
+  meep_cuda::lorentzian_material_fp32 legacy_lorentzian;
+  legacy_lorentzian.sigma = &sigma;
+  legacy_lorentzian.offdiagonal1 = nullptr;
+  legacy_lorentzian.offdiagonal2 = nullptr;
+  legacy_lorentzian.gamma_inverse = 1.0f;
+  legacy_lorentzian.gamma_previous = 1.0f;
+  legacy_lorentzian.omega_dt_squared = 0.1f;
+  legacy_lorentzian.omega_dt_squared_denominator = 0.1f;
+  if (legacy_lorentzian.options != 0)
+    throw std::runtime_error(
+        "legacy Lorentzian descriptor did not default options to zero");
+  invoke_lorentzian(legacy_lorentzian);
+  meep_cuda::update_lorentzian_structured_fp32(
+      &field, &auxiliary, &operand, nullptr, nullptr, structured_space, 0, 0,
+      0, 0, legacy_lorentzian);
 
   const auto invoke_lorentzian_increment =
       [&](const meep_cuda::lorentzian_material_fp32 &increment_material) {
@@ -388,12 +413,76 @@ int main() {
   lorentzian.sigma = nullptr;
   expect_invalid("null increment-state Lorentzian sigma", "diagonal sigma",
                  [&] { invoke_lorentzian_increment(lorentzian); });
+  lorentzian = empty_lorentzian;
+  lorentzian.options = 1U << 7;
+  expect_invalid("unsupported increment-state Lorentzian option",
+                 "unsupported", [&] {
+                   invoke_lorentzian_increment(lorentzian);
+                 });
   // Both increment-state entry points must accept valid zero-work calls
   // without querying a CUDA device.
   invoke_lorentzian_increment(empty_lorentzian);
   meep_cuda::update_lorentzian_increment_structured_fp32(
       &field, &auxiliary, &operand, nullptr, nullptr, structured_space, 0, 0,
       0, 0, empty_lorentzian);
+  invoke_lorentzian_increment(legacy_lorentzian);
+  meep_cuda::update_lorentzian_increment_structured_fp32(
+      &field, &auxiliary, &operand, nullptr, nullptr, structured_space, 0, 0,
+      0, 0, legacy_lorentzian);
+
+  if (meep_cuda::lorentzian_sparse_compaction_block_count(0) != 0 ||
+      meep_cuda::lorentzian_sparse_compaction_block_count(1) != 1 ||
+      meep_cuda::lorentzian_sparse_compaction_block_count(256) != 1 ||
+      meep_cuda::lorentzian_sparse_compaction_block_count(257) != 2 ||
+      meep_cuda::lorentzian_sparse_compaction_block_count(
+          std::numeric_limits<std::size_t>::max()) == 0)
+    throw std::runtime_error(
+        "sparse Lorentzian compaction block count contract failed");
+  std::uint32_t sparse_count = 0;
+  std::uint32_t sparse_validation = 0;
+  std::uint64_t sparse_offset = 0;
+  std::ptrdiff_t sparse_index = 0;
+  meep_cuda::lorentzian_sparse_execution_ledger_fp32 sparse_ledger{};
+
+  // Valid zero-work sparse calls must remain device-independent.
+  meep_cuda::count_lorentzian_sparse_active_blocks_fp32(
+      &field, &auxiliary, structured_space, 0, empty_lorentzian, false,
+      nullptr, nullptr);
+  meep_cuda::fill_lorentzian_sparse_active_indices_fp32(
+      &field, &auxiliary, structured_space, 0, empty_lorentzian, false,
+      nullptr, 0, nullptr, nullptr);
+  meep_cuda::scan_lorentzian_sparse_field_finite_fp32(
+      &operand, structured_space, 0, &sparse_count, &sparse_ledger);
+  meep_cuda::update_lorentzian_sparse_guarded_fp32(
+      &field, &auxiliary, &operand, nullptr, 0, structured_space, 0,
+      empty_lorentzian, &sparse_validation, &sparse_count, &sparse_ledger);
+  meep_cuda::update_lorentzian_increment_sparse_guarded_fp32(
+      &field, &auxiliary, &operand, nullptr, 0, structured_space, 0,
+      empty_lorentzian, &sparse_validation, &sparse_count, &sparse_ledger);
+
+  lorentzian = empty_lorentzian;
+  lorentzian.offdiagonal1 = &inverse;
+  expect_invalid("anisotropic sparse compaction", "isotropic", [&] {
+    meep_cuda::count_lorentzian_sparse_active_blocks_fp32(
+        &field, &auxiliary, structured_space, 0, lorentzian, false,
+        &sparse_count, &sparse_validation);
+  });
+  expect_invalid("anisotropic guarded sparse update", "isotropic", [&] {
+    meep_cuda::update_lorentzian_sparse_guarded_fp32(
+        &field, &auxiliary, &operand, nullptr, 0, structured_space, 0,
+        lorentzian, &sparse_validation, &sparse_count, &sparse_ledger);
+  });
+  expect_invalid("sparse active count overflow", "exceeds", [&] {
+    meep_cuda::fill_lorentzian_sparse_active_indices_fp32(
+        &field, &auxiliary, structured_space, 0, empty_lorentzian, false,
+        &sparse_offset, 1, &sparse_index, &sparse_count);
+  });
+  expect_invalid("guarded sparse active count overflow", "exceeds", [&] {
+    meep_cuda::update_lorentzian_sparse_guarded_fp32(
+        &field, &auxiliary, &operand, &sparse_index, 1, structured_space, 0,
+        empty_lorentzian, &sparse_validation, &sparse_count,
+        &sparse_ledger);
+  });
 
   meep_cuda::gyrotropic_material_fp32 gyrotropic = {};
   gyrotropic.sigma = &sigma;
@@ -715,6 +804,72 @@ int main() {
     meep_cuda::launch_boundary_phase_graph_fp32(nullptr);
   });
   meep_cuda::destroy_boundary_phase_graph_fp32(nullptr);
+
+  meep_cuda::curl_phase_operation_fp32 curl_graph_operation{};
+  expect_invalid("null structured curl graph operations", "operations", [&] {
+    (void)meep_cuda::create_structured_curl_graph_fp32(nullptr, 1);
+  });
+  expect_invalid("zero structured curl graph operations", "nonzero", [&] {
+    (void)meep_cuda::create_structured_curl_graph_fp32(
+        &curl_graph_operation, 0);
+  });
+  expect_invalid("null structured curl graph field", "field", [&] {
+    curl_graph_operation.g1 = reinterpret_cast<const float *>(0x1);
+    curl_graph_operation.point_count = 1;
+    (void)meep_cuda::create_structured_curl_graph_fp32(
+        &curl_graph_operation, 1);
+  });
+  expect_invalid("null structured curl graph operand", "operand", [&] {
+    curl_graph_operation.field = &field;
+    curl_graph_operation.g1 = nullptr;
+    (void)meep_cuda::create_structured_curl_graph_fp32(
+        &curl_graph_operation, 1);
+  });
+  curl_graph_operation.g1 = &operand;
+  curl_graph_operation.inline_space.extent1 = 1;
+  curl_graph_operation.inline_space.extent2 = 1;
+  curl_graph_operation.inline_space.extent3 = 1;
+  curl_graph_operation.inline_space.coefficient_start = -1;
+  curl_graph_operation.inline_space.coefficient2_start = -1;
+  curl_graph_operation.material.sigma = &sigma;
+  expect_invalid("partial structured curl graph PML-f", "PML-f", [&] {
+    (void)meep_cuda::create_structured_curl_graph_fp32(
+        &curl_graph_operation, 1);
+  });
+  curl_graph_operation.material = {};
+  curl_graph_operation.material.conductivity = &sigma;
+  expect_invalid("partial structured curl graph conductivity", "both", [&] {
+    (void)meep_cuda::create_structured_curl_graph_fp32(
+        &curl_graph_operation, 1);
+  });
+  curl_graph_operation.material = {};
+  curl_graph_operation.material.field_conductivity = &auxiliary;
+  expect_invalid("orphan structured curl graph conductivity auxiliary",
+                 "inconsistent", [&] {
+    (void)meep_cuda::create_structured_curl_graph_fp32(
+        &curl_graph_operation, 1);
+  });
+  curl_graph_operation.material = {};
+  curl_graph_operation.material.sigma = &sigma;
+  curl_graph_operation.material.kappa = &kappa;
+  curl_graph_operation.material.sigma_inverse = &inverse;
+  expect_invalid("structured curl graph PML coefficient space",
+                 "coefficient", [&] {
+    (void)meep_cuda::create_structured_curl_graph_fp32(
+        &curl_graph_operation, 1);
+  });
+  curl_graph_operation.material = {};
+  curl_graph_operation.point_count = 2;
+  expect_invalid("structured curl graph count mismatch", "do not match", [&] {
+    (void)meep_cuda::create_structured_curl_graph_fp32(
+        &curl_graph_operation, 1);
+  });
+  expect_invalid("null structured curl graph launch", "non-null", [&] {
+    meep_cuda::launch_structured_curl_graph_fp32(nullptr);
+  });
+  if (!meep_cuda::destroy_structured_curl_graph_fp32(nullptr))
+    throw std::runtime_error(
+        "null structured curl graph destroy was not a successful no-op");
   meep_cuda::array_span_fp32 span = {&field, 1};
   int finite_result = 1;
   expect_invalid("null finite initialization result", "result", [&] {

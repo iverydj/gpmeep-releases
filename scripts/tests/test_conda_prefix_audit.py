@@ -291,6 +291,34 @@ class CondaPrefixAuditTests(unittest.TestCase):
             ]
         )
 
+    def test_archive_payload_mismatch_reports_observed_and_expected_bytes(self):
+        with self.archive.open("rb") as archive:
+            archive_info = AUDIT_MODULE._package_archive_info(
+                archive, self.archive.name
+            )
+            record = archive_info["paths"]["lib/libtrusted.so"]
+            record["prefix_placeholder"] = "/opt/conda-placeholder"
+            record["file_mode"] = "binary"
+            observed = "0" * 64
+            installed = "1" * 64
+            with mock.patch.object(
+                AUDIT_MODULE,
+                "_hash_relocated_payload",
+                return_value=(observed, installed, 123),
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    rf"observed_sha256={observed}; "
+                    rf"expected_sha256={record['sha256']}; "
+                    rf"observed_size=123; expected_size={record['size_in_bytes']}",
+                ):
+                    AUDIT_MODULE._selected_package_payload(
+                        archive,
+                        self.archive.name,
+                        archive_info["paths"],
+                        self.prefix,
+                    )
+
     def test_archive_swap_between_hash_and_parse_cannot_forge_metadata(self):
         trusted_bytes = self.archive.read_bytes()
         trusted_digest = self.package_digest

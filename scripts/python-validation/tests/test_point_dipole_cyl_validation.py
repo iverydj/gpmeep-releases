@@ -156,6 +156,33 @@ class PointDipoleCylLauncherTest(unittest.TestCase):
         self.assertIn("9", argv)
         self.assertEqual(argv[-3:], [str(EXAMPLE.resolve()), "--", "--validation"])
 
+    def test_acknowledgement_reason_is_validated_and_forwarded_once(self):
+        reason = "M4 explicit CPU and CUDA comparison"
+        args = launcher.parse_args(
+            ["--acknowledge-backend-mismatch-reason", reason, str(EXAMPLE)]
+        )
+        self.assertEqual(args.acknowledge_backend_mismatch_reason, reason)
+        argv = launcher.build_oracle_argv(EXAMPLE, reason)
+        self.assertEqual(argv.count("--acknowledge-backend-mismatch-reason"), 1)
+        index = argv.index("--acknowledge-backend-mismatch-reason")
+        self.assertEqual(argv[index + 1], reason)
+        for invalid in ("short", "x" * 513):
+            with self.subTest(invalid_length=len(invalid)), self.assertRaises(
+                SystemExit
+            ):
+                launcher.parse_args(
+                    [
+                        "--acknowledge-backend-mismatch-reason",
+                        invalid,
+                        str(EXAMPLE),
+                    ]
+                )
+        for option in ("--ack", "--acknowledge-backend-mismatch-r"):
+            with self.subTest(option=option), self.assertRaises(SystemExit):
+                launcher.parse_args(
+                    [option, "embedded old reason", str(EXAMPLE)]
+                )
+
     def test_launcher_constants_match_target_profile(self):
         self.assertEqual(self.target.VALIDATION_M_VALUES, (-1, 0, 1))
         self.assertEqual(

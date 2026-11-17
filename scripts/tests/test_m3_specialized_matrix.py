@@ -170,6 +170,7 @@ class M3SpecializedMatrixTests(unittest.TestCase):
                 "build_input_id": "input",
                 "artifact_set_id": "artifacts",
                 "source_start": {"sha256": "1" * 64},
+                "git_head": "a" * 40,
             }
             hardware = {"fixture": "hardware"}
             process_count = 0

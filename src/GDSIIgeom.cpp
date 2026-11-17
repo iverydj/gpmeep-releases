@@ -120,9 +120,11 @@ meep::grid_volume set_geometry_from_GDSII(double resolution, const char *GDSIIFi
   meep::vec center, size;
   get_polygon_center_size(polygon, center, size);
 
+  geometry_state_transaction transaction;
   geometry_lattice.size.x = size.in_direction(meep::X);
   geometry_lattice.size.y = size.in_direction(meep::Y);
   geometry_lattice.size.z = zsize;
+  commit_geometry_state_mutation();
   meep::grid_volume gv =
       zsize == 0.0
           ? meep::vol2d(geometry_lattice.size.x, geometry_lattice.size.y, resolution)

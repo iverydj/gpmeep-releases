@@ -23,11 +23,14 @@ from typing import Any
 
 
 SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
-if str(SCRIPT_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPT_DIR))
+SCRIPTS_DIR = SCRIPT_DIR.parent
+for import_root in (SCRIPT_DIR, SCRIPTS_DIR):
+    if str(import_root) not in sys.path:
+        sys.path.insert(0, str(import_root))
 
 from common import (  # noqa: E402
     AUNP_ARCHIVE_SHA256,
+    AUNP_BACKEND_ACKNOWLEDGEMENT_REASON,
     AUNP_DFT_DECAY_TOLERANCE,
     AUNP_DFT_MINIMUM_RUN_TIME,
     AUNP_EXPECTED_DEFAULT_CONFIG,
@@ -51,10 +54,11 @@ from common import (  # noqa: E402
     verify_build_receipt_collective,
     verify_package_attestation_collective,
 )
+import gpmeep_backend_guard as backend_guard  # noqa: E402
 
 
-SCHEMA = "gpmeep-aunp-r4000-performance-workload-v2"
-COMPLETE_SCHEMA = "gpmeep-aunp-r4000-performance-workload-complete-v2"
+SCHEMA = "gpmeep-aunp-r4000-performance-workload-v3"
+COMPLETE_SCHEMA = "gpmeep-aunp-r4000-performance-workload-complete-v3"
 MEASUREMENT_MODE = "fixed-meep-time-performance-window"
 PERFORMANCE_ADAPTATION = (
     "each production decay stop is replaced by a fixed 0.25 Meep-time interval"
@@ -87,6 +91,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--expected-source-commit")
     parser.add_argument("--expected-package-sha256")
     parser.add_argument("--expected-backend", required=True, choices=("cpu", "cuda"))
+    parser.add_argument(
+        "--acknowledge-backend-mismatch-reason", required=True
+    )
     return parser.parse_args(argv)
 
 
@@ -109,6 +116,16 @@ def _validate_backend_record(record: dict[str, Any], expected_backend: str) -> N
         or record.get("requested_backend") != expected_backend
     ):
         raise WorkloadError("AuNP performance phase selected the wrong backend")
+    try:
+        backend_guard.validate_evidence(
+            record.get("backend_guard"),
+            expected_backend=expected_backend,
+            expected_reason=AUNP_BACKEND_ACKNOWLEDGEMENT_REASON,
+        )
+    except backend_guard.BackendGuardEvidenceError as exc:
+        raise WorkloadError(
+            f"AuNP performance backend-guard evidence differs: {exc}"
+        ) from exc
     if (
         type(record.get("timestep_delta")) is not int
         or record["timestep_delta"] < MINIMUM_TIMESTEPS_PER_PHASE
@@ -422,6 +439,11 @@ def validate_performance_output(
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    if (
+        args.acknowledge_backend_mismatch_reason
+        != AUNP_BACKEND_ACKNOWLEDGEMENT_REASON
+    ):
+        raise WorkloadError("AuNP performance acknowledgement reason differs")
     archive = verify_file(args.archive, AUNP_ARCHIVE_SHA256, "AuNP archive")
     output = args.output.resolve()
 
@@ -559,10 +581,14 @@ def main(argv: list[str] | None = None) -> int:
             )
             before_stats = json_safe(mp.gpu.statistics())
             comm.Barrier()
-            fdtd_started = time.perf_counter()
-            simulation.run(until=FIXED_WINDOW_MEEP_TIME)
+            _, backend_guard_evidence = backend_guard.invoke_with_acknowledgement(
+                mp,
+                simulation,
+                lambda: simulation.run(until=FIXED_WINDOW_MEEP_TIME),
+                args.acknowledge_backend_mismatch_reason,
+            )
             comm.Barrier()
-            wall_seconds = time.perf_counter() - fdtd_started
+            wall_seconds = backend_guard_evidence["execution_wall_seconds"]
             after_stats = json_safe(mp.gpu.statistics())
             delta = statistics_delta(before_stats, after_stats)
             record = {
@@ -573,6 +599,7 @@ def main(argv: list[str] | None = None) -> int:
                 "timestep_delta": int(simulation.timestep()) - before_timestep,
                 "meep_time": float(simulation.meep_time()),
                 "wall_seconds": wall_seconds,
+                "backend_guard": backend_guard_evidence,
                 "phase_process_seconds_before_reset": time.perf_counter()
                 - phase_started,
                 "active_backend": str(mp.gpu.active_backend),

@@ -19,6 +19,8 @@ from unittest import mock
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 WORKLOAD_DIR = ROOT / "scripts" / "user-workloads"
 sys.path.insert(0, str(WORKLOAD_DIR))
+sys.path.insert(0, str(ROOT / "scripts" / "tests"))
+from backend_guard_test_fixture import telemetry as guard_telemetry  # noqa: E402
 
 
 def load_module(name: str):
@@ -421,6 +423,15 @@ class AuNPExactResumeTests(unittest.TestCase):
 
                 def __init__(self):
                     self.values = zero_statistics()
+                    self.recommendation = None
+
+                def publish_recommendation(self):
+                    self.recommendation = guard_telemetry(
+                        ADAPTER.backend_guard, "cpu", "cpu"
+                    )
+
+                def acknowledge_backend_mismatch(self, _challenge, _reason):
+                    raise AssertionError("matching fixture must not acknowledge")
 
                 def reset_statistics(self):
                     self.values = zero_statistics()
@@ -444,6 +455,7 @@ class AuNPExactResumeTests(unittest.TestCase):
                         fake_gpu.values[group][f"cpu_{stem}_calls"] += 1
                         fake_gpu.values[group][f"cpu_{stem}_points"] += 4
                     self.fields.t += 20
+                    fake_gpu.publish_recommendation()
 
                 def timestep(self):
                     return self.fields.t
@@ -456,6 +468,9 @@ class AuNPExactResumeTests(unittest.TestCase):
             fake_mp.__version__ = "fixture"
             fake_mp.Simulation = FakeSimulation
             fake_mp.gpu = fake_gpu
+            fake_mp.backend_policy = types.SimpleNamespace(
+                BackendRecommendationMismatch=RuntimeError
+            )
             fake_mp.is_single_precision = lambda: True
 
             class FakeComm:
@@ -632,6 +647,8 @@ class AuNPExactResumeTests(unittest.TestCase):
                 str(receipt),
                 "--expected-backend",
                 "cpu",
+                "--acknowledge-backend-mismatch-reason",
+                COMMON.AUNP_BACKEND_ACKNOWLEDGEMENT_REASON,
             ]
             with mock.patch.dict(
                 sys.modules, {"meep": fake_mp, "mpi4py": mpi4py_module}

@@ -86,6 +86,7 @@ def paired_fixture(root: pathlib.Path, plan_root: pathlib.Path):
         "build_receipt": {
             "receipt_id": "receipt",
             "source_sha256": "1" * 64,
+            "git_head": "a" * 40,
         },
         "gpu_device": GPU,
     }

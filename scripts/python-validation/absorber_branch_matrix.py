@@ -27,13 +27,16 @@ def parse_args(argv=None):
 
 def execute(example, common_args, use_pml, run_path=runpy.run_path):
     previous_argv = sys.argv
-    sys.argv = [str(example), *common_args]
+    previous_argv_contents = list(previous_argv)
+    previous_argv[:] = [str(example), *common_args]
     if use_pml:
-        sys.argv.append("-pml")
+        previous_argv.append("-pml")
     try:
         return run_path(str(example), run_name="__main__")["absorber_result"]
     finally:
-        sys.argv = previous_argv
+        if sys.argv is not previous_argv:
+            sys.argv = previous_argv
+        previous_argv[:] = previous_argv_contents
 
 
 def run_branch_matrix(args, run_path=runpy.run_path):

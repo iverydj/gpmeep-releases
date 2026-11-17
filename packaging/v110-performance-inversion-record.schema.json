@@ -1,0 +1,394 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://gpmeep.invalid/schema/v110-performance-inversion-record.schema.json",
+  "title": "gpmeep v1.1.0 GPU/CPU performance inversion record",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "record_id",
+    "workload_id",
+    "observed_gpu_slower_than_cpu",
+    "source_inventory",
+    "representative",
+    "comparison",
+    "phase_decomposition",
+    "primary_class",
+    "classification_evidence",
+    "confidence",
+    "owner",
+    "resolution",
+    "release_blocking"
+  ],
+  "properties": {
+    "schema_version": {"const": 2},
+    "record_id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]+$"},
+    "workload_id": {"type": "string", "minLength": 1},
+    "observed_gpu_slower_than_cpu": {"const": true},
+    "source_inventory": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["campaign_id", "inventory_path", "inventory_sha256", "case_digest"],
+      "properties": {
+        "campaign_id": {"type": "string", "minLength": 1},
+        "inventory_path": {"type": "string", "minLength": 1},
+        "inventory_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "case_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "representative": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["value", "impact", "selection_policy_version", "rationale"],
+      "properties": {
+        "value": {"type": "boolean"},
+        "impact": {"enum": ["low", "medium", "high"]},
+        "selection_policy_version": {"type": "string", "minLength": 1},
+        "rationale": {"type": "string", "minLength": 16}
+      }
+    },
+    "comparison": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "physics_fingerprint",
+        "precision",
+        "stopping_condition",
+        "cpu_topology",
+        "lanes",
+        "ratios"
+      ],
+      "properties": {
+        "physics_fingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "precision": {"type": "string", "minLength": 1},
+        "stopping_condition": {"type": "string", "minLength": 1},
+        "cpu_topology": {"type": "string", "minLength": 1},
+        "lanes": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "upstream_meep_cpu",
+            "gpmeep_v110_cpu",
+            "gpmeep_v103_cuda_gpu1",
+            "gpmeep_v110_cuda_gpu1",
+            "gpmeep_v103_cuda_gpu2",
+            "gpmeep_v110_cuda_gpu2"
+          ],
+          "properties": {
+            "upstream_meep_cpu": {"$ref": "#/$defs/lane"},
+            "gpmeep_v110_cpu": {"$ref": "#/$defs/lane"},
+            "gpmeep_v103_cuda_gpu1": {"$ref": "#/$defs/lane"},
+            "gpmeep_v110_cuda_gpu1": {"$ref": "#/$defs/lane"},
+            "gpmeep_v103_cuda_gpu2": {
+              "oneOf": [{"$ref": "#/$defs/lane"}, {"type": "null"}]
+            },
+            "gpmeep_v110_cuda_gpu2": {
+              "oneOf": [{"$ref": "#/$defs/lane"}, {"type": "null"}]
+            }
+          }
+        },
+        "ratios": {"$ref": "#/$defs/ratios"}
+      }
+    },
+    "phase_decomposition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "upstream_meep_cpu",
+        "gpmeep_v110_cpu",
+        "gpmeep_v103_cuda_gpu1",
+        "gpmeep_v110_cuda_gpu1",
+        "gpmeep_v103_cuda_gpu2",
+        "gpmeep_v110_cuda_gpu2"
+      ],
+      "properties": {
+        "upstream_meep_cpu": {"$ref": "#/$defs/phase_set"},
+        "gpmeep_v110_cpu": {"$ref": "#/$defs/phase_set"},
+        "gpmeep_v103_cuda_gpu1": {"$ref": "#/$defs/phase_set"},
+        "gpmeep_v110_cuda_gpu1": {"$ref": "#/$defs/phase_set"},
+        "gpmeep_v103_cuda_gpu2": {
+          "oneOf": [{"$ref": "#/$defs/phase_set"}, {"type": "null"}]
+        },
+        "gpmeep_v110_cuda_gpu2": {
+          "oneOf": [{"$ref": "#/$defs/phase_set"}, {"type": "null"}]
+        }
+      }
+    },
+    "primary_class": {
+      "enum": ["hardware_crossover", "engine_overhead", "environment", "unknown"]
+    },
+    "classification_evidence": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {"$ref": "#/$defs/evidence"}
+    },
+    "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+    "owner": {"type": "string", "minLength": 1},
+    "resolution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "state",
+        "same_binary_ablation",
+        "numerical_regression",
+        "performance_claim_eligible",
+        "notes"
+      ],
+      "properties": {
+        "state": {
+          "enum": [
+            "open",
+            "optimized_and_remeasured",
+            "proved_hardware_crossover",
+            "environment_fixed_and_remeasured"
+          ]
+        },
+        "same_binary_ablation": {
+          "oneOf": [{"$ref": "#/$defs/evidence"}, {"type": "null"}]
+        },
+        "numerical_regression": {
+          "oneOf": [{"$ref": "#/$defs/evidence"}, {"type": "null"}]
+        },
+        "performance_claim_eligible": {"type": "boolean"},
+        "notes": {"type": "string", "minLength": 1}
+      }
+    },
+    "release_blocking": {"type": "boolean"}
+  },
+  "$defs": {
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "path", "sha256"],
+      "properties": {
+        "kind": {
+          "enum": [
+            "timing",
+            "phase_profile",
+            "size_run_sweep",
+            "profiler_or_ablation",
+            "same_binary_ablation",
+            "numerical_regression",
+            "environment_diagnostic"
+          ]
+        },
+        "path": {"type": "string", "minLength": 1},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "lane": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "runtime_id",
+        "runtime",
+        "backend",
+        "topology",
+        "devices",
+        "measured_seconds",
+        "mean_seconds",
+        "samples"
+      ],
+      "properties": {
+        "runtime_id": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "runtime": {"enum": ["upstream_meep", "gpmeep_v103", "gpmeep_v110"]},
+        "backend": {"enum": ["cpu", "cuda"]},
+        "topology": {"enum": ["cpu1", "cpu8", "gpu1", "gpu2"]},
+        "devices": {
+          "type": "array",
+          "maxItems": 2,
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1}
+        },
+        "measured_seconds": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": {"type": "number", "exclusiveMinimum": 0.0}
+        },
+        "mean_seconds": {"type": "number", "exclusiveMinimum": 0.0},
+        "samples": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/sample_evidence"}
+        }
+      }
+    },
+    "sample_evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "schema", "cycle_index", "path", "sha256"],
+      "properties": {
+        "kind": {"enum": ["upstream_sample", "v103_sample", "v110_sample"]},
+        "schema": {"type": "string", "minLength": 1},
+        "cycle_index": {"enum": [1, 2]},
+        "path": {"type": "string", "minLength": 1},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "ratio": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "numerator_lane",
+        "denominator_lane",
+        "paired_cycle_values",
+        "ratio_of_means"
+      ],
+      "properties": {
+        "numerator_lane": {"type": "string", "minLength": 1},
+        "denominator_lane": {"type": "string", "minLength": 1},
+        "paired_cycle_values": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": {"type": "number", "exclusiveMinimum": 0.0}
+        },
+        "ratio_of_means": {"type": "number", "exclusiveMinimum": 0.0}
+      }
+    },
+    "ratio_set": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "upstream_cpu_over_v103_cuda",
+        "upstream_cpu_over_v110_cuda",
+        "v103_cuda_over_v110_cuda",
+        "v110_cpu_over_v110_cuda"
+      ],
+      "properties": {
+        "upstream_cpu_over_v103_cuda": {"$ref": "#/$defs/ratio"},
+        "upstream_cpu_over_v110_cuda": {"$ref": "#/$defs/ratio"},
+        "v103_cuda_over_v110_cuda": {"$ref": "#/$defs/ratio"},
+        "v110_cpu_over_v110_cuda": {"$ref": "#/$defs/ratio"}
+      }
+    },
+    "ratios": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["gpu1", "gpu2"],
+      "properties": {
+        "gpu1": {"$ref": "#/$defs/ratio_set"},
+        "gpu2": {
+          "oneOf": [{"$ref": "#/$defs/ratio_set"}, {"type": "null"}]
+        }
+      }
+    },
+    "phase_set": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "initialization",
+        "fdtd_timestep",
+        "source",
+        "boundary",
+        "dispersive_ade",
+        "dft_reduction",
+        "host_device_transfer_and_sync",
+        "mpi",
+        "python_adjoint_mpb",
+        "io"
+      ],
+      "properties": {
+        "initialization": {"$ref": "#/$defs/phase"},
+        "fdtd_timestep": {"$ref": "#/$defs/phase"},
+        "source": {"$ref": "#/$defs/phase"},
+        "boundary": {"$ref": "#/$defs/phase"},
+        "dispersive_ade": {"$ref": "#/$defs/phase"},
+        "dft_reduction": {"$ref": "#/$defs/phase"},
+        "host_device_transfer_and_sync": {"$ref": "#/$defs/phase"},
+        "mpi": {"$ref": "#/$defs/phase"},
+        "python_adjoint_mpb": {"$ref": "#/$defs/phase"},
+        "io": {"$ref": "#/$defs/phase"}
+      }
+    },
+    "phase": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "available",
+            "measured_seconds",
+            "mean_seconds",
+            "basis",
+            "native_sinks",
+            "cycle_indices"
+          ],
+          "properties": {
+            "available": {"const": true},
+            "measured_seconds": {
+              "type": "array",
+              "minItems": 2,
+              "maxItems": 2,
+              "items": {"type": "number", "minimum": 0.0}
+            },
+            "mean_seconds": {"type": "number", "minimum": 0.0},
+            "basis": {
+              "type": "array",
+              "minItems": 2,
+              "maxItems": 2,
+              "items": {"type": "string", "minLength": 1}
+            },
+            "native_sinks": {
+              "type": "array",
+              "minItems": 2,
+              "maxItems": 2,
+              "items": {
+                "type": "array",
+                "items": {"type": "string", "minLength": 1},
+                "uniqueItems": true
+              }
+            },
+            "cycle_indices": {"const": [1, 2]}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "available",
+            "measured_seconds",
+            "mean_seconds",
+            "reason_code",
+            "basis",
+            "native_sinks",
+            "cycle_indices"
+          ],
+          "properties": {
+            "available": {"const": false},
+            "measured_seconds": {"const": [null, null]},
+            "mean_seconds": {"type": "null"},
+            "reason_code": {
+              "enum": [
+                "no_comparable_native_timer",
+                "initialization_not_separable",
+                "phase_not_exercised_in_both_samples"
+              ]
+            },
+            "basis": {
+              "type": "array",
+              "minItems": 2,
+              "maxItems": 2,
+              "items": {"type": "string", "minLength": 1}
+            },
+            "native_sinks": {
+              "type": "array",
+              "minItems": 2,
+              "maxItems": 2,
+              "items": {
+                "type": "array",
+                "items": {"type": "string", "minLength": 1},
+                "uniqueItems": true
+              }
+            },
+            "cycle_indices": {"const": [1, 2]}
+          }
+        }
+      ]
+    }
+  }
+}

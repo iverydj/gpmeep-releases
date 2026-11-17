@@ -281,6 +281,27 @@ def _existing_repo_file(repo: pathlib.Path, relative: str, label: str) -> None:
         raise PlanError(f"{label} is not a regular non-symlink file: {relative}")
 
 
+def _unit_record(unit: PairedUnit | HostUnit) -> dict[str, Any]:
+    """Return the one canonical JSON representation of a plan unit.
+
+    ``dataclasses.asdict`` intentionally preserves tuples.  Checkpoints cannot:
+    JSON reloads them as lists and an otherwise identical resume used to fail
+    direct plan equality.  Only ``HostUnit.covers_examples`` is a declared
+    sequence at this boundary, so normalize that field explicitly instead of
+    accepting tuple/list drift anywhere else in the sealed contract.
+    """
+
+    record = asdict(unit)
+    if isinstance(unit, HostUnit):
+        covered = record.get("covers_examples")
+        if type(covered) not in {tuple, list} or any(
+            type(item) is not str for item in covered
+        ):
+            raise PlanError("host coverage cannot be serialized canonically")
+        record["covers_examples"] = list(covered)
+    return record
+
+
 def load_release_plan(plan_root: pathlib.Path, repo: pathlib.Path) -> dict[str, Any]:
     plan_root = pathlib.Path(os.path.abspath(plan_root))
     repo = pathlib.Path(os.path.abspath(repo))
@@ -331,9 +352,9 @@ def load_release_plan(plan_root: pathlib.Path, repo: pathlib.Path) -> dict[str, 
     return {
         "schema": SCHEMA,
         "inputs": records,
-        "selected": [asdict(unit) for unit in selected],
-        "stronger": [asdict(unit) for unit in stronger],
-        "host": [asdict(unit) for unit in host],
+        "selected": [_unit_record(unit) for unit in selected],
+        "stronger": [_unit_record(unit) for unit in stronger],
+        "host": [_unit_record(unit) for unit in host],
         "counts": {
             "selected_units": 56,
             "stronger_units": 14,

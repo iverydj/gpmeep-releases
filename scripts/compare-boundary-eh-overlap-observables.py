@@ -16,6 +16,7 @@ OVERLAP_PREFIX = "gpmeep-boundary-eh-overlap-v1:"
 INITIAL_CONDITION_PREFIX = "gpmeep-initial-condition-v1:"
 SOURCE_PROFILE_PREFIX = "gpmeep-source-profile-v1:"
 INITIALIZATION_TIMING_PREFIX = "gpmeep-initialize-field-timing-v1:"
+STRUCTURED_CURL_GRAPH_PREFIX = "gpmeep-structured-curl-graph-v1:"
 QUALIFICATION_PREFIX = "gpmeep-qualification:"
 WORKER_GPMEEP_PREFIXES = (
     RESULT_PREFIX,
@@ -32,6 +33,7 @@ WORKER_GPMEEP_PREFIXES = (
     "gpmeep-tile-coalescing-v1:",
     "gpmeep-phase-batch-policy-v1:",
     "gpmeep-curl-phase-replay-v1:",
+    STRUCTURED_CURL_GRAPH_PREFIX,
     "gpmeep-boundary-descriptor-replay-v1:",
     "gpmeep-dft-phase-sharing-v1:",
     "gpmeep-dft-multi-monitor-batch-v1:",

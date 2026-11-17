@@ -21,17 +21,24 @@ for import_root in (SCRIPT_DIR, SCRIPT_DIR.parent, USER_WORKLOAD_DIR):
         sys.path.insert(0, str(import_root))
 
 import run_hybrid_aunp_matrix as aunp_matrix  # noqa: E402
+import m3_explicit_policy_evidence as explicit_policy_evidence  # noqa: E402
 import run_m3_host_matrix as host_matrix  # noqa: E402
 import run_m3_paired_matrix as paired_matrix  # noqa: E402
 import run_m3_specialized_matrix as specialized_matrix  # noqa: E402
 import run_user_workload_matrix as matrix  # noqa: E402
 import seal_m3_plan_replay as plan_replay_seal  # noqa: E402
 import seal_milestone_adversarial_audit as audit_seal  # noqa: E402
-from common import WorkloadError, atomic_write_json, atomic_write_text, file_record  # noqa: E402
+from common import (  # noqa: E402
+    WorkloadError,
+    atomic_write_json,
+    atomic_write_text,
+    durable_publish_terminal,
+    file_record,
+)
 
 
-SCHEMA = "gpmeep-current-scope-release-v1"
-COMPLETE_SCHEMA = "gpmeep-current-scope-release-complete-v1"
+SCHEMA = "gpmeep-current-scope-release-v2"
+COMPLETE_SCHEMA = "gpmeep-current-scope-release-complete-v2"
 TERMINAL_NAME = "M3_COMPLETE"
 PENDING_TERMINAL_NAME = "PENDING_M3_COMPLETE"
 HOR_DEFERRAL_SCHEMA = "gpmeep-user-deferred-workload-v1"
@@ -52,6 +59,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--hor-deferral", required=True, type=pathlib.Path)
     parser.add_argument("--aunp-output", required=True, type=pathlib.Path)
     parser.add_argument("--aunp-audit", required=True, type=pathlib.Path)
+    parser.add_argument("--explicit-policy-output", required=True, type=pathlib.Path)
     parser.add_argument("--paired-output", required=True, type=pathlib.Path)
     parser.add_argument("--host-output", required=True, type=pathlib.Path)
     parser.add_argument("--specialized-output", required=True, type=pathlib.Path)
@@ -230,13 +238,56 @@ def _task_ids(report: dict[str, Any], label: str, expected_count: int) -> set[st
 
 
 def feature_closure(
-    plan: dict[str, Any], component_ids: dict[str, set[str]]
+    plan: dict[str, Any],
+    component_ids: dict[str, set[str]],
+    milestone_ids: set[str],
+    explicit_policy: dict[str, Any],
 ) -> list[dict[str, Any]]:
     features = plan.get("features")
     if not isinstance(features, list) or len(features) != 42:
         raise WorkloadError("current-scope feature inventory differs")
+    policy_projection = explicit_policy_evidence.policy_contract_projection(
+        explicit_policy
+    )
+    policy_features = explicit_policy.get("features")
+    if (
+        explicit_policy.get("outcome") != "PASS"
+        or explicit_policy.get("backend_selection") != "user-explicit-only"
+        or explicit_policy.get("automatic_backend_selection") is not False
+        or not isinstance(policy_features, dict)
+        or set(policy_features) != set(explicit_policy_evidence.EXPECTED_FEATURES)
+    ):
+        raise WorkloadError("current-scope explicit backend policy differs")
     results = []
     for feature in features:
+        feature_id = feature.get("feature_id") if isinstance(feature, dict) else None
+        if feature_id in explicit_policy_evidence.EXPECTED_FEATURES:
+            policy_record = policy_features.get(feature_id)
+            if (
+                not isinstance(policy_record, dict)
+                or policy_record.get("outcome") != "PASS"
+            ):
+                raise WorkloadError(
+                    f"explicit backend policy feature did not pass: {feature_id}"
+                )
+            results.append(
+                {
+                    "feature_id": feature_id,
+                    "family": feature["family"],
+                    "planned_status": feature["status"],
+                    "outcome": "PASS",
+                    "evidence": [
+                        {
+                            "component": "explicit_policy",
+                            "backend_selection": "user-explicit-only",
+                            "automatic_backend_selection": False,
+                            "classification_unit": "guard-event",
+                            "case_level_recommendations_used": False,
+                        }
+                    ],
+                }
+            )
+            continue
         routes = feature.get("primary_routes") if isinstance(feature, dict) else None
         if not isinstance(routes, list) or not routes:
             raise WorkloadError("current-scope feature route is absent")
@@ -250,7 +301,7 @@ def feature_closure(
                 kind = route.get("kind") if isinstance(route, dict) else None
                 unit_id = route.get("unit_id") if isinstance(route, dict) else None
                 if kind == "milestone":
-                    ok = unit_id in {"milestone:M2-AuNP", "milestone:M3-example-matrix"}
+                    ok = unit_id in milestone_ids
                 else:
                     ok = isinstance(unit_id, str) and unit_id in component_ids.get(kind, set())
                 if ok:
@@ -278,6 +329,7 @@ def _component_terminal(root: pathlib.Path, name: str) -> dict[str, Any]:
         "paired": "PAIRED_COMPLETE",
         "host": "HOST_COMPLETE",
         "specialized": "SPECIALIZED_COMPLETE",
+        "explicit_policy": "COMPLETE",
     }
     return plan_replay_seal._stable_file_record(
         root / terminals[name], f"current-scope {name} terminal"
@@ -285,14 +337,33 @@ def _component_terminal(root: pathlib.Path, name: str) -> dict[str, Any]:
 
 
 def _build_hardware_closure(
-    aunp: dict[str, Any], components: dict[str, dict[str, Any]]
+    aunp: dict[str, Any],
+    components: dict[str, dict[str, Any]],
+    expected_git_head: str,
 ) -> dict[str, Any]:
     receipt_id = aunp.get("build", {}).get("receipt_id")
     source_sha256 = aunp.get("source_snapshot_sha256")
+    git_head = aunp.get("build", {}).get("git_head")
     devices = aunp.get("gpu_devices")
     if (
         not isinstance(receipt_id, str)
+        or len(receipt_id) != 64
+        or any(character not in "0123456789abcdef" for character in receipt_id)
         or not isinstance(source_sha256, str)
+        or len(source_sha256) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in source_sha256
+        )
+        or not isinstance(git_head, str)
+        or len(git_head) != 40
+        or any(character not in "0123456789abcdef" for character in git_head)
+        or git_head != expected_git_head
+        or len(expected_git_head) != 40
+        or any(
+            character not in "0123456789abcdef"
+            for character in expected_git_head
+        )
         or not isinstance(devices, list)
         or len(devices) != 2
         or len(set(devices)) != 2
@@ -302,7 +373,11 @@ def _build_hardware_closure(
     for name, report in components.items():
         contract = report.get("contract", {})
         build = contract.get("build_receipt", {})
-        if build.get("receipt_id") != receipt_id or build.get("source_sha256") != source_sha256:
+        if (
+            build.get("receipt_id") != receipt_id
+            or build.get("source_sha256") != source_sha256
+            or build.get("git_head") != git_head
+        ):
             raise WorkloadError(f"{name} build receipt differs from AuNP")
         if name == "specialized" and contract.get("gpu_devices") != devices:
             raise WorkloadError("specialized GPU identity differs from AuNP")
@@ -311,6 +386,7 @@ def _build_hardware_closure(
     return {
         "receipt_id": receipt_id,
         "source_sha256": source_sha256,
+        "git_head": git_head,
         "cpu_baseline": "8 physical MPI ranks",
         "gpu_devices": devices,
         "shared_identical_fp32_build": True,
@@ -353,6 +429,7 @@ def derive(contract: dict[str, str]) -> dict[str, Any]:
         "hor_deferral",
         "aunp_output",
         "aunp_audit",
+        "explicit_policy_output",
         "paired_output",
         "host_output",
         "specialized_output",
@@ -362,7 +439,7 @@ def derive(contract: dict[str, str]) -> dict[str, Any]:
     repo = _canonical_directory(pathlib.Path(contract["repo"]), "current-scope repository")
     roots = {
         name: _canonical_directory(pathlib.Path(contract[f"{name}_output"]), f"{name} output")
-        for name in ("aunp", "paired", "host", "specialized")
+        for name in ("aunp", "paired", "host", "specialized", "explicit_policy")
     }
     plan_replay = plan_replay_seal.verify(pathlib.Path(contract["plan_replay"]))
     if plan_replay.get("repository") != str(repo):
@@ -381,11 +458,17 @@ def derive(contract: dict[str, str]) -> dict[str, Any]:
     }
     if any(report.get("outcome") != "PASS" for report in components.values()):
         raise WorkloadError("official Meep component is not a PASS")
+    explicit_policy = explicit_policy_evidence.verify(roots["explicit_policy"])
     component_ids = {
         name: _task_ids(report, name, EXPECTED_COMPONENT_COUNTS[name])
         for name, report in components.items()
     }
-    features = feature_closure(plan_replay["plan"], component_ids)
+    features = feature_closure(
+        plan_replay["plan"],
+        component_ids,
+        {"milestone:M2-AuNP", "milestone:M3-example-matrix"},
+        explicit_policy,
+    )
     performance = validate_aunp_performance(aunp)
     audit = _audit_summary(
         pathlib.Path(contract["aunp_audit"]), roots["aunp"], source
@@ -393,6 +476,21 @@ def derive(contract: dict[str, str]) -> dict[str, Any]:
     terminals = {
         name: _component_terminal(root, name) for name, root in roots.items()
     }
+    if (
+        explicit_policy.get("receipt_id")
+        != aunp.get("build", {}).get("receipt_id")
+        or explicit_policy.get("source_sha256")
+        != aunp.get("source_snapshot_sha256")
+        or explicit_policy.get("git_head") != source["git_commit"]
+        or explicit_policy.get("inputs")
+        != {
+            "paired_complete": terminals["paired"],
+            "aunp_complete": terminals["aunp"],
+        }
+    ):
+        raise WorkloadError(
+            "explicit backend policy build/source/input identity differs"
+        )
     return {
         "schema": SCHEMA,
         "outcome": "PASS",
@@ -416,6 +514,18 @@ def derive(contract: dict[str, str]) -> dict[str, Any]:
             "performance": performance,
             "adversarial_audit": audit,
         },
+        "backend_policy": {
+            "outcome": "PASS",
+            **explicit_policy_evidence.policy_contract_projection(
+                explicit_policy
+            ),
+            "feature_ids": list(explicit_policy_evidence.EXPECTED_FEATURES),
+            "terminal": terminals["explicit_policy"],
+            "report": file_record(
+                roots["explicit_policy"] / "report.json",
+                roots["explicit_policy"],
+            ),
+        },
         "official_meep_examples": {
             "outcome": "PASS",
             "performance_release_gate": False,
@@ -428,7 +538,9 @@ def derive(contract: dict[str, str]) -> dict[str, Any]:
             "features": features,
             "terminals": {name: terminals[name] for name in components},
         },
-        "build_and_hardware": _build_hardware_closure(aunp, components),
+        "build_and_hardware": _build_hardware_closure(
+            aunp, components, source["git_commit"]
+        ),
         "next_action": "STOP_FOR_M4_COORDINATION_AFTER_M3_ADVERSARIAL_AUDIT",
     }
 
@@ -442,6 +554,7 @@ def markdown_report(report: dict[str, Any]) -> str:
         "- Outcome: **PASS**",
         "- Hor_TM: user-deferred, correctness/performance not evaluated",
         "- Performance release evidence: AuNP only, two measured runs per topology",
+        "- Backend selection: user-explicit-only; automatic selection disabled",
         f"- Build receipt: `{build['receipt_id']}`",
         f"- GPUs: `{', '.join(build['gpu_devices'])}`",
         "",
@@ -526,6 +639,11 @@ def _contract_from_args(args: argparse.Namespace) -> dict[str, str]:
         "hor_deferral": str(pathlib.Path(os.path.abspath(args.hor_deferral))),
         "aunp_output": str(_canonical_directory(args.aunp_output, "AuNP output")),
         "aunp_audit": str(pathlib.Path(os.path.abspath(args.aunp_audit))),
+        "explicit_policy_output": str(
+            _canonical_directory(
+                args.explicit_policy_output, "explicit-policy output"
+            )
+        ),
         "paired_output": str(_canonical_directory(args.paired_output, "paired output")),
         "host_output": str(_canonical_directory(args.host_output, "host output")),
         "specialized_output": str(
@@ -541,7 +659,13 @@ def main(argv: list[str] | None = None) -> int:
     repo = pathlib.Path(contract["repo"])
     input_roots = {
         pathlib.Path(contract[name])
-        for name in ("aunp_output", "paired_output", "host_output", "specialized_output")
+        for name in (
+            "aunp_output",
+            "paired_output",
+            "host_output",
+            "specialized_output",
+            "explicit_policy_output",
+        )
     }
     if output == repo or repo in output.parents or any(
         output == root or root in output.parents for root in input_roots
@@ -554,7 +678,7 @@ def main(argv: list[str] | None = None) -> int:
     atomic_write_text(output / "report.md", markdown_report(report))
     atomic_write_json(output / PENDING_TERMINAL_NAME, _terminal_payload(output))
     verify_complete(output, PENDING_TERMINAL_NAME)
-    os.replace(output / PENDING_TERMINAL_NAME, output / TERMINAL_NAME)
+    durable_publish_terminal(output / PENDING_TERMINAL_NAME, output / TERMINAL_NAME)
     value = verify_complete(output)
     print(
         "GPMEEP_CURRENT_SCOPE_RELEASE="

@@ -5,6 +5,7 @@ https://conda.anaconda.org/conda-forge/linux-64/_openmp_mutex-4.5-20_gnu.conda#1
 https://conda.anaconda.org/conda-forge/linux-64/autoconf-2.72-pl5321hbb4ee43_1.conda#8297a545b15576a899ffc0293a9b25c7d9895e155c61d96f266d38c3c46640cb
 https://conda.anaconda.org/conda-forge/linux-64/autoconf-archive-2021.02.19-ha770c72_0.tar.bz2#e32720491a030f20d8820b0121bb17f6fc75f7e1e97465e86b0f6094a5c06723
 https://conda.anaconda.org/conda-forge/noarch/autograd-1.9.1-pyhd8ed1ab_0.conda#424731f434698c0ff937eec4010c94b75fda29394816dc1ec34f94d605b39629
+https://conda.anaconda.org/conda-forge/noarch/attrs-26.1.0-pyhcf101f3_0.conda#1b6124230bb4e571b1b9401537ecff575b7b109cc3a21ee019f65e083b8399ab
 https://conda.anaconda.org/conda-forge/linux-64/automake-1.17-pl5321ha770c72_0.conda#b5c383c4b95c405796c309d9149ae4dd314eab1e8cb0ba1925f0c8f7c304dd26
 https://conda.anaconda.org/conda-forge/linux-64/binutils-2.46.1-default_h4852527_102.conda#659c367ef49df7741749a2ad240b007d7df51b4f210505a78543deafb001e44c
 https://conda.anaconda.org/conda-forge/linux-64/binutils_impl_linux-64-2.46.1-default_hfdba357_102.conda#fb7bf36984a37ce7e4714d1d1da0bd0e3bfc679520f5cdc184afc676fd4b5da2
@@ -77,6 +78,8 @@ https://conda.anaconda.org/conda-forge/noarch/importlib-metadata-9.0.0-pyhcf101f
 https://conda.anaconda.org/conda-forge/noarch/iniconfig-2.3.0-pyhd8ed1ab_0.conda#e1a9e3b1c8fe62dc3932a616c284b5d8cbe3124bbfbedcf4ce5c828cb166ee19
 https://conda.anaconda.org/conda-forge/noarch/jax-0.10.2-pyhd8ed1ab_0.conda#c63764f3f6aaa7bdd2f4b3bc1c297f946ae7e5503d0d3a4ca225ba4dff3fc25b
 https://conda.anaconda.org/conda-forge/linux-64/jaxlib-0.10.2-cpu_py311hceffaa2_0.conda#0b51bff46ff6b3e4fb02c8384f1abd761cc6d74a52df18af70521d1797d6778b
+https://conda.anaconda.org/conda-forge/noarch/jsonschema-4.26.0-pyhcf101f3_1.conda#328756a4555941d57af4a5f553e5d8598e9f3b37db028f557e30f9f0b3086db6
+https://conda.anaconda.org/conda-forge/noarch/jsonschema-specifications-2025.9.1-pyhcf101f3_0.conda#0a4f3b132f0faca10c89fdf3b60e15abb62ded6fa80aebfc007d05965192aa04
 https://conda.anaconda.org/conda-forge/noarch/kernel-headers_linux-64-6.12.0-he073ed8_6.conda#73b11f31db6c9ebe63d900334fa4f46859aa1ddd8f37cfa5f25a043e0a59253c
 https://conda.anaconda.org/conda-forge/linux-64/keyutils-1.6.3-hb9d3cd8_0.conda#0960d06048a7185d3542d850986d807c6e37ca2e644342dd0c72feefcf26c2a4
 https://conda.anaconda.org/conda-forge/linux-64/kiwisolver-1.5.0-py311h724c32c_0.conda#3ff7e51c88f53f05e22ca5549e935d1ccb398665f6ec080a9c6a5c9e9b186b79
@@ -186,7 +189,9 @@ https://conda.anaconda.org/conda-forge/linux-64/qhull-2020.2-h434a139_5.conda#77
 https://conda.anaconda.org/conda-forge/linux-64/rdma-core-63.0-h192683f_1.conda#f0931894c751b22be09d7c976343a2957a14a59cfe0db04d916d1b93bd66ffcf
 https://conda.anaconda.org/conda-forge/linux-64/re2-2025.11.05-h5301d42_1.conda#3fc684b81631348540e9a42f6768b871dfeab532d3f47d5c341f1f83e2a2b2b2
 https://conda.anaconda.org/conda-forge/linux-64/readline-8.3-h853b02a_0.conda#12ffde5a6f958e285aa22c191ca01bbd3d6e710aa852e00618fa6ddc59149002
+https://conda.anaconda.org/conda-forge/noarch/referencing-0.37.0-pyhcf101f3_0.conda#0577eedfb347ff94d0f2fa6c052c502989b028216996b45c7f21236f25864414
 https://conda.anaconda.org/conda-forge/linux-64/rhash-1.4.6-hb9d3cd8_1.conda#d5c73079c1dd2c2a313c3bfd81c73dbd066b7eb08d213778c8bff520091ae894
+https://conda.anaconda.org/conda-forge/linux-64/rpds-py-2026.6.3-py311ha6e1976_0.conda#424cea2ffd94448a6a3202c624b693d2d4db6bedce39f4ab06e9830b3f1bcd4f
 https://conda.anaconda.org/conda-forge/linux-64/scipy-1.17.1-py311hbe70eeb_1.conda#3ae2ff1d1cc5930de2ca6ac03216118bdf13b2af6098e28e827f1ba25bfcbc4e
 https://conda.anaconda.org/conda-forge/noarch/setuptools-83.0.0-pyh332efcf_0.conda#48a9f96016505debadfc67f06de7ac548decbc38d327409b24b0432ef6f16335
 https://conda.anaconda.org/conda-forge/noarch/six-1.17.0-pyhe01879c_1.conda#458227f759d5e3fcec5d9b7acce54e10c9e1f4f4b7ec978f3bfd54ce4ee9853d

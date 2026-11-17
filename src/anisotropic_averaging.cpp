@@ -250,6 +250,7 @@ breakout:
   // (i.e., pure C++ geometry, not a Python callback). The trivial[] flags
   // need a reduction since each thread computes its local subset.
   if (medium.is_thread_safe()) {
+    medium.note_parallel_epsilon(loop_npixels);
     bool trivial0 = true, trivial1 = true, trivial2 = true;
     PLOOP_OVER_IVECS_C(gv, gv.little_corner() + gv.iyee_shift(c),
                        gv.big_corner() + gv.iyee_shift(c), i,
@@ -365,7 +366,8 @@ void structure_chunk::add_susceptibility(material_function &sigma, field_type ft
       // Use OpenMP parallelization when the material function is thread-safe
       // (i.e., pure C++ geometry, not a Python callback). The trivial[] flags
       // need a reduction since each thread computes its local subset.
-      if (sigma.is_thread_safe()) {
+      if (sigma.is_thread_safe_for_sigma()) {
+        sigma.note_parallel_sigma(gv.ntot());
         bool trivial0 = true, trivial1 = true, trivial2 = true;
         PLOOP_OVER_IVECS_C(gv, gv.little_corner() + gv.iyee_shift(c),
                            gv.big_corner() + gv.iyee_shift(c), i,

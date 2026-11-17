@@ -30,6 +30,7 @@ DFT_MULTI_PREFIX = "gpmeep-dft-multi-monitor-batch-v1:"
 DFT_WARMUP_PLAN_PREFIX = "gpmeep-dft-warmup-plan-v1:"
 PHASE_BATCH_POLICY_PREFIX = "gpmeep-phase-batch-policy-v1:"
 CURL_PHASE_REPLAY_PREFIX = "gpmeep-curl-phase-replay-v1:"
+STRUCTURED_CURL_GRAPH_PREFIX = "gpmeep-structured-curl-graph-v1:"
 EAGER_PREFIX = "gpmeep-eager-mpi-v1:"
 PINGPONG_PREFIX = "gpmeep-receive-pingpong-v1:"
 GRAPH_PREFIX = "gpmeep-boundary-phase-graph-v1:"
@@ -48,6 +49,7 @@ WORKER_GPMEEP_PREFIXES = (
     "gpmeep-tile-coalescing-v1:",
     PHASE_BATCH_POLICY_PREFIX,
     CURL_PHASE_REPLAY_PREFIX,
+    STRUCTURED_CURL_GRAPH_PREFIX,
     "gpmeep-boundary-descriptor-replay-v1:",
     DFT_PREFIX,
     DFT_MULTI_PREFIX,

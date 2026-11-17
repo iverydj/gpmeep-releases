@@ -416,6 +416,104 @@ class RunnerSelfTest(unittest.TestCase):
             ],
         )
 
+    def test_backend_acknowledgement_routes_oracle_or_site_owner(self):
+        command = [
+            "/env/bin/python",
+            str(runner.SCRIPT_SELF_DIR / "run_example_oracle.py"),
+            "--expected-run-count",
+            "1",
+            "/repo/python/examples/example.py",
+        ]
+        reason = "M3 explicit forced CUDA investigation"
+        actual = runner.command_with_backend_acknowledgement(command, reason)
+        self.assertEqual(
+            actual[2:4],
+            ["--acknowledge-backend-mismatch-reason", reason],
+        )
+        self.assertEqual(
+            runner.command_with_backend_acknowledgement(command, None), command
+        )
+        direct = ["/env/bin/python", "/repo/example.py"]
+        self.assertEqual(
+            runner.command_with_backend_acknowledgement(direct, reason), direct
+        )
+
+        dedicated = [
+            "/env/bin/python",
+            str(
+                runner.SCRIPT_SELF_DIR
+                / "run_point_dipole_cyl_validation.py"
+            ),
+            "/repo/python/examples/point_dipole_cyl.py",
+        ]
+        routed = runner.command_with_backend_acknowledgement(dedicated, reason)
+        self.assertEqual(
+            routed[2:4],
+            ["--acknowledge-backend-mismatch-reason", reason],
+        )
+        self.assertEqual(runner.backend_guard_owner_index(dedicated), 1)
+
+        ambiguous = [*command, dedicated[1]]
+        with self.assertRaisesRegex(
+            runner.ManifestError, "multiple validation guard owners"
+        ):
+            runner.command_with_backend_acknowledgement(ambiguous, reason)
+
+        for spoof in (
+            ["/env/bin/python", "/other/run_example_oracle.py"],
+            ["/env/bin/python", "/repo/example.py", "run_example_oracle.py"],
+        ):
+            with self.subTest(spoof=spoof):
+                self.assertIsNone(runner.backend_guard_owner_index(spoof))
+                self.assertEqual(
+                    runner.command_with_backend_acknowledgement(spoof, reason),
+                    spoof,
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            alias = pathlib.Path(directory) / "run_example_oracle.py"
+            alias.symlink_to(command[1])
+            symlink_command = ["/env/bin/python", str(alias)]
+            self.assertIsNone(
+                runner.backend_guard_owner_index(symlink_command)
+            )
+            self.assertEqual(
+                runner.command_with_backend_acknowledgement(
+                    symlink_command, reason
+                ),
+                symlink_command,
+            )
+
+        misplaced = ["/env/bin/python", "/repo/example.py", command[1]]
+        with self.assertRaisesRegex(runner.ManifestError, r"not command\[1\]"):
+            runner.command_with_backend_acknowledgement(misplaced, reason)
+
+        for preloaded in (
+            [*command, "--acknowledge-backend-mismatch-reason", "old reason"],
+            [*command, "--acknowledge-backend-mismatch-reason=old reason"],
+            [*command, "--acknowledge-backend-mismatch-r", "old reason"],
+            [*command, "--ack=old reason"],
+        ):
+            for injected_reason in (None, reason):
+                with self.subTest(preloaded=preloaded, reason=injected_reason):
+                    with self.assertRaisesRegex(
+                        runner.ManifestError, "pre-existing"
+                    ):
+                        runner.command_with_backend_acknowledgement(
+                            preloaded, injected_reason
+                        )
+
+    def test_runner_backend_acknowledgement_reason_is_bounded(self):
+        reason = "M3 explicit forced CUDA investigation"
+        args = runner.parse_args(
+            ["--acknowledge-backend-mismatch-reason", reason]
+        )
+        self.assertEqual(args.acknowledge_backend_mismatch_reason, reason)
+        for invalid in ("short", "x" * 513):
+            with self.subTest(length=len(invalid)), self.assertRaises(SystemExit):
+                runner.parse_args(
+                    ["--acknowledge-backend-mismatch-reason", invalid]
+                )
     def test_checked_in_wrapper_uses_authoritative_cuda_mpi_build(self):
         wrapper = RUNNER_PATH.parents[1] / "run-python-validation.sh"
         source = wrapper.read_text(encoding="utf-8")
@@ -4193,7 +4291,7 @@ class RunnerSelfTest(unittest.TestCase):
             for path in (repo / "python" / "examples").rglob(suffix)
         )
         self.assertSetEqual(materialized, expected)
-        self.assertEqual(len(cases), 207)
+        self.assertEqual(len(cases), 210)
         self.assertFalse(any(path.startswith("scheme/") for path in materialized))
 
     def test_checked_in_manifest_has_structured_compute_and_coverage_scope(self):
@@ -5164,6 +5262,30 @@ class RunnerSelfTest(unittest.TestCase):
         reciprocity_tolerances = cases[
             "python/examples/stochastic_emitter_reciprocity.py"
         ]["comparison"]["tolerances"]
+        self.assertEqual(
+            reciprocity_tolerances[
+                "example_results.reciprocity_forward_normalized_convergence_residual.*"
+            ],
+            {"rtol": 0.02, "atol": 1e-5},
+        )
+        self.assertEqual(
+            reciprocity_tolerances[
+                "example_results.reciprocity_backward_normalized_convergence_residual.*"
+            ],
+            {"rtol": 0.01, "atol": 1e-5},
+        )
+        self.assertEqual(
+            reciprocity_tolerances[
+                "example_results.reciprocity_base_residual.*"
+            ],
+            {"rtol": 0.01, "atol": 1e-5},
+        )
+        self.assertEqual(
+            reciprocity_tolerances[
+                "example_results.reciprocity_forward_normalized_flux.*"
+            ],
+            {"rtol": 0.002, "atol": 1e-6},
+        )
         diagnostic_only_rules = {
             "example_results.reciprocity_forward_normalized_convergence_pointwise_relative_error.*",
             "example_results.reciprocity_backward_normalized_convergence_pointwise_relative_error.*",
@@ -5260,7 +5382,7 @@ class RunnerSelfTest(unittest.TestCase):
             if case["kind"] == "unittest"
             and case["disposition"] == "run"
         ]
-        self.assertEqual(len(runnable), 72)
+        self.assertEqual(len(runnable), 74)
         total_identities = 0
         for case in runnable:
             with self.subTest(path=case["path"]):
@@ -5271,7 +5393,7 @@ class RunnerSelfTest(unittest.TestCase):
                 self.assertEqual(contract.get("count"), len(identities))
                 self.assertEqual(len(set(identities)), len(identities))
                 total_identities += len(identities)
-        self.assertEqual(total_identities, 387)
+        self.assertEqual(total_identities, 507)
 
 
 if __name__ == "__main__":

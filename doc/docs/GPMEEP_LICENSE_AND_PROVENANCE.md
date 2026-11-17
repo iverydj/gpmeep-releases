@@ -18,15 +18,6 @@ repository and its checksum-bound tagged source archive. Upstream Meep
 copyright and citation information remains in `LICENSE`, `README.md`,
 `doc/docs/License_and_Copyright.md`, and `doc/docs/Acknowledgements.md`.
 
-The public repository contains privacy-cleaned source snapshots rather than
-the private development history. Removed files are raw evidence, resume notes,
-evidence anchors, and development automation, not numerical solver or package
-build source. Public-facing documentation may also be updated or have local
-execution paths replaced with generic examples. The original binary retains
-its original source commit and SHA-256; public Git commits must not be
-substituted for those identities. See `PUBLIC_RELEASE.json` and
-`PUBLIC_RELEASE_POLICY.md` at the repository root.
-
 The MPI adjoint chunk-invariance correction is a manual backport that preserves
 the identity of NanoComp/meep PR 3274 commit
 `897dbe06b0ed6442d34f2a940f21acbff9375523`. The gpmeep release plan records

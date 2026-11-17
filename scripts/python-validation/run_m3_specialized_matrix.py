@@ -33,6 +33,7 @@ from common import (  # noqa: E402
     WorkloadError,
     absolute_file_record,
     atomic_write_json,
+    durable_publish_terminal,
     file_record,
 )
 
@@ -333,6 +334,13 @@ def _receipt_record(
     source_sha256 = receipt.get("source_start", {}).get("sha256")
     if not isinstance(source_sha256, str) or len(source_sha256) != 64:
         raise WorkloadError("M3 specialized build source identity is invalid")
+    git_head = receipt.get("git_head")
+    if (
+        not isinstance(git_head, str)
+        or len(git_head) != 40
+        or any(character not in "0123456789abcdef" for character in git_head)
+    ):
+        raise WorkloadError("M3 specialized build Git identity is invalid")
     return {
         "path": str(receipt_path),
         "size_bytes": receipt_path.stat().st_size,
@@ -341,6 +349,7 @@ def _receipt_record(
         "build_input_id": receipt["build_input_id"],
         "artifact_set_id": receipt["artifact_set_id"],
         "source_sha256": source_sha256,
+        "git_head": git_head,
     }
 
 
@@ -1022,7 +1031,7 @@ def publish_terminal(output: pathlib.Path, report: dict[str, Any]) -> None:
         output / "PENDING_SPECIALIZED_COMPLETE", _terminal_payload(output, report)
     )
     verify_complete(output, "PENDING_SPECIALIZED_COMPLETE")
-    os.replace(
+    durable_publish_terminal(
         output / "PENDING_SPECIALIZED_COMPLETE", output / "SPECIALIZED_COMPLETE"
     )
 
@@ -1291,7 +1300,7 @@ def main(argv: list[str] | None = None) -> int:
         }
         if (output / "JOURNAL.json").is_file():
             failure["journal"] = file_record(output / "JOURNAL.json", output)
-        atomic_write_json(output / "FAILED.json", failure)
+        matrix.publish_failure_record(output, failure)
         raise
     finally:
         for stable in code_stables.values():

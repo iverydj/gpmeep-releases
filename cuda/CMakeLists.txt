@@ -213,6 +213,16 @@ if(BUILD_TESTING)
 
   add_test(NAME cuda-smoke COMMAND meep_cuda_smoke)
   set_tests_properties(cuda-smoke PROPERTIES SKIP_RETURN_CODE 77)
+
+  add_executable(meep_cuda_sparse_lorentzian_smoke_test
+    tests/sparse_lorentzian_smoke.cpp
+  )
+  target_link_libraries(meep_cuda_sparse_lorentzian_smoke_test
+    PRIVATE meep_cuda_runtime)
+  add_test(NAME cuda-sparse-lorentzian-smoke
+    COMMAND meep_cuda_sparse_lorentzian_smoke_test)
+  set_tests_properties(cuda-sparse-lorentzian-smoke
+    PROPERTIES SKIP_RETURN_CODE 77)
 endif()
 
 message(STATUS "Meep CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")

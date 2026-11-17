@@ -15,10 +15,17 @@
 */
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
+#include <mutex>
 #include <vector>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 #include "meepgeom.hpp"
 #include "meep_internals.hpp"
 #include "gpu_backend_internal.hpp"
@@ -27,6 +34,249 @@ namespace meep_geom {
 
 #define master_printf meep::master_printf
 
+namespace {
+
+using counter_type = unsigned long long;
+
+struct material_omp_atomic_statistics {
+  std::atomic<counter_type> feature_checks{0};
+  std::atomic<counter_type> enabled_checks{0};
+  std::atomic<counter_type> eligible_checks{0};
+  std::atomic<counter_type> disabled_checks{0};
+  std::atomic<counter_type> unsafe_material_checks{0};
+  std::atomic<counter_type> guard_rejections{0};
+  std::atomic<counter_type> stale_epoch_rejections{0};
+  std::atomic<counter_type> non_openmp_checks{0};
+  std::atomic<counter_type> epsilon_parallel_calls{0};
+  std::atomic<counter_type> epsilon_parallel_points{0};
+  std::atomic<counter_type> sigma_parallel_calls{0};
+  std::atomic<counter_type> sigma_parallel_points{0};
+  std::atomic<counter_type> team_observations{0};
+  std::atomic<counter_type> team_mismatch_observations{0};
+  std::atomic<counter_type> team_reference_threads{0};
+  std::atomic<counter_type> configured_threads{0};
+  std::atomic<counter_type> observed_threads{0};
+  std::atomic<counter_type> prism_preflight_calls{0};
+  std::atomic<counter_type> reset_generation{1};
+  std::atomic<bool> prism_preflight_complete{false};
+  std::atomic<bool> counter_overflow{false};
+};
+
+material_omp_atomic_statistics material_omp_stats;
+std::recursive_mutex geometry_state_mutex;
+std::atomic<counter_type> geometry_state_epoch{1};
+std::atomic<counter_type> geometry_owner_sequence{1};
+thread_local unsigned geometry_transaction_depth = 0;
+thread_local counter_type geometry_owner_token = 0;
+std::once_flag prism_preflight_once;
+
+void saturating_add(std::atomic<counter_type> &counter, counter_type increment) {
+  counter_type value = counter.load(std::memory_order_relaxed);
+  const counter_type maximum = std::numeric_limits<counter_type>::max();
+  for (;;) {
+    if (increment > maximum - value) {
+      if (counter.compare_exchange_weak(value, maximum, std::memory_order_relaxed)) {
+        material_omp_stats.counter_overflow.store(true, std::memory_order_relaxed);
+        return;
+      }
+    }
+    else if (counter.compare_exchange_weak(value, value + increment, std::memory_order_relaxed))
+      return;
+  }
+}
+
+void record_max(std::atomic<counter_type> &counter, counter_type value) {
+  counter_type previous = counter.load(std::memory_order_relaxed);
+  while (previous < value &&
+         !counter.compare_exchange_weak(previous, value, std::memory_order_relaxed)) {}
+}
+
+bool geometry_transaction_owned() {
+  return geometry_transaction_depth > 0 && geometry_owner_token != 0;
+}
+
+counter_type current_geometry_epoch() {
+  return geometry_state_epoch.load(std::memory_order_acquire);
+}
+
+counter_type commit_geometry_mutation() {
+  if (!geometry_transaction_owned())
+    meep::abort("C4 geometry mutation attempted outside the process-global transaction");
+  const counter_type previous = geometry_state_epoch.fetch_add(1, std::memory_order_acq_rel);
+  if (previous == std::numeric_limits<counter_type>::max())
+    meep::abort("C4 geometry epoch exhausted");
+  return previous + 1;
+}
+
+enum class material_omp_control { disabled, enabled };
+
+material_omp_control material_omp_control_from_environment() {
+  const char *enable = std::getenv("MEEP_C4_MATERIAL_OMP_ENABLE");
+  const char *disable = std::getenv("MEEP_C4_MATERIAL_OMP_DISABLE");
+  const bool enable_set = enable != nullptr;
+  const bool disable_set = disable != nullptr;
+  if ((enable_set && std::strcmp(enable, "1") != 0) ||
+      (disable_set && std::strcmp(disable, "1") != 0) || (enable_set && disable_set))
+    meep::abort("C4 material OpenMP controls must be mutually exclusive exact '=1' values");
+  return enable_set ? material_omp_control::enabled : material_omp_control::disabled;
+}
+
+bool static_material_is_safe(const void *value) {
+  if (!value) return false;
+  const material_data *material = static_cast<const material_data *>(value);
+  return material->which_subclass == material_data::MEDIUM ||
+         material->which_subclass == material_data::PERFECT_METAL;
+}
+
+bool fixed_object_is_safe(const geometric_object &object) {
+  switch (object.which_subclass) {
+    case geometric_object::MESH:
+    case geometric_object::PRISM:
+    case geometric_object::BLOCK:
+    case geometric_object::SPHERE:
+    case geometric_object::CYLINDER: return static_material_is_safe(object.material);
+    case geometric_object::COMPOUND_GEOMETRIC_OBJECT: {
+      if (!object.subclass.compound_geometric_object_data) return false;
+      const geometric_object_list &components =
+          object.subclass.compound_geometric_object_data->component_objects;
+      if (components.num_items < 0 || (components.num_items > 0 && !components.items)) return false;
+      for (int index = 0; index < components.num_items; ++index)
+        if (!fixed_object_is_safe(components.items[index])) return false;
+      // A compound's own material is not selectable; all selectable leaves
+      // above have nevertheless been checked recursively.
+      return true;
+    }
+    case geometric_object::GEOMETRIC_OBJECT_SELF:
+    default: return false;
+  }
+}
+
+bool fixed_geometry_is_safe(const geometric_object_list &geometry,
+                            const material_type_list &extra_materials) {
+  if (!static_material_is_safe(default_material) || geometry.num_items < 0 ||
+      (geometry.num_items > 0 && !geometry.items) || extra_materials.num_items < 0 ||
+      (extra_materials.num_items > 0 && !extra_materials.items))
+    return false;
+  for (int index = 0; index < geometry.num_items; ++index)
+    if (!fixed_object_is_safe(geometry.items[index])) return false;
+  for (int index = 0; index < extra_materials.num_items; ++index)
+    if (!static_material_is_safe(extra_materials.items[index])) return false;
+  return true;
+}
+
+const geometric_object *first_prism(const geometric_object &object) {
+  if (object.which_subclass == geometric_object::PRISM) return &object;
+  if (object.which_subclass != geometric_object::COMPOUND_GEOMETRIC_OBJECT ||
+      !object.subclass.compound_geometric_object_data)
+    return nullptr;
+  const geometric_object_list &components =
+      object.subclass.compound_geometric_object_data->component_objects;
+  for (int index = 0; index < components.num_items; ++index) {
+    const geometric_object *candidate = first_prism(components.items[index]);
+    if (candidate) return candidate;
+  }
+  return nullptr;
+}
+
+void preflight_prism_if_present(const geometric_object_list &geometry) {
+  const geometric_object *prism_object = nullptr;
+  for (int index = 0; index < geometry.num_items && !prism_object; ++index)
+    prism_object = first_prism(geometry.items[index]);
+  if (!prism_object) return;
+  std::call_once(prism_preflight_once, [prism_object]() {
+    // The result is immaterial: invoking the actual fixed-prism predicate in
+    // this serial transaction initializes libctl's boundary-policy static.
+    (void)point_in_fixed_objectp(prism_object->center, *prism_object);
+    saturating_add(material_omp_stats.prism_preflight_calls, 1);
+    material_omp_stats.prism_preflight_complete.store(true, std::memory_order_release);
+  });
+}
+
+} // namespace
+
+geometry_state_transaction::geometry_state_transaction() {
+  geometry_state_mutex.lock();
+  if (geometry_transaction_depth++ == 0) {
+    counter_type token = geometry_owner_sequence.fetch_add(1, std::memory_order_relaxed);
+    if (token == 0 || token == std::numeric_limits<counter_type>::max())
+      meep::abort("C4 geometry owner-token sequence exhausted");
+    geometry_owner_token = token;
+  }
+}
+
+geometry_state_transaction::~geometry_state_transaction() {
+  if (geometry_transaction_depth == 0)
+    meep::abort("C4 geometry transaction depth underflow");
+  if (--geometry_transaction_depth == 0) geometry_owner_token = 0;
+  geometry_state_mutex.unlock();
+}
+
+void commit_geometry_state_mutation() { (void)commit_geometry_mutation(); }
+
+material_omp_statistics get_material_omp_statistics() {
+  material_omp_statistics result;
+  result.feature_checks = material_omp_stats.feature_checks.load(std::memory_order_relaxed);
+  result.enabled_checks = material_omp_stats.enabled_checks.load(std::memory_order_relaxed);
+  result.eligible_checks = material_omp_stats.eligible_checks.load(std::memory_order_relaxed);
+  result.disabled_checks = material_omp_stats.disabled_checks.load(std::memory_order_relaxed);
+  result.unsafe_material_checks =
+      material_omp_stats.unsafe_material_checks.load(std::memory_order_relaxed);
+  result.guard_rejections = material_omp_stats.guard_rejections.load(std::memory_order_relaxed);
+  result.stale_epoch_rejections =
+      material_omp_stats.stale_epoch_rejections.load(std::memory_order_relaxed);
+  result.non_openmp_checks = material_omp_stats.non_openmp_checks.load(std::memory_order_relaxed);
+  result.epsilon_parallel_calls =
+      material_omp_stats.epsilon_parallel_calls.load(std::memory_order_relaxed);
+  result.epsilon_parallel_points =
+      material_omp_stats.epsilon_parallel_points.load(std::memory_order_relaxed);
+  result.sigma_parallel_calls =
+      material_omp_stats.sigma_parallel_calls.load(std::memory_order_relaxed);
+  result.sigma_parallel_points =
+      material_omp_stats.sigma_parallel_points.load(std::memory_order_relaxed);
+  result.team_observations = material_omp_stats.team_observations.load(std::memory_order_relaxed);
+  result.team_mismatch_observations =
+      material_omp_stats.team_mismatch_observations.load(std::memory_order_relaxed);
+  result.configured_threads = material_omp_stats.configured_threads.load(std::memory_order_relaxed);
+  result.observed_threads = material_omp_stats.observed_threads.load(std::memory_order_relaxed);
+  result.geometry_epoch = current_geometry_epoch();
+  result.prism_preflight_calls =
+      material_omp_stats.prism_preflight_calls.load(std::memory_order_relaxed);
+  result.reset_generation = material_omp_stats.reset_generation.load(std::memory_order_relaxed);
+  result.prism_preflight_complete =
+      material_omp_stats.prism_preflight_complete.load(std::memory_order_acquire);
+  result.counter_overflow = material_omp_stats.counter_overflow.load(std::memory_order_relaxed);
+  return result;
+}
+
+void reset_material_omp_statistics() {
+  material_omp_stats.feature_checks.store(0, std::memory_order_relaxed);
+  material_omp_stats.enabled_checks.store(0, std::memory_order_relaxed);
+  material_omp_stats.eligible_checks.store(0, std::memory_order_relaxed);
+  material_omp_stats.disabled_checks.store(0, std::memory_order_relaxed);
+  material_omp_stats.unsafe_material_checks.store(0, std::memory_order_relaxed);
+  material_omp_stats.guard_rejections.store(0, std::memory_order_relaxed);
+  material_omp_stats.stale_epoch_rejections.store(0, std::memory_order_relaxed);
+  material_omp_stats.non_openmp_checks.store(0, std::memory_order_relaxed);
+  material_omp_stats.epsilon_parallel_calls.store(0, std::memory_order_relaxed);
+  material_omp_stats.epsilon_parallel_points.store(0, std::memory_order_relaxed);
+  material_omp_stats.sigma_parallel_calls.store(0, std::memory_order_relaxed);
+  material_omp_stats.sigma_parallel_points.store(0, std::memory_order_relaxed);
+  material_omp_stats.team_observations.store(0, std::memory_order_relaxed);
+  material_omp_stats.team_mismatch_observations.store(0, std::memory_order_relaxed);
+  material_omp_stats.team_reference_threads.store(0, std::memory_order_relaxed);
+  material_omp_stats.configured_threads.store(0, std::memory_order_relaxed);
+  material_omp_stats.observed_threads.store(0, std::memory_order_relaxed);
+  material_omp_stats.prism_preflight_calls.store(0, std::memory_order_relaxed);
+  material_omp_stats.counter_overflow.store(false, std::memory_order_relaxed);
+  const counter_type previous =
+      material_omp_stats.reset_generation.fetch_add(1, std::memory_order_relaxed);
+  if (previous == std::numeric_limits<counter_type>::max()) {
+    material_omp_stats.reset_generation.store(std::numeric_limits<counter_type>::max(),
+                                              std::memory_order_relaxed);
+    material_omp_stats.counter_overflow.store(true, std::memory_order_relaxed);
+  }
+}
+
 /***************************************************************/
 /* global variables for default material                       */
 /***************************************************************/
@@ -34,6 +284,7 @@ material_data vacuum_material_data;
 material_type vacuum = &vacuum_material_data;
 
 void set_default_material(material_type _default_material) {
+  geometry_state_transaction transaction;
   if (default_material != NULL) {
     if (default_material == _default_material) return;
     material_free((material_type)default_material);
@@ -45,12 +296,15 @@ void set_default_material(material_type _default_material) {
     new_material->copy_from(*_default_material);
     default_material = (void *)new_material;
   }
+  commit_geometry_mutation();
 }
 
 void unset_default_material(void) {
+  geometry_state_transaction transaction;
   if (default_material != NULL) {
     material_free((material_type)default_material);
     default_material = NULL;
+    commit_geometry_mutation();
   }
 }
 
@@ -235,8 +489,12 @@ int sym_matrix_positive_definite(symm_matrix *V) {
 /***************************************************************/
 static meep::ndim dim = meep::D3;
 void set_dimensions(int dims) {
-  if (dims == CYLINDRICAL) { dim = meep::Dcyl; }
-  else { dim = meep::ndim(dims - 1); }
+  geometry_state_transaction transaction;
+  const meep::ndim next = dims == CYLINDRICAL ? meep::Dcyl : meep::ndim(dims - 1);
+  if (next != dim) {
+    dim = next;
+    commit_geometry_mutation();
+  }
 }
 
 vector3 vec_to_vector3(const meep::vec &pt) {
@@ -635,6 +893,7 @@ void epsilon_material_grid(material_data *md, double u) {
 
 // return material of the point p from the file (assumed already read)
 void epsilon_file_material(material_data *md, vector3 p) {
+  geometry_state_transaction transaction;
   set_default_material(md);
 
   if (md->which_subclass != material_data::MATERIAL_FILE)
@@ -658,6 +917,7 @@ void epsilon_file_material(material_data *md, vector3 p) {
 
 geom_epsilon::geom_epsilon(geometric_object_list g, material_type_list mlist,
                            const meep::volume &v) {
+  geometry_state_transaction transaction;
   // Copy the geometry
   int length = g.num_items;
   geometry.num_items = length;
@@ -700,6 +960,13 @@ geom_epsilon::geom_epsilon(geometric_object_list g, material_type_list mlist,
       master_printf("%*s...(+ %d objects not shown)...\n", 5, "", geometry.num_items - num_print);
   }
   geom_fix_object_list(geometry);
+  omp_has_prism = false;
+  for (int i = 0; i < geometry.num_items && !omp_has_prism; ++i)
+    omp_has_prism = first_prism(geometry.items[i]) != nullptr;
+  preflight_prism_if_present(geometry);
+  omp_safe_materials = fixed_geometry_is_safe(geometry, mlist);
+  geometry_epoch = current_geometry_epoch();
+  omp_team_observed = false;
   geom_box box = gv2box(v);
   geometry_tree = create_geom_box_tree0(geometry, box);
   if (meep::verbosity > 2 && meep::am_master()) {
@@ -718,11 +985,16 @@ geom_epsilon::geom_epsilon(geometric_object_list g, material_type_list mlist,
 
 // copy constructor
 geom_epsilon::geom_epsilon(const geom_epsilon &geps1) {
+  geometry_state_transaction transaction;
   // Copy the geometry
   int length = geps1.geometry.num_items;
   geometry.num_items = length;
   geometry.items = new geometric_object[length];
   has_user_materials = geps1.has_user_materials;
+  geometry_epoch = geps1.geometry_epoch;
+  omp_safe_materials = geps1.omp_safe_materials;
+  omp_has_prism = geps1.omp_has_prism;
+  omp_team_observed = false;
   for (int i = 0; i < length; i++) {
     geometric_object_copy(&geps1.geometry.items[i], &geometry.items[i]);
     geometry.items[i].material = new material_data();
@@ -749,6 +1021,80 @@ geom_epsilon::~geom_epsilon() {
   FOR_DIRECTIONS(d) FOR_SIDES(b) {
     if (cond[d][b].prof) delete[] cond[d][b].prof;
   }
+}
+
+bool geom_epsilon::parallel_eligible(bool sigma) const {
+  (void)sigma;
+  saturating_add(material_omp_stats.feature_checks, 1);
+  // C4 is strictly opt-in.  Preserve the legacy serial behavior, including
+  // its compatibility surface, before enforcing C4-only ownership and epoch
+  // invariants.
+  if (material_omp_control_from_environment() == material_omp_control::disabled) {
+    saturating_add(material_omp_stats.disabled_checks, 1);
+    return false;
+  }
+  saturating_add(material_omp_stats.enabled_checks, 1);
+  if (!geometry_transaction_owned()) {
+    saturating_add(material_omp_stats.guard_rejections, 1);
+    meep::abort("C4 geom_epsilon evaluation has no geometry transaction owner");
+  }
+  if (geometry_epoch != current_geometry_epoch()) {
+    saturating_add(material_omp_stats.stale_epoch_rejections, 1);
+    meep::abort("C4 rejected a stale geom_epsilon epoch before material evaluation");
+  }
+#ifndef _OPENMP
+  saturating_add(material_omp_stats.non_openmp_checks, 1);
+  return false;
+#else
+  if (!omp_safe_materials) {
+    saturating_add(material_omp_stats.unsafe_material_checks, 1);
+    return false;
+  }
+  if (omp_has_prism &&
+      !material_omp_stats.prism_preflight_complete.load(std::memory_order_acquire))
+    meep::abort("C4 material OpenMP prism preflight did not complete");
+
+  if (!omp_team_observed) {
+    int configured = omp_get_max_threads();
+    int observed = 1;
+#pragma omp parallel reduction(max : observed)
+    { observed = omp_get_num_threads(); }
+    const counter_type configured_count =
+        configured > 0 ? static_cast<counter_type>(configured) : 0;
+    const counter_type observed_count = observed > 0 ? static_cast<counter_type>(observed) : 0;
+    counter_type reference =
+        material_omp_stats.team_reference_threads.load(std::memory_order_relaxed);
+    if (reference == 0 && configured_count > 0) {
+      counter_type expected = 0;
+      material_omp_stats.team_reference_threads.compare_exchange_strong(
+          expected, configured_count, std::memory_order_relaxed);
+      reference = material_omp_stats.team_reference_threads.load(std::memory_order_relaxed);
+    }
+    if (configured_count == 0 || observed_count == 0 || configured_count != reference ||
+        observed_count != reference)
+      saturating_add(material_omp_stats.team_mismatch_observations, 1);
+    record_max(material_omp_stats.configured_threads, configured_count);
+    record_max(material_omp_stats.observed_threads, observed_count);
+    saturating_add(material_omp_stats.team_observations, 1);
+    omp_team_observed = true;
+  }
+  saturating_add(material_omp_stats.eligible_checks, 1);
+  return true;
+#endif
+}
+
+bool geom_epsilon::is_thread_safe() const { return parallel_eligible(false); }
+
+bool geom_epsilon::is_thread_safe_for_sigma() const { return parallel_eligible(true); }
+
+void geom_epsilon::note_parallel_epsilon(size_t points) {
+  saturating_add(material_omp_stats.epsilon_parallel_calls, 1);
+  saturating_add(material_omp_stats.epsilon_parallel_points, static_cast<counter_type>(points));
+}
+
+void geom_epsilon::note_parallel_sigma(size_t points) {
+  saturating_add(material_omp_stats.sigma_parallel_calls, 1);
+  saturating_add(material_omp_stats.sigma_parallel_points, static_cast<counter_type>(points));
 }
 
 void geom_epsilon::set_cond_profile(meep::direction dir, meep::boundary_side side, double L,
@@ -1947,6 +2293,7 @@ if needed */
 geom_epsilon *make_geom_epsilon(meep::structure *s, geometric_object_list *g, vector3 center,
                                 bool _ensure_periodicity, material_type _default_material,
                                 material_type_list extra_materials) {
+  geometry_state_transaction transaction;
   // set global variables in libctlgeom based on data fields in s
   geom_initialize();
   geometry_center = center;
@@ -1989,6 +2336,7 @@ geom_epsilon *make_geom_epsilon(meep::structure *s, geometric_object_list *g, ve
 
   geometry_lattice.size = size;
   geometry_edge = vector3_to_vec(size) * 0.5;
+  commit_geometry_mutation();
 
   if (meep::verbosity > 0) {
     master_printf("Working in %s dimensions.\n", meep::dimension_name(s->gv.dim));
@@ -2006,6 +2354,7 @@ void set_materials_from_geometry(meep::structure *s, geometric_object_list g, ve
                                  bool use_anisotropic_averaging, double tol, int maxeval,
                                  bool _ensure_periodicity, material_type _default_material,
                                  absorber_list alist, material_type_list extra_materials) {
+  geometry_state_transaction transaction;
   meep_geom::geom_epsilon *geps = meep_geom::make_geom_epsilon(s, &g, center, _ensure_periodicity,
                                                                _default_material, extra_materials);
   set_materials_from_geom_epsilon(s, geps, use_anisotropic_averaging, tol, maxeval, alist);
@@ -2017,6 +2366,11 @@ set the materials as specified */
 void set_materials_from_geom_epsilon(meep::structure *s, geom_epsilon *geps,
                                      bool use_anisotropic_averaging, double tol, int maxeval,
                                      absorber_list alist) {
+  geometry_state_transaction transaction;
+  // Parse the exact feature controls and reject a stale safe tree before any
+  // structure material array can be allocated. Unsafe materials simply retain
+  // the reviewed serial path.
+  (void)geps->is_thread_safe();
 
   // store for later use in gradient calculations
   geps->tol = tol;
@@ -2200,6 +2554,7 @@ fragment_stats compute_fragment_stats(
     std::vector<meep::volume> pml_3d_vols_, std::vector<meep::volume> absorber_vols_,
     material_type_list extra_materials_, double tol, int maxeval, bool ensure_per,
     bool eps_averaging) {
+  geometry_state_transaction transaction;
 
   fragment_stats::geom = geom_;
   fragment_stats::dft_data_list = dft_data_list_;
@@ -2227,6 +2582,7 @@ fragment_stats::fragment_stats(geom_box &bx)
 
 void init_libctl(material_type default_mat, bool ensure_per, meep::grid_volume *gv,
                  vector3 cell_size, vector3 cell_center, geometric_object_list *geom_) {
+  geometry_state_transaction transaction;
   geom_initialize();
   set_default_material(default_mat);
   ensure_periodicity = ensure_per;
@@ -2234,6 +2590,7 @@ void init_libctl(material_type default_mat, bool ensure_per, meep::grid_volume *
   dimensions = meep::number_of_directions(gv->dim);
   geometry_lattice.size = cell_size;
   geom_fix_object_list(*geom_);
+  commit_geometry_mutation();
 }
 
 bool fragment_stats::has_non_medium_material() {
@@ -3053,6 +3410,7 @@ void material_grids_addgradient(double *v, size_t ng, size_t nf,
                                 std::vector<meep::dft_fields *> fields_f, double *frequencies,
                                 double scalegrad, meep::grid_volume &gv, geom_epsilon *geps,
                                 double du) {
+  geometry_state_transaction transaction;
   const material_gradient_path gradient_path = configured_material_gradient_path();
   material_gradient_stats gradient_stats;
   /* ------------------------------------------------------------ */
@@ -3270,6 +3628,7 @@ void get_epsilon_grid(geometric_object_list gobj_list, material_type_list mlist,
                       meep::grid_volume gv, vector3 cell_size, vector3 cell_center, int nx,
                       const double *x, int ny, const double *y, int nz, const double *z,
                       std::complex<double> *grid_vals, double frequency) {
+  geometry_state_transaction transaction;
   double min_val[3], max_val[3];
   for (int n = 0; n < 3; ++n) {
     int ndir = (n == 0) ? nx : ((n == 1) ? ny : nz);

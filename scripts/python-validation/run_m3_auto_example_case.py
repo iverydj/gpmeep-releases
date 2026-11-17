@@ -27,11 +27,13 @@ import run_example_oracle as oracle  # noqa: E402
 import run_m3_mpi_example_case as mpi_example  # noqa: E402
 import run_user_workload_matrix as matrix  # noqa: E402
 import run_validation as validation  # noqa: E402
+import gpmeep_backend_guard as backend_guard_contract  # noqa: E402
 from common import (  # noqa: E402
     StableFile,
     WorkloadError,
     absolute_file_record,
     atomic_write_json,
+    durable_publish_terminal,
     file_record,
 )
 
@@ -80,6 +82,66 @@ POLICIES = {
         "classification": "long-horizon-small-domain-cpu-policy",
     },
 }
+
+
+def producer_safe_ambient(
+    output: pathlib.Path, python: pathlib.Path
+) -> dict[str, str]:
+    """Derive the legacy auto-runner ambient from its sealed output tree."""
+
+    output = pathlib.Path(output)
+    python = pathlib.Path(python)
+    if not output.is_absolute() or not python.is_absolute():
+        raise WorkloadError("M3 auto producer paths must be absolute")
+    temporary = output / "lane" / "work"
+    try:
+        if (
+            not output.is_dir()
+            or not temporary.is_dir()
+            or output.resolve(strict=True) != output
+            or temporary.resolve(strict=True) != temporary
+            or not python.is_file()
+            or python.is_symlink()
+            or python.resolve(strict=True) != python
+            or not os.access(python, os.X_OK)
+        ):
+            raise WorkloadError(
+                "M3 auto producer paths must be canonical non-symlink paths"
+            )
+    except OSError as exc:
+        raise WorkloadError(f"M3 auto producer paths are unavailable: {exc}") from exc
+    return {
+        "PATH": f"{python.parent}:/usr/bin:/bin",
+        "TMPDIR": str(temporary),
+        "LC_ALL": "C",
+        "LANG": "C",
+    }
+
+
+def lane_environment(
+    output: pathlib.Path,
+    lane: mpi_example.Lane,
+    paths: dict[str, pathlib.Path],
+    runtime_contract: dict[str, Any],
+    nonce: str,
+) -> dict[str, str]:
+    environment = mpi_example.clean_environment(
+        lane,
+        python=paths["python"],
+        build_python=paths["build_python"],
+        runtime_contract=runtime_contract,
+        run_nonce=nonce,
+        site_guard_expected=False,
+        producer_safe_ambient=producer_safe_ambient(output, paths["python"]),
+    )
+    environment.update(
+        {
+            "MEEP_GPU_BACKEND": "auto",
+            "GPMEEP_VALIDATION_EXPECTED_REQUESTED_BACKEND": "auto",
+        }
+    )
+    environment.pop("GPMEEP_VALIDATION_STRICT_CUDA", None)
+    return environment
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -156,10 +218,20 @@ def _prefixed_object(path: pathlib.Path, prefix: str, label: str) -> dict[str, A
 
 
 def audit_runs(
-    stdout: pathlib.Path, requested_backend: str = "auto"
+    stdout: pathlib.Path,
+    requested_backend: str = "auto",
+    *,
+    upstream_cpu_baseline: bool = False,
+    frozen_v103_baseline: bool = False,
 ) -> list[dict[str, Any]]:
     if requested_backend not in {"cpu", "cuda", "auto"}:
         raise WorkloadError("M3 run audit requested backend differs")
+    if upstream_cpu_baseline and requested_backend != "cpu":
+        raise WorkloadError("M3 upstream audit must request CPU")
+    if upstream_cpu_baseline and frozen_v103_baseline:
+        raise WorkloadError("M3 run audit baseline modes are mutually exclusive")
+    if frozen_v103_baseline and requested_backend not in {"cpu", "cuda"}:
+        raise WorkloadError("frozen v1.0.3 audit requires an explicit CPU/CUDA backend")
     audit = _prefixed_object(stdout, oracle.AUDIT_PREFIX, "M3 auto audit")
     if set(audit) != {"runs"} or not isinstance(audit["runs"], list):
         raise WorkloadError("M3 auto audit schema differs")
@@ -177,6 +249,10 @@ def audit_runs(
         "runtime_counters",
         "run_phase_calls",
         "measurement_phase_calls",
+        "statistics_delta",
+        "field_timing_delta",
+        "backend_guard",
+        "explicit_backend_guard",
     }
     for record in runs:
         if (
@@ -207,10 +283,18 @@ def audit_runs(
             "runtime_device_enumerations",
             "runtime_device_selections",
         }
-        if (
-            not isinstance(runtime, dict)
-            or set(runtime) != expected_runtime_keys
-            or any(type(value) is not int or value < 0 for value in runtime.values())
+        if not isinstance(runtime, dict) or (
+            upstream_cpu_baseline
+            and runtime != {}
+        ) or (
+            not upstream_cpu_baseline
+            and (
+                set(runtime) != expected_runtime_keys
+                or any(
+                    type(value) is not int or value < 0
+                    for value in runtime.values()
+                )
+            )
         ):
             raise WorkloadError("M3 auto run runtime audit differs")
         for name in ("run_phase_calls", "measurement_phase_calls"):
@@ -221,6 +305,122 @@ def audit_runs(
                 or any(type(value) is not int or value < 0 for value in calls.values())
             ):
                 raise WorkloadError(f"M3 auto {name} audit differs")
+        statistics = record["statistics_delta"]
+        if not isinstance(statistics, dict) or (
+            upstream_cpu_baseline and statistics != {}
+        ):
+            raise WorkloadError("M3 run statistics delta differs")
+        for group in statistics.values():
+            if not isinstance(group, dict) or any(
+                type(value) is not int for value in group.values()
+            ):
+                raise WorkloadError("M3 run statistics delta differs")
+        timing = record["field_timing_delta"]
+        if timing is not None:
+            if not isinstance(timing, dict) or not timing:
+                raise WorkloadError("M3 run field timing delta differs")
+            for phase in timing.values():
+                if (
+                    not isinstance(phase, dict)
+                    or set(phase)
+                    != {"per_rank_seconds", "maximum_seconds", "mean_seconds"}
+                    or not isinstance(phase["per_rank_seconds"], list)
+                    or not phase["per_rank_seconds"]
+                ):
+                    raise WorkloadError("M3 run field timing delta differs")
+                values = [
+                    *phase["per_rank_seconds"],
+                    phase["maximum_seconds"],
+                    phase["mean_seconds"],
+                ]
+                if any(
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or not math.isfinite(float(value))
+                    or value < 0
+                    for value in values
+                ):
+                    raise WorkloadError("M3 run field timing delta differs")
+        guard = record["backend_guard"]
+        if (
+            not isinstance(guard, dict)
+            or set(guard)
+            != {
+                "attempts",
+                "acknowledgements",
+                "warning_wall_seconds",
+                "warning_telemetry",
+                "final_telemetry",
+            }
+            or type(guard["attempts"]) is not int
+            or type(guard["acknowledgements"]) is not int
+            or guard["attempts"] not in {1, 2}
+            or guard["acknowledgements"] not in {0, 1}
+            or guard["attempts"] != 1 + guard["acknowledgements"]
+            or isinstance(guard["warning_wall_seconds"], bool)
+            or not isinstance(guard["warning_wall_seconds"], (int, float))
+            or not math.isfinite(float(guard["warning_wall_seconds"]))
+            or guard["warning_wall_seconds"] < 0
+            or guard["warning_telemetry"] is not None
+            and not isinstance(guard["warning_telemetry"], dict)
+            or guard["final_telemetry"] is not None
+            and not isinstance(guard["final_telemetry"], dict)
+        ):
+            raise WorkloadError("M3 run backend guard audit differs")
+        explicit_guard = record["explicit_backend_guard"]
+        if upstream_cpu_baseline or frozen_v103_baseline or requested_backend == "auto":
+            if explicit_guard is not None:
+                raise WorkloadError("historical run has explicit guard evidence")
+        else:
+            expected_reason = None
+            if isinstance(explicit_guard, dict) and explicit_guard.get(
+                "mismatch_observed"
+            ) is True:
+                final = explicit_guard.get("final_telemetry")
+                if isinstance(final, dict):
+                    expected_reason = final.get("acknowledgement_reason")
+            try:
+                backend_guard_contract.validate_evidence(
+                    explicit_guard,
+                    expected_backend=record["active_backend"],
+                    expected_reason=expected_reason,
+                )
+            except backend_guard_contract.BackendGuardEvidenceError as exc:
+                raise WorkloadError(
+                    f"M3 explicit backend guard audit differs: {exc}"
+                ) from exc
+        if upstream_cpu_baseline and (
+            record["active_backend"] != "cpu"
+            or record["execution_diagnostic"] != "upstream-meep-cpu-baseline"
+            or record["run_phase_calls"] != {"cpu": 0, "cuda": 0}
+            or record["measurement_phase_calls"] != {"cpu": 0, "cuda": 0}
+            or guard
+            != {
+                "attempts": 1,
+                "acknowledgements": 0,
+                "warning_wall_seconds": 0.0,
+                "warning_telemetry": None,
+                "final_telemetry": None,
+            }
+        ):
+            raise WorkloadError("M3 upstream CPU audit differs")
+        if frozen_v103_baseline:
+            other = "cuda" if requested_backend == "cpu" else "cpu"
+            if (
+                record["active_backend"] != requested_backend
+                or record["requested_backend"] != requested_backend
+                or record["run_phase_calls"][requested_backend] <= 0
+                or record["run_phase_calls"][other] != 0
+                or guard
+                != {
+                    "attempts": 1,
+                    "acknowledgements": 0,
+                    "warning_wall_seconds": 0.0,
+                    "warning_telemetry": None,
+                    "final_telemetry": None,
+                }
+            ):
+                raise WorkloadError("frozen v1.0.3 strict backend audit differs")
     return runs
 
 
@@ -424,7 +624,7 @@ def _terminal(output: pathlib.Path, report: dict[str, Any]) -> dict[str, Any]:
 def publish_terminal(output: pathlib.Path, report: dict[str, Any]) -> None:
     atomic_write_json(output / "PENDING_COMPLETE", _terminal(output, report))
     verify_complete(output, "PENDING_COMPLETE")
-    os.replace(output / "PENDING_COMPLETE", output / "COMPLETE")
+    durable_publish_terminal(output / "PENDING_COMPLETE", output / "COMPLETE")
 
 
 def verify_complete(output: pathlib.Path, terminal: str = "COMPLETE") -> dict[str, Any]:
@@ -531,20 +731,13 @@ def verify_complete(output: pathlib.Path, terminal: str = "COMPLETE") -> dict[st
         case_command=case_command,
     ):
         raise WorkloadError("M3 auto lane command differs")
-    environment = mpi_example.clean_environment(
+    environment = lane_environment(
+        output,
         expected_lane,
-        python=paths["python"],
-        build_python=paths["build_python"],
-        runtime_contract=snapshot["runtime_contract"],
-        run_nonce=lane["run_nonce"],
+        paths,
+        snapshot["runtime_contract"],
+        lane["run_nonce"],
     )
-    environment.update(
-        {
-            "MEEP_GPU_BACKEND": "auto",
-            "GPMEEP_VALIDATION_EXPECTED_REQUESTED_BACKEND": "auto",
-        }
-    )
-    environment.pop("GPMEEP_VALIDATION_STRICT_CUDA", None)
     if lane["environment_sha256"] != validation.environment_sha256(environment):
         raise WorkloadError("M3 auto environment identity differs")
     process = lane["process"]
@@ -647,20 +840,9 @@ def main(argv: list[str] | None = None) -> int:
         for name in ("statistics", "identity", "work"):
             (root / name).mkdir(parents=True, mode=0o700, exist_ok=False)
         nonce = uuid.uuid4().hex
-        environment = mpi_example.clean_environment(
-            lane,
-            python=paths["python"],
-            build_python=paths["build_python"],
-            runtime_contract=snapshot["runtime_contract"],
-            run_nonce=nonce,
+        environment = lane_environment(
+            output, lane, paths, snapshot["runtime_contract"], nonce
         )
-        environment.update(
-            {
-                "MEEP_GPU_BACKEND": "auto",
-                "GPMEEP_VALIDATION_EXPECTED_REQUESTED_BACKEND": "auto",
-            }
-        )
-        environment.pop("GPMEEP_VALIDATION_STRICT_CUDA", None)
         case_command = validation.case_command(case, paths["python"], paths["repo"])
         command = mpi_example.lane_command(
             lane,

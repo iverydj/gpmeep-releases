@@ -11,36 +11,10 @@ Install gpmeep in its own environment. Installing official `pymeep` into the
 same prefix is unsupported because both distributions provide the `meep`
 module and native `libmeep` ABI.
 
-## Public download availability
-
-This repository currently publishes v1.0.3 source and its tag, not a prebuilt
-Conda asset. Existing binary recipe metadata is awaiting a privacy review.
-`PUBLIC_RELEASE.json` records the accepted original binary's identity, not a
-download promise. The binary installation examples below apply only if you
-already have that exact package and its matching checksum sidecar.
-
-## Building from the public source
-
-On a supported Linux x86-64 build host, use a clean committed clone and a new
-output directory. The script creates an isolated Micromamba package-builder
-environment from the included lock; no system Meep environment is modified.
-
-```sh
-/bin/bash -p scripts/build-conda-package.sh \
-  --jobs 4 --output-dir /absolute/new/path/gpmeep-build
-```
-
-The output package and `.sha256` sidecar are under that directory's
-`linux-64/` subdirectory. For a local build, pass `git rev-parse HEAD` as
-`--expected-source-commit` to the installer, not the original binary commit
-used in the examples below. A local build must still pass the installed
-provenance and CPU/CUDA self-checks; it is not the original checksum-pinned
-release binary.
-
 ## Requirements
 
 - Linux x86-64
-- glibc 2.17 or newer. The v1.0.3 release is built against the 2.17 sysroot
+- glibc 2.17 or newer. The v1.1.0 release is built against the 2.17 sysroot
   and its gpmeep-owned ELF symbol requirements are audited during packaging;
   Ubuntu 22.04/glibc 2.35 is an explicit clean-install qualification target.
 - NVIDIA driver reporting CUDA 12.4 or newer through Conda's `__cuda` virtual
@@ -73,8 +47,7 @@ After downloading the release package and its `.sha256` sidecar into a
 ```sh
 /bin/bash -p scripts/install-gpmeep.sh \
   --prefix /absolute/path/to/gpmeep-v1 \
-  --package downloads/gpmeep-1.0.3-cuda124_mpi_openmpi_py311_0.conda \
-  --expected-source-commit b48c9b678f2316cefa95e48a661f7a877547a000 \
+  --package downloads/gpmeep-1.1.0-cuda124_mpi_openmpi_py311_0.conda \
   --mode gpu1 \
   --gpu-devices 0
 ```
@@ -88,11 +61,9 @@ resolution, verifies provenance, and runs the installed self-check.
 Micromamba's local-package repodata check runs in warning mode only for that
 one `--no-deps` transaction because a direct file has no channel repodata;
 the installer first requires and verifies the package's external SHA-256.
-For the published v1.0.3 package, pass the original binary build commit shown
-above even from a Git clone: a privacy-cleaned public snapshot has a different
-Git commit. Without an explicit override the installer uses clone HEAD, which
-is appropriate only for a package built from that exact commit. Exported
-source trees also require an explicit `--expected-source-commit`.
+When run from a Git clone, the installer automatically requires the embedded
+package source commit to equal that clone's exact HEAD. When using an exported
+source tree, pass the release's full commit with `--expected-source-commit`.
 
 It creates only these caller-selected paths:
 
@@ -137,6 +108,38 @@ Strict selection fails instead of silently falling back:
 mp.gpu.set_backend("cpu")
 mp.gpu.set_backend("cuda")
 ```
+
+In v1.1.0, `auto` is rejected. `Simulation.run` evaluates the explicit choice
+before initialization. If it disagrees with the recommendation, catch
+`meep.backend_policy.BackendRecommendationMismatch`, inspect its telemetry,
+acknowledge its exact challenge with
+`mp.gpu.acknowledge_backend_mismatch(challenge, reason)`, and repeat that run
+once. See [the crossover guide](GPMEEP_GPU_CROSSOVER.md) for the complete
+fail-closed example and acknowledgement scope. The same flow works after
+`Simulation` initialization: an ordered per-rank native state digest binds
+monotonic fields and material-structure mutation epochs plus core solver state.
+Any intervening native step, reload/reset, material/source/component change,
+DFT add/update/load/scale/removal, boundary change, synchronization, or owner
+replacement invalidates the acknowledgement before the repeated run.
+
+This recommendation guard applies to `Simulation.run`, `run_k_point`,
+`solve_cw`, and `solve_eigfreq`. CUDA availability, memory, device mapping, or
+MPI-topology defects raise `BackendEnvironmentError` and cannot be bypassed by
+an acknowledgement. Direct low-level `mp.fields` calls remain explicit and
+fail closed in the C++ engine, but do not have enough `Simulation` metadata for
+the high-level suitability recommendation.
+
+Custom Python callbacks must expose canonicalizable state. gpmeep binds their
+transitive function/descriptor/global/module and iterator/generator
+dependencies, function attributes and annotations, bound-owner state,
+class/MRO slots, container subclasses, and alias/cycle topology. Simulation
+semantic state is included, and material/checkpoint/chunk-layout input files
+are SHA-256 content-bound. Direct static module attributes are supported; a
+module nested behind a container/object and opaque extension state fail closed
+rather than weakening an exact-workload acknowledgement. No raw Python/SWIG
+address or type/name-only fallback can authorize a mismatch. The internal
+adjoint `sourcedata` exception combines its native SHA-256 manifest with
+canonicalized Python proxy attributes.
 
 The environment alternative must be set before Python starts:
 

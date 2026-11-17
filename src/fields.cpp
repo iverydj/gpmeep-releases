@@ -18,7 +18,12 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <iomanip>
 #include <limits>
+#include <locale>
+#include <sstream>
+#include <typeinfo>
+#include <unordered_set>
 #include <utility>
 #include <stdio.h>
 #include <string.h>
@@ -186,7 +191,9 @@ fields::fields(structure *s, double m, double beta, bool zero_fields_near_cylori
       bfast_scaled_k(bfast_scaled_k), beta(beta),
       loop_tile_base_db(checked_loop_tile_base(loop_tile_base_db, "loop_tile_base_db")),
       loop_tile_base_eh(checked_loop_tile_base(loop_tile_base_eh, "loop_tile_base_eh")),
-      working_on(&times_spent) {
+      gpmeep_mutation_epoch_(0), gpmeep_backend_pinned_(false),
+      gpmeep_cpu_backend_fast_path_(false),
+      gpmeep_backend_operation_depth_(0), working_on(&times_spent) {
   shared_chunks = s->shared_chunks;
   components_allocated = false;
   synchronized_magnetic_fields = 0;
@@ -197,6 +204,8 @@ fields::fields(structure *s, double m, double beta, bool zero_fields_near_cylori
   for (int d = 0; d < 5; d++) {
     k[d] = 0.0;
     eikna[d] = 1.0;
+    coskna[d] = 1.0;
+    sinkna[d] = 0.0;
   }
   is_real = 0;
   a = gv.a;
@@ -211,9 +220,11 @@ fields::fields(structure *s, double m, double beta, bool zero_fields_near_cylori
   num_chunks = s->num_chunks;
   typedef fields_chunk *fields_chunk_ptr;
   chunks = new fields_chunk_ptr[num_chunks];
-  for (int i = 0; i < num_chunks; i++)
+  for (int i = 0; i < num_chunks; i++) {
     chunks[i] = new fields_chunk(s->chunks[i], outdir, m, beta, zero_fields_near_cylorigin, i,
                                  loop_tile_base_db, bfast_scaled_k);
+    chunks[i]->gpmeep_fields_owner = this;
+  }
   FOR_FIELD_TYPES(ft) {
     typedef realnum *realnum_ptr;
     comm_blocks[ft] = new realnum_ptr[num_chunks * num_chunks];
@@ -241,6 +252,9 @@ fields::fields(structure *s, double m, double beta, bool zero_fields_near_cylori
 fields::fields(const fields &thef)
     : S(thef.S), gv(thef.gv), user_volume(thef.user_volume), v(thef.v),
       loop_tile_base_db(thef.loop_tile_base_db), loop_tile_base_eh(thef.loop_tile_base_eh),
+      gpmeep_mutation_epoch_(thef.gpmeep_mutation_epoch_),
+      gpmeep_backend_pinned_(false), gpmeep_cpu_backend_fast_path_(false),
+      gpmeep_backend_operation_depth_(0),
       working_on(&times_spent) {
   // Do this before allocating any constructor-owned storage so a CUDA sync
   // failure cannot leak a partially constructed fields object.
@@ -259,6 +273,8 @@ fields::fields(const fields &thef)
   for (int d = 0; d < 5; d++) {
     k[d] = thef.k[d];
     eikna[d] = thef.eikna[d];
+    coskna[d] = thef.coskna[d];
+    sinkna[d] = thef.sinkna[d];
   }
   is_real = thef.is_real;
   a = thef.a;
@@ -273,8 +289,10 @@ fields::fields(const fields &thef)
   num_chunks = thef.num_chunks;
   typedef fields_chunk *fields_chunk_ptr;
   chunks = new fields_chunk_ptr[num_chunks];
-  for (int i = 0; i < num_chunks; i++)
+  for (int i = 0; i < num_chunks; i++) {
     chunks[i] = new fields_chunk(*thef.chunks[i], i);
+    chunks[i]->gpmeep_fields_owner = this;
+  }
   FOR_FIELD_TYPES(ft) {
     typedef realnum *realnum_ptr;
     comm_blocks[ft] = new realnum_ptr[num_chunks * num_chunks];
@@ -305,6 +323,23 @@ fields::~fields() {
   delete sources;
   delete fluxes;
   delete[] outdir;
+  if (gpmeep_backend_pinned_)
+    gpu::detail::unpin_backend_for_owner(this);
+  gpmeep_backend_operation_depth_ = 0;
+  gpmeep_backend_pinned_ = false;
+  gpmeep_cpu_backend_fast_path_ = false;
+}
+
+void fields::gpmeep_release_backend_pin() const noexcept {
+  if (gpmeep_backend_operation_depth_ > 1) {
+    --gpmeep_backend_operation_depth_;
+    return;
+  }
+  gpmeep_backend_operation_depth_ = 0;
+  if (gpmeep_backend_pinned_)
+    gpu::detail::unpin_backend_for_owner(this);
+  gpmeep_backend_pinned_ = false;
+  gpmeep_cpu_backend_fast_path_ = false;
 }
 
 void fields::use_real_fields() {
@@ -312,6 +347,7 @@ void fields::use_real_fields() {
     if (boundaries[High][d] == Periodic && k[d] != 0.0)
       meep::abort("Can't use real fields with bloch boundary conditions!\n");
   }
+  gpmeep_note_state_mutation();
   is_real = 1;
   for (int i = 0; i < num_chunks; i++)
     chunks[i]->use_real_fields();
@@ -479,6 +515,7 @@ fields_chunk::fields_chunk(structure_chunk *the_s, const char *od, double m, dou
     : gv(the_s->gv), v(the_s->v), m(m), zero_fields_near_cylorigin(zero_fields_near_cylorigin),
       bfast_scaled_k(bfast_scaled_k), beta(beta) {
   const size_t tile_base = checked_loop_tile_base(loop_tile_base_db, "loop_tile_base_db");
+  gpmeep_fields_owner = NULL;
   s = the_s;
   chunk_idx = chunkidx;
   s->refcount++;
@@ -536,6 +573,7 @@ fields_chunk::fields_chunk(structure_chunk *the_s, const char *od, double m, dou
 }
 
 fields_chunk::fields_chunk(const fields_chunk &thef, int chunkidx) : gv(thef.gv), v(thef.v) {
+  gpmeep_fields_owner = NULL;
   chunk_idx = chunkidx;
   s = thef.s;
   s->refcount++;
@@ -745,6 +783,9 @@ bool fields_chunk::alloc_f(component c) {
 // allocate fields for components required by any source on any process
 // ... this is needed after calling the low-level fields::add_srcdata
 void fields::require_source_components() {
+  // fix_boundary_sources can move source payloads even when all field
+  // components were already allocated, so invalidate before either path.
+  gpmeep_note_state_mutation();
   fix_boundary_sources(); // needed if add_srcdata put sources on non-owned points
 
   int needed[NUM_FIELD_COMPONENTS];
@@ -789,6 +830,7 @@ bool fields::is_aniso2d() {
 }
 
 void fields::_require_component(component c, bool aniso2d) {
+  gpmeep_note_state_mutation();
   if (!gv.has_field(c))
     meep::abort("cannot require a %s component in a %s grid", component_name(c),
                 dimension_name(gv.dim));
@@ -849,6 +891,7 @@ void fields_chunk::remove_sources() {
 }
 
 void fields::remove_sources() {
+  gpmeep_note_state_mutation();
   for (int i = 0; i < num_chunks; i++)
     chunks[i]->remove_sources();
   delete sources;
@@ -873,12 +916,14 @@ void fields_chunk::remove_susceptibilities(bool shared_chunks) {
 }
 
 void fields::remove_susceptibilities() {
+  gpmeep_note_state_mutation();
   changed_materials = true;
   for (int i = 0; i < num_chunks; i++)
     chunks[i]->remove_susceptibilities(shared_chunks);
 }
 
 void fields::remove_fluxes() {
+  gpmeep_note_state_mutation();
   delete fluxes;
   fluxes = NULL;
 }
@@ -911,6 +956,7 @@ void fields_chunk::zero_fields() {
 }
 
 void fields::zero_fields() {
+  gpmeep_note_state_mutation();
   for (int i = 0; i < num_chunks; i++)
     chunks[i]->zero_fields();
 }
@@ -953,6 +999,7 @@ bool fields::has_nonlinearities(bool parallel) const {
 }
 
 int fields::phase_in_material(const structure *snew, double time) {
+  gpmeep_note_state_mutation();
   if (snew->num_chunks != num_chunks)
     meep::abort("Can only phase in similar sets of chunks: %d vs %d\n", snew->num_chunks,
                 num_chunks);
@@ -1000,11 +1047,13 @@ bool fields::nosize_direction(direction d) const {
 }
 
 void fields::set_solve_cw_omega(complex<double> omega) {
+  gpmeep_note_state_mutation();
   for (int i = 0; i < num_chunks; ++i)
     chunks[i]->set_solve_cw_omega(omega);
 }
 
 void fields::unset_solve_cw_omega() {
+  gpmeep_note_state_mutation();
   for (int i = 0; i < num_chunks; ++i)
     chunks[i]->unset_solve_cw_omega();
 }
@@ -1083,6 +1132,7 @@ bool operator==(const comms_key &lhs, const comms_key &rhs) {
 }
 
 void fields::change_m(double new_m) {
+  gpmeep_note_state_mutation();
   m = new_m;
   if ((new_m != 0) && (is_real)) {
     meep::abort("The simulation must be reinitialized if switching to complex fields!\n");
@@ -1096,5 +1146,122 @@ void fields::change_m(double new_m) {
 }
 
 void fields_chunk::change_m(double new_m) { m = new_m; }
+
+unsigned long long fields::gpmeep_state_epoch() const { return gpmeep_mutation_epoch_; }
+
+void fields::gpmeep_note_state_mutation() {
+  if (gpmeep_mutation_epoch_ == std::numeric_limits<unsigned long long>::max())
+    meep::abort("gpmeep fields mutation epoch exhausted\n");
+  ++gpmeep_mutation_epoch_;
+}
+
+std::string fields::gpmeep_state_manifest() const {
+  std::ostringstream out;
+  out.imbue(std::locale::classic());
+  const auto write_double = [&out](double value) {
+    out << '\"' << std::hexfloat << value << std::defaultfloat << '\"';
+  };
+  const auto write_complex = [&out, &write_double](
+                                 const std::complex<double> &value) {
+    out << '[';
+    write_double(value.real());
+    out << ',';
+    write_double(value.imag());
+    out << ']';
+  };
+  out << "{\"schema\":\"gpmeep-fields-state-v2\",\"epoch\":"
+      << gpmeep_mutation_epoch_ << ",\"t\":" << t
+      << ",\"phasein_time\":" << phasein_time << ",\"is_real\":" << is_real
+      << ",\"components_allocated\":" << (components_allocated ? "true" : "false")
+      << ",\"synchronized_magnetic_fields\":" << synchronized_magnetic_fields
+      << ",\"changed_materials\":" << (changed_materials ? "true" : "false")
+      << ",\"chunk_connections_valid\":"
+      << (chunk_connections_valid ? "true" : "false") << ",\"m\":";
+  write_double(m);
+  out << ",\"beta\":";
+  write_double(beta);
+  out << ",\"a\":";
+  write_double(a);
+  out << ",\"dt\":";
+  write_double(dt);
+  out << ",\"num_chunks\":" << num_chunks
+      << ",\"shared_chunks\":" << (shared_chunks ? "true" : "false")
+      << ",\"loop_tile_base_db\":" << loop_tile_base_db
+      << ",\"loop_tile_base_eh\":" << loop_tile_base_eh
+      << ",\"bfast_scaled_k\":[";
+  for (size_t index = 0; index < bfast_scaled_k.size(); ++index) {
+    if (index) out << ',';
+    write_double(bfast_scaled_k[index]);
+  }
+  out << "],\"k\":[";
+  for (int d = 0; d < 5; ++d) {
+    if (d) out << ',';
+    out << '[';
+    write_double(k[d].real());
+    out << ',';
+    write_double(k[d].imag());
+    out << ']';
+  }
+  out << "],\"eikna\":[";
+  for (int d = 0; d < 5; ++d) {
+    if (d) out << ',';
+    out << '[';
+    write_double(eikna[d].real());
+    out << ',';
+    write_double(eikna[d].imag());
+    out << ']';
+  }
+  out << "],\"coskna\":[";
+  for (int d = 0; d < 5; ++d) {
+    if (d) out << ',';
+    write_double(coskna[d]);
+  }
+  out << "],\"sinkna\":[";
+  for (int d = 0; d < 5; ++d) {
+    if (d) out << ',';
+    write_double(sinkna[d]);
+  }
+  out << "],\"boundaries\":[";
+  for (int b = 0; b < 2; ++b)
+    for (int d = 0; d < 5; ++d) {
+      if (b || d) out << ',';
+      out << static_cast<int>(boundaries[b][d]);
+    }
+  out << "],\"sources\":[";
+  std::unordered_set<const src_time *> seen_sources;
+  bool first_source = true;
+  std::size_t external_source_count = 0;
+  for (const src_time *source = sources; source; source = source->next) {
+    if (!seen_sources.insert(source).second) {
+      throw std::runtime_error(
+          "native source list contains an ownership cycle");
+    }
+    if (!first_source) out << ',';
+    first_source = false;
+    const bool has_external_state = source->gpmeep_external_state() != NULL;
+    if (has_external_state) ++external_source_count;
+    out << "{\"identity\":\"0x" << std::hex
+        << reinterpret_cast<std::uintptr_t>(source) << std::dec
+        << "\",\"type\":\"" << typeid(*source).name()
+        << "\",\"id\":" << source->id
+        << ",\"is_integrated\":"
+        << (source->is_integrated ? "true" : "false")
+        << ",\"has_external_state\":"
+        << (has_external_state ? "true" : "false")
+        << ",\"frequency\":";
+    write_complex(source->frequency());
+    out << ",\"fwidth\":";
+    write_double(source->get_fwidth());
+    out << ",\"last_time\":";
+    write_double(source->last_time());
+    out << ",\"current\":";
+    write_complex(source->current());
+    out << ",\"dipole\":";
+    write_complex(source->dipole());
+    out << '}';
+  }
+  out << "],\"external_source_count\":" << external_source_count << '}';
+  return out.str();
+}
 
 } // namespace meep

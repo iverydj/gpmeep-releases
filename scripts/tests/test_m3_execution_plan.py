@@ -117,6 +117,19 @@ class M3ExecutionPlanTests(unittest.TestCase):
         with self.assertRaisesRegex(Exception, "execution policy differs"):
             PLAN.parse_host(changed)
 
+    def test_host_record_has_checkpoint_stable_json_sequence(self) -> None:
+        unit = PLAN.parse_host(host_rows())[0]
+        record = PLAN._unit_record(unit)
+        self.assertIs(type(record["covers_examples"]), list)
+        self.assertEqual(
+            record["covers_examples"],
+            ["python/examples/mpb_a.py", "python/examples/mpb_b.py"],
+        )
+
+        import json
+
+        self.assertEqual(record, json.loads(json.dumps(record)))
+
 
 if __name__ == "__main__":
     unittest.main()

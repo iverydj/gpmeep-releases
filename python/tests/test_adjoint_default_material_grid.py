@@ -1,3 +1,4 @@
+import contextlib
 import json
 import os
 import subprocess
@@ -10,6 +11,30 @@ import numpy as np
 
 import meep as mp
 import meep.adjoint as mpa
+from meep import backend_policy
+
+
+@contextlib.contextmanager
+def recommend_selected_backend_for_scientific_qualification():
+    """Keep this fixture focused on adjoint/finite-difference correctness.
+
+    The public backend-policy suites separately exercise the exact first-run
+    acknowledgement and bounded process-local reuse on initialized CPU, CUDA,
+    and MPI simulations.  Patching
+    ``Simulation.run`` here would itself be a scientifically relevant user
+    class mutation and must be fingerprinted transitively by the v1.1 guard.
+    """
+    original_decision = backend_policy._policy_decision
+    selected_backend = mp.gpu.requested_backend
+    backend_policy._policy_decision = lambda _records: (
+        selected_backend,
+        "hardware_crossover",
+        "high",
+    )
+    try:
+        yield
+    finally:
+        backend_policy._policy_decision = original_decision
 
 
 class TestAdjointDefaultMaterialGrid(unittest.TestCase):
@@ -75,7 +100,10 @@ class TestAdjointDefaultMaterialGrid(unittest.TestCase):
                 design_regions=[design_region],
                 frequencies=[1 / 1.55],
             )
-            value, gradient = problem([weights], need_gradient=need_gradient)
+            with recommend_selected_backend_for_scientific_qualification():
+                value, gradient = problem(
+                    [weights], need_gradient=need_gradient
+                )
             objective_value = float(np.asarray(value).reshape(-1)[0])
             if not need_gradient:
                 return objective_value, None
@@ -230,6 +258,7 @@ problem = mpa.OptimizationProblem(
     minimum_run_time=0.5,
     maximum_run_time=0.5,
 )
+mp.gpu.set_backend("cpu")
 problem([material_grid.weights], need_gradient=True)
 """
         cases = (

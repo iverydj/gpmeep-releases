@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Replay and seal the complete M1--M3 gpmeep release evidence closure."""
+"""Replay the historical pre-v1.1 M1--M3 evidence closure.
+
+This module is retained only to replay already published evidence.  It is not
+valid release authority for gpmeep v1.1 because its performance component used
+the removed automatic-backend experiment.  New v1.1 evidence must use the
+explicit-policy controller and the current M3 runbook.
+"""
 
 from __future__ import annotations
 
@@ -36,6 +42,7 @@ from common import (  # noqa: E402
     absolute_file_record,
     atomic_write_json,
     atomic_write_text,
+    durable_publish_terminal,
     file_record,
 )
 
@@ -77,6 +84,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--specialized-output", required=True, type=pathlib.Path)
     parser.add_argument("--performance-output", required=True, type=pathlib.Path)
     parser.add_argument("--output", required=True, type=pathlib.Path)
+    parser.add_argument(
+        "--historical-replay-only",
+        action="store_true",
+        help="required acknowledgement that this output cannot authorize v1.1",
+    )
     return parser.parse_args(argv)
 
 
@@ -1550,22 +1562,41 @@ def _terminal_payload(output: pathlib.Path) -> dict[str, Any]:
     return {
         "schema": COMPLETE_SCHEMA,
         "outcome": "PASS",
+        "authority": "HISTORICAL_NON_RELEASE",
+        "release_eligible": False,
         "report": file_record(output / "report.json", output),
         "markdown": file_record(output / "report.md", output),
     }
 
 
 def verify_complete(
-    output: pathlib.Path, terminal_name: str = "M3_COMPLETE"
+    output: pathlib.Path,
+    terminal_name: str = "M3_COMPLETE",
+    *,
+    historical_replay_only: bool = False,
 ) -> dict[str, Any]:
+    if historical_replay_only is not True:
+        raise WorkloadError(
+            "historical M3 aggregation requires explicit non-release replay authority"
+        )
     output = output.resolve(strict=True)
     if terminal_name not in {"M3_COMPLETE", "PENDING_M3_COMPLETE"}:
         raise WorkloadError("M3 aggregate terminal filename differs")
     terminal = _load_json(output / terminal_name, "M3 aggregate terminal")
     if (
-        set(terminal) != {"schema", "outcome", "report", "markdown"}
+        set(terminal)
+        != {
+            "schema",
+            "outcome",
+            "authority",
+            "release_eligible",
+            "report",
+            "markdown",
+        }
         or terminal.get("schema") != COMPLETE_SCHEMA
         or terminal.get("outcome") != "PASS"
+        or terminal.get("authority") != "HISTORICAL_NON_RELEASE"
+        or terminal.get("release_eligible") is not False
     ):
         raise WorkloadError("M3 aggregate terminal is not an exact PASS")
     report = matrix.load_stable_json_record(
@@ -1615,8 +1646,12 @@ def verify_complete(
 
 def publish_terminal(output: pathlib.Path) -> None:
     atomic_write_json(output / "PENDING_M3_COMPLETE", _terminal_payload(output))
-    verify_complete(output, "PENDING_M3_COMPLETE")
-    os.replace(output / "PENDING_M3_COMPLETE", output / "M3_COMPLETE")
+    verify_complete(
+        output,
+        "PENDING_M3_COMPLETE",
+        historical_replay_only=True,
+    )
+    durable_publish_terminal(output / "PENDING_M3_COMPLETE", output / "M3_COMPLETE")
 
 
 def validate_output(output: pathlib.Path, contract: dict[str, Any]) -> pathlib.Path:
@@ -1639,6 +1674,11 @@ def validate_output(output: pathlib.Path, contract: dict[str, Any]) -> pathlib.P
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    if not args.historical_replay_only:
+        raise WorkloadError(
+            "historical automatic-backend aggregation cannot authorize gpmeep v1.1; "
+            "pass --historical-replay-only only when replaying prior evidence"
+        )
     contract = build_contract(args)
     output = validate_output(args.output, contract)
     output.parent.mkdir(parents=True, exist_ok=True)

@@ -1,0 +1,114 @@
+{
+  "schema": "gpmeep-v110-m4-equal-work-plan-v1",
+  "release_train": "1.1.0",
+  "purpose": "same-host CPU versus frozen-v1.0.3-CUDA versus candidate-v1.1.0-CUDA comparison",
+  "source_policy": {
+    "entrypoint_bytes": "exact-v1.1.0-candidate-commit",
+    "same_entrypoint_bytes_for_every_runtime": true,
+    "same_arguments_physics_precision_and_stopping_condition": true,
+    "precision": "fp32",
+    "profiler_free_primary_wall_time": true
+  },
+  "frozen_v103": {
+    "package_name": "gpmeep-1.0.3-cuda124_mpi_openmpi_py311_0.conda",
+    "package_sha256": "fd834ca51019ce2f18b26cb1f7252933205e008cdf1b2d9598b54e58ea37ebf3",
+    "provenance_report_sha256": "c8598f275ce328d9c02a971061e29fc2864f6707a49f39cda0d3c7901158a0cd",
+    "provenance_report_id": "6c5d6e8266a33f8b6b85fa8b5b54c539e5519d74a0ed0cc58eb25b20e0f1cb17",
+    "source_commit": "b48c9b678f2316cefa95e48a661f7a877547a000",
+    "rebuild_permitted": false,
+    "fresh_dedicated_prefix_required": true
+  },
+  "lanes": [
+    {
+      "id": "upstream_meep_cpu",
+      "runtime": "upstream_meep",
+      "backend": "cpu",
+      "topology": "physical_cpu8_except_declared_cpu1"
+    },
+    {
+      "id": "gpmeep_v110_cpu",
+      "runtime": "gpmeep_v110_candidate",
+      "backend": "cpu",
+      "topology": "physical_cpu8_except_declared_cpu1"
+    },
+    {
+      "id": "gpmeep_v103_cuda_gpu1",
+      "runtime": "gpmeep_v103_frozen",
+      "backend": "cuda",
+      "topology": "gpu1"
+    },
+    {
+      "id": "gpmeep_v110_cuda_gpu1",
+      "runtime": "gpmeep_v110_candidate",
+      "backend": "cuda",
+      "topology": "gpu1"
+    },
+    {
+      "id": "gpmeep_v103_cuda_gpu2",
+      "runtime": "gpmeep_v103_frozen",
+      "backend": "cuda",
+      "topology": "gpu2",
+      "only_when_gpu2_relevant": true
+    },
+    {
+      "id": "gpmeep_v110_cuda_gpu2",
+      "runtime": "gpmeep_v110_candidate",
+      "backend": "cuda",
+      "topology": "gpu2",
+      "only_when_gpu2_relevant": true
+    }
+  ],
+  "cycles": [
+    {"index": 0, "kind": "warmup", "case_order": "forward", "lane_order": "forward"},
+    {"index": 1, "kind": "measured", "case_order": "forward", "lane_order": "forward"},
+    {"index": 2, "kind": "measured", "case_order": "reverse", "lane_order": "reverse"}
+  ],
+  "cases": [
+    {
+      "path": "python/examples/phase_in_material.py",
+      "cpu_ranks": 8,
+      "gpu2": false,
+      "timing": "sum-all-simulation-run-wall-seconds",
+      "fixed_work": {
+        "environment": "GPMEEP_PHASE_IN_MATERIAL_FIXED_WORK",
+        "value": "1",
+        "phase_time": 200.0,
+        "run_count": 2,
+        "final_timestep": 4000,
+        "total_timestep_delta": 8000,
+        "purpose": "stable timing and one-second external GPU process observability"
+      }
+    },
+    {"path": "python/examples/material-dispersion.py", "cpu_ranks": 1, "gpu2": false, "timing": "sum-all-simulation-run-wall-seconds"},
+    {"path": "python/examples/refl-quartz.py", "cpu_ranks": 8, "gpu2": false, "timing": "sum-all-simulation-run-wall-seconds"},
+    {"path": "python/examples/waveguide_crossing.py", "cpu_ranks": 8, "gpu2": false, "timing": "sum-all-simulation-run-wall-seconds"},
+    {"path": "python/examples/adjoint_optimization/multilayer_opt.py", "cpu_ranks": 8, "gpu2": false, "timing": "sum-all-simulation-run-wall-seconds"},
+    {"path": "python/examples/absorber-1d.py", "cpu_ranks": 8, "gpu2": false, "timing": "sum-all-simulation-run-wall-seconds"},
+    {"path": "python/examples/parallel-wvgs-force.py", "cpu_ranks": 8, "gpu2": false, "timing": "sum-all-simulation-run-wall-seconds"},
+    {"path": "python/examples/antenna_pec_ground_plane_1D.py", "cpu_ranks": 8, "gpu2": false, "timing": "sum-all-simulation-run-wall-seconds"},
+    {"path": "python/examples/3rd-harm-1d.py", "cpu_ranks": 8, "gpu2": false, "timing": "sum-all-simulation-run-wall-seconds"},
+    {"path": "python/examples/adjoint_optimization/near2far_3d_validation.py", "cpu_ranks": 8, "gpu2": true, "timing": "sum-all-simulation-run-wall-seconds"},
+    {"path": "python/examples/edge_emitter_3D.py", "cpu_ranks": 8, "gpu2": true, "timing": "sum-all-simulation-run-wall-seconds"},
+    {"path": "python/examples/dipole_in_vacuum_cyl_off_axis.py", "cpu_ranks": 8, "gpu2": true, "timing": "sum-all-simulation-run-wall-seconds"},
+    {"path": "python/tests/test_adjoint_cyl.py", "cpu_ranks": 8, "gpu2": true, "timing": "sum-all-simulation-run-wall-seconds"}
+  ],
+  "execution_counts": {
+    "per_cycle": 60,
+    "all_cycles": 180,
+    "measured": 120
+  },
+  "reporting": {
+    "measured_repetitions": 2,
+    "retain_raw_seconds": true,
+    "required_ratios": [
+      "upstream_cpu_over_v103_cuda",
+      "upstream_cpu_over_v110_cuda",
+      "v103_cuda_over_v110_cuda",
+      "v110_cpu_over_v110_cuda"
+    ],
+    "keep_upstream_and_v110_cpu_distinct": true,
+    "unavailable_phase_seconds_are_null": true,
+    "numerical_oracle_required": true,
+    "zero_cpu_fallback_required_for_cuda": true
+  }
+}

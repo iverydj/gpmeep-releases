@@ -18,7 +18,7 @@ import stat
 from typing import Any
 
 
-DISTRIBUTION_VERSION = "1.0.3"
+DISTRIBUTION_VERSION = "1.1.0"
 RELEASE_MANIFEST_SCHEMA_VERSION = 3
 GLIBC_MINIMUM = "2.17"
 GLIBC_AUDIT_SCHEMA = "gpmeep-glibc-compatibility-v1"

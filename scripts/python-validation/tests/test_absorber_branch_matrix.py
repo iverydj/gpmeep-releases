@@ -48,10 +48,17 @@ class AbsorberBranchMatrixTests(unittest.TestCase):
             example = pathlib.Path(directory) / "absorber.py"
             example.touch()
             previous_argv = sys.argv
+            previous_contents = list(previous_argv)
+
+            def identity_run_path(path: str, *, run_name: str):
+                self.assertIs(sys.argv, previous_argv)
+                return self.fake_run_path(path, run_name=run_name)
+
             result = WRAPPER.run_branch_matrix(
-                self.make_args(example), run_path=self.fake_run_path
+                self.make_args(example), run_path=identity_run_path
             )
         self.assertIs(sys.argv, previous_argv)
+        self.assertEqual(sys.argv, previous_contents)
         np.testing.assert_array_equal(result["absorber_branch_codes"], [0, 1])
         self.assertEqual(result["absorber_trace_fields"].shape, (2, 4096))
         self.assertLess(result["absorber_branch_relative_error"][0], 0.02)
@@ -106,6 +113,23 @@ class AbsorberBranchMatrixTests(unittest.TestCase):
                 WRAPPER.run_branch_matrix(
                     self.make_args(example), run_path=bad_run_path
                 )
+
+    def test_exception_restores_exact_argv_object_and_contents(self):
+        with tempfile.TemporaryDirectory() as directory:
+            example = pathlib.Path(directory) / "absorber.py"
+            example.touch()
+            previous_argv = sys.argv
+            previous_contents = list(previous_argv)
+
+            def failing_run_path(_path: str, *, run_name: str):
+                self.assertEqual(run_name, "__main__")
+                self.assertIs(sys.argv, previous_argv)
+                raise RuntimeError("synthetic nested failure")
+
+            with self.assertRaisesRegex(RuntimeError, "synthetic nested failure"):
+                WRAPPER.execute(example, (), False, run_path=failing_run_path)
+        self.assertIs(sys.argv, previous_argv)
+        self.assertEqual(sys.argv, previous_contents)
 
 
 if __name__ == "__main__":

@@ -61,6 +61,7 @@ from gpmeep_qualification_contract import (  # noqa: E402
     QualificationContractError,
     validate_v2_receipt,
 )
+import gpmeep_backend_guard as backend_guard  # noqa: E402
 
 
 SCHEMA_VERSION = 2
@@ -81,6 +82,25 @@ EXIT_COMPARISON_FAILED = 3
 EXIT_BLOCKED = 4
 EXIT_BACKEND_CONTRACT = 5
 EXIT_EVIDENCE_INTEGRITY = 6
+BACKEND_GUARD_OWNER_FILENAMES = (
+    "run_example_oracle.py", "run_point_dipole_cyl_validation.py"
+)
+BACKEND_GUARD_OWNER_PATHS = frozenset(
+    str(SCRIPT_SELF_DIR / name) for name in BACKEND_GUARD_OWNER_FILENAMES
+)
+BACKEND_GUARD_OWNER_IDENTITIES = {
+    path: (
+        info.st_mode,
+        info.st_dev,
+        info.st_ino,
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+    )
+    for path in BACKEND_GUARD_OWNER_PATHS
+    for info in (os.lstat(path),)
+}
+BACKEND_ACKNOWLEDGEMENT_OPTION = "--acknowledge-backend-mismatch-reason"
 MAX_INLINE_JSON_METRICS = 4096
 MAX_INLINE_JSON_BYTES = 1024 * 1024
 # Small payloads retain the canonical external-sort path so historical report
@@ -411,6 +431,20 @@ def strict_utf8(value: str, description: str) -> bytes:
         return value.encode("utf-8")
     except UnicodeEncodeError as exc:
         raise ManifestError(f"{description} is not valid UTF-8") from exc
+
+
+def acknowledgement_reason(value: str) -> str:
+    try:
+        encoded = value.encode("utf-8", errors="strict")
+    except UnicodeEncodeError as exc:
+        raise argparse.ArgumentTypeError(
+            "acknowledgement reason must be valid UTF-8 text"
+        ) from exc
+    if not 8 <= len(encoded) <= 512:
+        raise argparse.ArgumentTypeError(
+            "acknowledgement reason must occupy 8 to 512 UTF-8 bytes"
+        )
+    return value
 
 
 def python_package_probe(
@@ -1753,6 +1787,100 @@ def case_command(case: dict[str, Any], python: pathlib.Path, repo: pathlib.Path)
     raise ManifestError(f"{case['path']}: cannot form command")
 
 
+def backend_guard_owner_position(
+    command: list[str], owner_paths: frozenset[str]
+) -> int | None:
+    """Match exact owner paths without consulting a live execution filesystem.
+
+    Archive replay supplies paths derived from its bound build receipt; live
+    execution additionally checks the selected owner's captured file identity.
+    """
+
+    owner_indices = []
+    for index, value in enumerate(command):
+        if not isinstance(value, str):
+            raise ManifestError("backend guard command contains a non-string token")
+        if value in owner_paths:
+            owner_indices.append(index)
+    if len(owner_indices) > 1:
+        raise ManifestError(
+            "backend mismatch acknowledgement found multiple validation guard owners"
+        )
+    if owner_indices and owner_indices[0] != 1:
+        raise ManifestError(
+            "backend mismatch acknowledgement guard owner is not command[1]"
+        )
+    return owner_indices[0] if owner_indices else None
+
+
+def backend_guard_owner_index(command: list[str]) -> int | None:
+    """Return the live guard owner only if its captured identity still matches."""
+
+    index = backend_guard_owner_position(command, BACKEND_GUARD_OWNER_PATHS)
+    if index is None:
+        return None
+    value = command[index]
+    try:
+        info = os.lstat(value)
+    except OSError as exc:
+        raise ManifestError(
+            "backend mismatch acknowledgement guard owner is unavailable"
+        ) from exc
+    identity = (
+        info.st_mode,
+        info.st_dev,
+        info.st_ino,
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+    )
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or identity != BACKEND_GUARD_OWNER_IDENTITIES[value]
+    ):
+        raise ManifestError(
+            "backend mismatch acknowledgement guard owner identity differs"
+        )
+    return index
+
+
+def reject_preexisting_backend_acknowledgement(
+    command: list[str], *, reject_abbreviations: bool
+) -> None:
+    for value in command:
+        if not isinstance(value, str):
+            raise ManifestError("backend guard command contains a non-string token")
+        option = value.partition("=")[0]
+        proper_prefix = (
+            reject_abbreviations
+            and option.startswith("--")
+            and len(option) > 2
+            and option != BACKEND_ACKNOWLEDGEMENT_OPTION
+            and BACKEND_ACKNOWLEDGEMENT_OPTION.startswith(option)
+        )
+        if option == BACKEND_ACKNOWLEDGEMENT_OPTION or proper_prefix:
+            raise ManifestError(
+                "case command contains a pre-existing backend acknowledgement"
+            )
+
+
+def command_with_backend_acknowledgement(
+    command: list[str], reason: str | None
+) -> list[str]:
+    index = backend_guard_owner_index(command)
+    reject_preexisting_backend_acknowledgement(
+        command, reject_abbreviations=index is not None
+    )
+    if reason is None or index is None:
+        return list(command)
+    return [
+        *command[: index + 1],
+        BACKEND_ACKNOWLEDGEMENT_OPTION,
+        reason,
+        *command[index + 1 :],
+    ]
+
+
 def read_stats(path: pathlib.Path) -> dict[str, Any]:
     if not path.is_file():
         return {"capture_status": "missing"}
@@ -1989,6 +2117,9 @@ def validate_phase_counters(stats: dict[str, Any]) -> list[str]:
 def verify_backend_contract(
     case: dict[str, Any], backend: str, stats: dict[str, Any],
     expected_runtime: dict[str, Any], run_nonce: str,
+    backend_acknowledgement_reason: str | None = None,
+    site_guard_expected: bool = False,
+    gpu_observation: dict[str, Any] | None = None,
 ) -> tuple[bool, list[str]]:
     problems: list[str] = []
     if stats.get("capture_status") != "captured":
@@ -2008,6 +2139,52 @@ def verify_backend_contract(
     expected_strict = backend == "cuda"
     if stats.get("strict_cuda_marker") is not expected_strict:
         problems.append("strict CUDA marker does not match the backend")
+    if gpu_observation is not None:
+        observation = stats.get("gpu_observation", {})
+        if (
+            backend != "cuda"
+            or observation.get("schema") != "gpmeep-correctness-gpu-observation-v1"
+            or observation.get("state") != "OBSERVED"
+            or observation.get("configuration") != gpu_observation
+            or observation.get("pid") != stats.get("pid")
+            or observation.get("run_nonce") != run_nonce
+            or set(observation.get("samples", {})) != {"host", "gpu"}
+        ):
+            problems.append("CUDA child observation barrier evidence differs")
+    guard_record = stats.get("backend_guard")
+    if not isinstance(guard_record, dict):
+        problems.append("validation backend-guard evidence is absent")
+    elif site_guard_expected:
+        if (
+            guard_record.get("schema")
+            != "gpmeep-validation-backend-guard-events-v2"
+            or guard_record.get("mode") != "reason-bound-policy-scope"
+            or guard_record.get("reason") != backend_acknowledgement_reason
+            or not isinstance(guard_record.get("events"), list)
+            or not guard_record["events"]
+            or len(guard_record["events"]) > 4096
+        ):
+            problems.append("reason-bound validation backend-guard evidence differs")
+        else:
+            for index, event in enumerate(guard_record["events"]):
+                try:
+                    backend_guard.validate_evidence(
+                        event,
+                        expected_backend=backend,
+                        expected_reason=backend_acknowledgement_reason,
+                    )
+                except backend_guard.BackendGuardEvidenceError as exc:
+                    problems.append(
+                        f"validation backend-guard event {index} differs: {exc}"
+                    )
+    elif (
+        guard_record.get("schema")
+        != "gpmeep-validation-backend-guard-events-v2"
+        or guard_record.get("mode") != "disabled"
+        or guard_record.get("reason") is not None
+        or guard_record.get("events") != []
+    ):
+        problems.append("disabled validation backend-guard evidence differs")
     for name in ("python_executable", "meep_module", "extension", "libmeep"):
         expected = expected_runtime.get(name)
         actual = stats.get(name)
@@ -4735,6 +4912,8 @@ def run_backend(
     hook_dir: pathlib.Path,
     result_dir: pathlib.Path,
     expected_runtime: dict[str, Any],
+    backend_acknowledgement_reason: str | None = None,
+    gpu_observation: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     safe_id = case_directory_id(case["id"])
     case_dir = result_dir / "runs" / safe_id / backend
@@ -4832,8 +5011,23 @@ def run_backend(
         # In gpmeep, selecting "cuda" is the strict mode: unsupported work must
         # throw rather than fall back.  This marker is recorded by the hook too.
         env["GPMEEP_VALIDATION_STRICT_CUDA"] = "1"
+        if gpu_observation is not None:
+            env["GPMEEP_VALIDATION_GPU_OBSERVATION"] = json.dumps(
+                gpu_observation, sort_keys=True, separators=(",", ":")
+            )
 
-    command = case_command(case, python, repo)
+    base_command = case_command(case, python, repo)
+    oracle_owned_guard = backend_guard_owner_index(base_command) is not None
+    site_guard_expected = bool(
+        backend_acknowledgement_reason is not None and not oracle_owned_guard
+    )
+    if site_guard_expected:
+        env["GPMEEP_VALIDATION_BACKEND_ACKNOWLEDGEMENT_REASON"] = (
+            backend_acknowledgement_reason
+        )
+    command = command_with_backend_acknowledgement(
+        base_command, backend_acknowledgement_reason
+    )
     started_at_utc = utc_now()
     started = time.monotonic()
     capture = run_bounded_process(
@@ -4930,7 +5124,14 @@ def run_backend(
     )
     skips_ok = skips <= allowed_skips and skip_identity_ok
     contract_ok, contract_problems = verify_backend_contract(
-        case, backend, stats, expected_runtime, run_nonce
+        case,
+        backend,
+        stats,
+        expected_runtime,
+        run_nonce,
+        backend_acknowledgement_reason,
+        site_guard_expected,
+        gpu_observation if backend == "cuda" else None,
     )
     outcome = "PASS"
     if timeout:
@@ -4951,6 +5152,10 @@ def run_backend(
         outcome = "PASS_WITH_DECLARED_SKIPS"
     return {
         "backend": backend,
+        "backend_acknowledgement_requested": (
+            backend_acknowledgement_reason is not None
+        ),
+        "backend_acknowledgement_reason": backend_acknowledgement_reason,
         "command": command,
         "cwd": work_dir.resolve().relative_to(result_dir.resolve()).as_posix(),
         "evidence_case_directory": safe_id,
@@ -5499,8 +5704,44 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             "explicitly invalid for a speed gate"
         ),
     )
+    parser.add_argument(
+        "--acknowledge-backend-mismatch-reason",
+        type=acknowledgement_reason,
+        help=(
+            "explicit M3 classification opt-in: acknowledge each exact "
+            "generic-example CPU/CUDA recommendation mismatch after its "
+            "first mutation-free rejection"
+        ),
+    )
     parser.add_argument("--list", action="store_true", help="list materialized inventory")
+    parser.add_argument("--gpu-observation-directory", type=pathlib.Path,
+                        help="paired correctness only: wait for live host/GPU observations before child exit")
+    parser.add_argument("--gpu-observation-label")
+    parser.add_argument("--gpu-observation-uuid")
+    parser.add_argument("--gpu-observation-timeout-seconds", type=float)
     return parser.parse_args(argv)
+
+
+def gpu_observation_configuration(args) -> dict[str, Any] | None:
+    values = (args.gpu_observation_directory, args.gpu_observation_label,
+              args.gpu_observation_uuid, args.gpu_observation_timeout_seconds)
+    if all(value is None for value in values):
+        return None
+    if any(value is None for value in values):
+        raise ManifestError("all four GPU observation options are required")
+    directory, label, gpu_uuid, timeout = values
+    if (not directory.is_absolute() or directory.resolve() != directory
+            or not label or re.fullmatch(r"GPU-[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", gpu_uuid) is None
+            or not math.isfinite(timeout) or not 1 <= timeout <= 210):
+        raise ManifestError("GPU observation identity/path/timeout is invalid")
+    raw = pathlib.Path("/proc/self/stat").read_text()
+    return {
+        "root_pid": os.getpid(),
+        "root_start_time_ticks": int(raw[raw.rfind(")") + 2:].split()[19]),
+        "label": label, "gpu_uuid": gpu_uuid, "timeout_seconds": timeout,
+        "host_stream": str(directory / "host.jsonl"),
+        "gpu_stream": str(directory / "gpu.jsonl"),
+    }
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -5517,6 +5758,7 @@ def main(argv: list[str] | None = None) -> int:
         else repo / "artifacts" / "python-validation" / timestamp
     )
     try:
+        gpu_observation = gpu_observation_configuration(args)
         manifest = load_json(manifest_path)
         cases = materialize_cases(manifest, repo)
         if not args.list:
@@ -5618,6 +5860,8 @@ def main(argv: list[str] | None = None) -> int:
             result["runs"][backend] = run_backend(
                 case, backend, repo, python, build_python, hook_dir, output,
                 start_snapshot["runtime_contract"],
+                args.acknowledge_backend_mismatch_reason,
+                gpu_observation,
             )
         result["comparison"] = compare_runs(case, result["runs"], output)
         failed_runs = [

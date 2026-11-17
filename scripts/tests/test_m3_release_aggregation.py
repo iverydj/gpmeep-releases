@@ -21,8 +21,8 @@ sys.modules[SPEC.name] = AGGREGATE
 SPEC.loader.exec_module(AGGREGATE)
 
 
-GPU0 = "GPU-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
-GPU1 = "GPU-11111111-2222-3333-4444-555555555555"
+GPU0 = "GPU-00000000-0000-0000-0000-000000009001"
+GPU1 = "GPU-00000000-0000-0000-0000-000000009002"
 RECEIPT = "a" * 64
 CPU_RECEIPT = "b" * 64
 SOURCE_SHA = "c" * 64
@@ -676,7 +676,13 @@ class M3ReleaseAggregationTests(unittest.TestCase):
             (output / "report.md").write_text("fixture\n")
             observations = []
 
-            def verify(path, terminal_name="M3_COMPLETE"):
+            def verify(
+                path,
+                terminal_name="M3_COMPLETE",
+                *,
+                historical_replay_only=False,
+            ):
+                self.assertTrue(historical_replay_only)
                 observations.append(
                     (
                         terminal_name,
@@ -722,7 +728,14 @@ class M3ReleaseAggregationTests(unittest.TestCase):
             ), mock.patch.object(
                 AGGREGATE, "render_markdown", return_value="fixture\n"
             ):
-                self.assertEqual(AGGREGATE.verify_complete(output), report)
+                with self.assertRaisesRegex(Exception, "explicit non-release"):
+                    AGGREGATE.verify_complete(output)
+                self.assertEqual(
+                    AGGREGATE.verify_complete(
+                        output, historical_replay_only=True
+                    ),
+                    report,
+                )
             AGGREGATE.atomic_write_text(output / "report.md", "tampered\n")
             AGGREGATE.atomic_write_json(
                 output / "M3_COMPLETE", AGGREGATE._terminal_payload(output)
@@ -733,7 +746,9 @@ class M3ReleaseAggregationTests(unittest.TestCase):
                 AGGREGATE, "render_markdown", return_value="fixture\n"
             ):
                 with self.assertRaisesRegex(Exception, "not fully re-derived"):
-                    AGGREGATE.verify_complete(output)
+                    AGGREGATE.verify_complete(
+                        output, historical_replay_only=True
+                    )
             AGGREGATE.atomic_write_text(output / "report.md", "fixture\n")
             report["outcome"] = "FAIL"
             AGGREGATE.atomic_write_json(output / "report.json", report)
@@ -746,7 +761,9 @@ class M3ReleaseAggregationTests(unittest.TestCase):
                 AGGREGATE, "render_markdown", return_value="fixture\n"
             ):
                 with self.assertRaisesRegex(Exception, "not fully re-derived"):
-                    AGGREGATE.verify_complete(output)
+                    AGGREGATE.verify_complete(
+                        output, historical_replay_only=True
+                    )
 
 
 if __name__ == "__main__":

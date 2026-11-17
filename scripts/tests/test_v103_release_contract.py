@@ -51,18 +51,19 @@ PACKAGED_DOCS = (
     "GPMEEP_V1_0_1_RELEASE_NOTES.md",
     "GPMEEP_V1_0_2_RELEASE_NOTES.md",
     "GPMEEP_V1_0_3_RELEASE_NOTES.md",
+    "GPMEEP_V1_1_0_RELEASE_NOTES.md",
     "GPMEEP_LICENSE_AND_PROVENANCE.md",
 )
 ACTIVE_IDENTITY_MARKERS = {
     "packaging/conda/meta.yaml": (
-        '{% set distribution_version = "1.0.3" %}',
+        '{% set distribution_version = "1.1.0" %}',
         "{% set build_number = 0 %}",
     ),
     "packaging/conda/release.json.in": (
-        '"distribution_version": "1.0.3"',
+        '"distribution_version": "1.1.0"',
     ),
-    "scripts/build-conda-package.sh": ('DISTRIBUTION_VERSION="1.0.3"',),
-    "scripts/gpmeep_release_manifest.py": ('DISTRIBUTION_VERSION = "1.0.3"',),
+    "scripts/build-conda-package.sh": ('DISTRIBUTION_VERSION="1.1.0"',),
+    "scripts/gpmeep_release_manifest.py": ('DISTRIBUTION_VERSION = "1.1.0"',),
     "scripts/verify-gpmeep-package.py": (
         "CONDA_BUILD_NUMBER = 0",
         'CONDA_BUILD_STRING = "cuda124_mpi_openmpi_py311_0"',
@@ -70,9 +71,9 @@ ACTIVE_IDENTITY_MARKERS = {
     "scripts/user-workloads/common.py": (
         'GPMEEP_DISTRIBUTION_VERSION = _DISTRIBUTION_VERSION',
     ),
-    "README.md": ("gpmeep-1.0.3-cuda124_mpi_openmpi_py311_0.conda",),
+    "README.md": ("gpmeep-1.1.0-cuda124_mpi_openmpi_py311_0.conda",),
     "doc/docs/GPMEEP_INSTALLATION.md": (
-        "gpmeep-1.0.3-cuda124_mpi_openmpi_py311_0.conda",
+        "gpmeep-1.1.0-cuda124_mpi_openmpi_py311_0.conda",
     ),
     "doc/docs/GPMEEP_V1_0_3_RELEASE_NOTES.md": (
         "gpmeep-1.0.3-cuda124_mpi_openmpi_py311_0.conda",
@@ -87,7 +88,9 @@ FORBIDDEN_ACTIVE_IDENTITIES = (
     "{% set build_number = 1 %}",
 )
 README_ARCHITECTURE_HEADING = "How GPU acceleration works"
+README_BACKEND_CHOICE_CAVEAT = "it never silently changes the backend."
 README_ARCHITECTURE_SUBSECTIONS = (
+    "Design rationale",
     "Backend selection is owner-wide and state-atomic",
     "Persistent field residency and coherence",
     "CUDA FDTD pipeline and supported physics",
@@ -100,16 +103,20 @@ README_ARCHITECTURE_SUBSECTIONS = (
 README_ARCHITECTURE_REQUIRED_PROSE = {
     None: (
         "The acceleration layer sits below the existing `fields::step()` pipeline",
+    ),
+    "Design rationale": (
         "persistent mirror cache per fields_chunk",
         "selective host publication only when it is required",
+        README_BACKEND_CHOICE_CAVEAT,
     ),
     "Backend selection is owner-wide and state-atomic": (
         "CPU is the default",
+        "`mp.gpu.set_backend(\"cpu\")` and `mp.gpu.set_backend(\"cuda\")` are explicit user choices",
+        "`auto` is rejected",
         "entirely CPU or entirely CUDA for that fields owner",
-        "the reference floor is 524,288 local cells",
-        "1,024 bytes per local cell plus 64 MiB",
-        "designed to reject the bounded launch-dominated cases used to calibrate it",
-        "it is not a guarantee that the selected backend is faster",
+        "advises CPU or CUDA but never changes the explicit choice",
+        "current reference floor is 524,288 local cells",
+        "versioned calibration input rather than an application API or a speed guarantee",
     ),
     "Persistent field residency and coherence": (
         "Meep's host arrays remain the API-visible storage identity",
@@ -123,8 +130,12 @@ README_ARCHITECTURE_REQUIRED_PROSE = {
         "B curl, B sources, and B boundaries",
         "D curl, D sources, and D boundaries",
         "Cylindrical coordinates and BFAST each have supported CUDA paths",
-        "automatic multi-monitor DFT batching is fail-closed in v1.0.2",
+        "Curl automatic mode requires at least four operations",
+        "Unset H/E controls retain their distinct measured adaptive policy",
+        "Indexed-source batching and multi-monitor DFT fusion remain experimental/forced-only",
         "An arbitrary custom susceptibility subclass is not implicitly CUDA-capable",
+        "the user must explicitly choose CPU for that workload",
+        "gpmeep never switches the requested backend silently",
     ),
     "DFT monitors and scientific reductions": (
         "For scalar/spectral reductions such as flux, energy, force, and LDOS",
@@ -181,6 +192,11 @@ README_ARCHITECTURE_FORBIDDEN_PATTERNS = (
     r"\bcomplete inverse-design program\b[^.]{0,60}(?:\bis\s+(?!not\b)(?:(?:entirely|fully|wholly)\s+)?(?:gpu|cuda)(?:[- ]resident)?\b|\b(?:runs|executes)\s+(?:(?:entirely|fully|wholly)\s+)?on\s+(?:the\s+)?(?:gpu|cuda)\b)",
     r"\ball meep features\b[^.]{0,100}\b(?:gpu|cuda)\b",
     r"\ball sm60\+ gpu[^.]{0,100}\bruntime-qualified\b",
+)
+README_ARCHITECTURE_FORBIDDEN_V110_BACKEND_PATTERNS = (
+    r"\bauto(?:matic(?:ally)?)?\b[^.]{0,100}\b(?:selects?|chooses?|switch(?:es)?|changes?|falls? back)\b[^.]{0,100}\b(?:cpu|cuda|backend)\b",
+    r"\bsilent(?:ly)?\b[^.]{0,100}\b(?:selects?|chooses?|switch(?:es)?|changes?|falls? back)\b[^.]{0,100}\b(?:cpu|cuda|backend)\b",
+    r"\b(?:selects?|chooses?|switch(?:es)?|changes?|falls? back)\b[^.]{0,100}\bsilent(?:ly)?\b[^.]{0,100}\b(?:cpu|cuda|backend)\b",
 )
 README_ARCHITECTURE_MINIMUM_WORDS = 1000
 DOC_CONTRACTS = {
@@ -320,6 +336,18 @@ def readme_gpu_architecture_contract_matches(text: str) -> bool:
         for pattern in README_ARCHITECTURE_FORBIDDEN_PATTERNS
     ):
         return False
+    normalized_section = _normalize_markdown_prose(section).casefold()
+    # The required complete denial is not an affirmative backend-switch claim.
+    # Exempt only its first exact occurrence, leaving added contradictions and
+    # qualified variants (for example, "except ...") subject to the checks.
+    normalized_section = normalized_section.replace(
+        README_BACKEND_CHOICE_CAVEAT.casefold(), "", 1
+    )
+    if any(
+        re.search(pattern, normalized_section)
+        for pattern in README_ARCHITECTURE_FORBIDDEN_V110_BACKEND_PATTERNS
+    ):
+        return False
 
     curl_row = _readme_architecture_table_row(section, "B/D curl")
     eh_row = _readme_architecture_table_row(section, "H/E constitutive update")
@@ -370,9 +398,9 @@ def active_identity_is_coherent(text_by_path: dict[str, str]) -> bool:
 
 class V103ReleaseContractTests(unittest.TestCase):
     def test_all_shipped_validators_use_one_version_and_anchor(self):
-        self.assertEqual(VERIFY.DISTRIBUTION_VERSION, "1.0.3")
-        self.assertEqual(SELF_CHECK.DISTRIBUTION_VERSION, "1.0.3")
-        self.assertEqual(COMMON.GPMEEP_DISTRIBUTION_VERSION, "1.0.3")
+        self.assertEqual(VERIFY.DISTRIBUTION_VERSION, "1.1.0")
+        self.assertEqual(SELF_CHECK.DISTRIBUTION_VERSION, "1.1.0")
+        self.assertEqual(COMMON.GPMEEP_DISTRIBUTION_VERSION, "1.1.0")
         self.assertEqual(VERIFY.RELEASE_MANIFEST_SCHEMA_VERSION, 3)
         self.assertEqual(SELF_CHECK.RELEASE_MANIFEST_SCHEMA_VERSION, 3)
         self.assertEqual(COMMON.GPMEEP_RELEASE_MANIFEST_SCHEMA_VERSION, 3)
@@ -479,11 +507,11 @@ class V103ReleaseContractTests(unittest.TestCase):
             for value in forbidden:
                 self.assertNotIn(value, text, f"{path} retains {value}")
 
-    def test_build_and_install_docs_name_v103(self):
+    def test_build_and_install_docs_name_current_release(self):
         builder = (ROOT / "scripts/build-conda-package.sh").read_text(encoding="utf-8")
-        self.assertIn('DISTRIBUTION_VERSION="1.0.3"', builder)
+        self.assertIn('DISTRIBUTION_VERSION="1.1.0"', builder)
         recipe = (ROOT / "packaging/conda/meta.yaml").read_text(encoding="utf-8")
-        self.assertIn('{% set distribution_version = "1.0.3" %}', recipe)
+        self.assertIn('{% set distribution_version = "1.1.0" %}', recipe)
         self.assertIn("{% set build_number = 0 %}", recipe)
         package_build = (ROOT / "packaging/conda/build.sh").read_text(encoding="utf-8")
         verifier = (ROOT / "scripts/verify-gpmeep-package.py").read_text(
@@ -503,7 +531,7 @@ class V103ReleaseContractTests(unittest.TestCase):
         self.assertIn('"${PREFIX}/share/gpmeep/docs/"', package_build)
         for relative in ("README.md", "doc/docs/GPMEEP_INSTALLATION.md"):
             text = (ROOT / relative).read_text(encoding="utf-8")
-            self.assertIn("gpmeep-1.0.3-", text)
+            self.assertIn("gpmeep-1.1.0-", text)
             self.assertNotIn("gpmeep-1.0.1-cuda124_mpi_openmpi_py311_1", text)
             self.assertIn("py311_0.conda", text)
 
@@ -626,8 +654,8 @@ class V103ReleaseContractTests(unittest.TestCase):
                     1,
                 )
                 self.assertTrue(
-                    "it is not a guarantee that the selected backend is faster"
-                    in _normalize_markdown_prose(mutated)
+                    "versioned calibration input rather than an application api or a speed guarantee"
+                    in _normalize_markdown_prose(mutated).casefold()
                 )
                 self.assertFalse(readme_gpu_architecture_contract_matches(mutated))
                 self.assertFalse(
@@ -635,6 +663,33 @@ class V103ReleaseContractTests(unittest.TestCase):
                         f"{readme.rstrip()}\n\n{overclaim}\n"
                     )
                 )
+
+    def test_readme_gpu_architecture_rejects_v110_backend_contradictions(self):
+        readme = (ROOT / README_DOC).read_text(encoding="utf-8")
+        next_heading = "\n## Numerical and environment migration notes"
+        contradictions = (
+            "`auto` selects CPU for the whole owner before the step.",
+            "`auto` selects CUDA for large workloads.",
+            "`auto` falls back to the CPU for unsupported CUDA work.",
+            "`automatic` chooses CPU for short workloads.",
+            "gpmeep silently chooses CPU when CUDA is not recommended.",
+            "It silently switches to CPU after CUDA preflight fails.",
+            "gpmeep silently switches the requested backend to CUDA.",
+            "The guard automatically changes CPU to CUDA.",
+            "The guard switches silently to the CUDA backend.",
+            "It silently changes the backend.",
+            "It never silently changes the backend except for small workloads.",
+            "It never silently changes the backend unless CUDA preflight fails.",
+        )
+        for contradiction in contradictions:
+            with self.subTest(contradiction=contradiction):
+                mutated = readme.replace(
+                    next_heading,
+                    f"\n\n{contradiction}\n{next_heading}",
+                    1,
+                )
+                self.assertNotEqual(mutated, readme)
+                self.assertFalse(readme_gpu_architecture_contract_matches(mutated))
 
     def test_readme_gpu_architecture_rejects_fragments_outside_or_without_prose(self):
         readme = (ROOT / README_DOC).read_text(encoding="utf-8")

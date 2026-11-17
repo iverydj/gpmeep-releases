@@ -30,21 +30,23 @@ import verify_aunp_performance_workload as performance_replay  # noqa: E402
 import verify_telemetry_v2 as telemetry_replay  # noqa: E402
 from common import (  # noqa: E402
     AUNP_ARCHIVE_SHA256,
+    AUNP_BACKEND_ACKNOWLEDGEMENT_REASON,
     StableFile,
     WorkloadError,
     absolute_file_record,
     aunp_qualification_profile,
     atomic_write_json,
     atomic_write_text,
+    durable_publish_terminal,
     file_record,
     verify_file,
 )
 
 
-SCHEMA = "gpmeep-hybrid-aunp-matrix-v3"
-CHECKPOINT_SCHEMA = "gpmeep-hybrid-aunp-checkpoint-v3"
-COMPLETE_SCHEMA = "gpmeep-hybrid-aunp-complete-v3"
-JOURNAL_SCHEMA = "gpmeep-hybrid-aunp-journal-v3"
+SCHEMA = "gpmeep-hybrid-aunp-matrix-v4"
+CHECKPOINT_SCHEMA = "gpmeep-hybrid-aunp-checkpoint-v4"
+COMPLETE_SCHEMA = "gpmeep-hybrid-aunp-complete-v4"
+JOURNAL_SCHEMA = "gpmeep-hybrid-aunp-journal-v4"
 RELEASE_PERFORMANCE_REPEATS = 2
 RELEASE_GATES = {
     "minimum_one_gpu_speedup": (1.5, math.inf, "minimum"),
@@ -216,6 +218,13 @@ def task_spec(task: Task) -> dict[str, Any]:
 
 
 def build_contract_record(build: matrix.Build) -> dict[str, Any]:
+    git_head = build.receipt.get("git_head")
+    if (
+        not isinstance(git_head, str)
+        or len(git_head) != 40
+        or any(character not in "0123456789abcdef" for character in git_head)
+    ):
+        raise WorkloadError("AuNP build Git identity is invalid")
     return {
         "python": str(build.python),
         "mpiexec": str(build.mpiexec),
@@ -224,6 +233,7 @@ def build_contract_record(build: matrix.Build) -> dict[str, Any]:
         "build_input_id": build.receipt["build_input_id"],
         "artifact_set_id": build.receipt["artifact_set_id"],
         "source_sha256": matrix._source_identity(build),
+        "git_head": git_head,
     }
 
 
@@ -275,6 +285,8 @@ def task_command(task: Task, archive: pathlib.Path, output: pathlib.Path) -> lis
         str(task.lane.build.receipt_path),
         "--expected-backend",
         task.lane.backend,
+        "--acknowledge-backend-mismatch-reason",
+        AUNP_BACKEND_ACKNOWLEDGEMENT_REASON,
     ]
 
 
@@ -359,6 +371,9 @@ def contract(
         "cpu_ranks": cpu_ranks,
         "gpu_devices": list(devices),
         "performance_repeats": args.performance_repeats,
+        "backend_acknowledgement_reason": (
+            AUNP_BACKEND_ACKNOWLEDGEMENT_REASON
+        ),
         "qualification_profile": aunp_qualification_profile(),
         "fixed_window_meep_time": performance_adapter.FIXED_WINDOW_MEEP_TIME,
         "minimum_timesteps_per_phase": (
@@ -388,6 +403,7 @@ def reconstruct_contract_tasks(
         "cpu_ranks",
         "gpu_devices",
         "performance_repeats",
+        "backend_acknowledgement_reason",
         "qualification_profile",
         "fixed_window_meep_time",
         "minimum_timesteps_per_phase",
@@ -477,6 +493,11 @@ def reconstruct_contract_tasks(
         raise WorkloadError("AuNP sealed task topology is invalid")
     if sealed_contract.get("qualification_profile") != aunp_qualification_profile():
         raise WorkloadError("AuNP sealed TM-only qualification profile differs")
+    if (
+        sealed_contract.get("backend_acknowledgement_reason")
+        != AUNP_BACKEND_ACKNOWLEDGEMENT_REASON
+    ):
+        raise WorkloadError("AuNP sealed backend acknowledgement reason differs")
     devices = normalized_devices(",".join(device_values))
     if list(devices) != device_values:
         raise WorkloadError("AuNP sealed GPU UUID spelling is not canonical")
@@ -1379,7 +1400,7 @@ def publish_terminal(output: pathlib.Path, outcome: str) -> None:
         },
     )
     verify_hybrid_complete(output, "PENDING_COMPLETE")
-    os.replace(output / "PENDING_COMPLETE", output / "COMPLETE")
+    durable_publish_terminal(output / "PENDING_COMPLETE", output / "COMPLETE")
 
 
 def verify_hybrid_complete(
@@ -1452,6 +1473,7 @@ def verify_hybrid_complete(
     evidence_code = sealed_contract["evidence_code"]
     expected_code = {
         "controller": pathlib.Path(__file__),
+        "backend_guard": SCRIPT_DIR.parent / "gpmeep_backend_guard.py",
         "matrix_common": SCRIPT_DIR / "run_user_workload_matrix.py",
         "observed_runner": SCRIPT_DIR / "run_observed_process.py",
         "exact_adapter": SCRIPT_DIR / "run_aunp_workload.py",
@@ -1599,6 +1621,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         code_paths = {
             "controller": pathlib.Path(__file__),
+            "backend_guard": SCRIPT_DIR.parent / "gpmeep_backend_guard.py",
             "matrix_common": SCRIPT_DIR / "run_user_workload_matrix.py",
             "observed_runner": SCRIPT_DIR / "run_observed_process.py",
             "exact_adapter": SCRIPT_DIR / "run_aunp_workload.py",
@@ -1923,7 +1946,7 @@ def main(argv: list[str] | None = None) -> int:
         }
         if (output / "JOURNAL.json").is_file():
             failure["journal"] = file_record(output / "JOURNAL.json", output)
-        atomic_write_json(output / "FAILED.json", failure)
+        matrix.publish_failure_record(output, failure)
         raise
     finally:
         for stable in code_stables.values():

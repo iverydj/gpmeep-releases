@@ -36,10 +36,14 @@ from gpmeep_release_manifest import (  # noqa: E402
     validate_glibc_compatibility_audit,
     validate_release_manifest,
 )
+import gpmeep_backend_guard as backend_guard  # noqa: E402
 
-SCHEMA_VERSION = 1
-MARKER = "gpmeep-self-check-v1:"
-PUBLIC_MARKER = "gpmeep-self-check-result-v1:"
+SCHEMA_VERSION = 2
+MARKER = "gpmeep-self-check-v2:"
+PUBLIC_MARKER = "gpmeep-self-check-result-v2:"
+BACKEND_ACKNOWLEDGEMENT_REASON = (
+    "Installed self-check intentionally compares explicit CPU and CUDA"
+)
 RELEASE_MANIFEST = pathlib.Path("share/gpmeep/release.json")
 DEFAULT_TIMEOUT_SECONDS = 180
 FIELD_ATOL = 5.0e-4
@@ -273,10 +277,14 @@ def _run_fixed_workload(lane: str) -> dict[str, Any]:
         mp.FluxRegion(center=mp.Vector3(0.65), size=mp.Vector3(y=1.2)),
     )
     communicator.Barrier()
-    started = time.perf_counter()
-    simulation.run(until=8)
+    _, backend_guard_evidence = backend_guard.invoke_with_acknowledgement(
+        mp,
+        simulation,
+        lambda: simulation.run(until=8),
+        BACKEND_ACKNOWLEDGEMENT_REASON,
+    )
     communicator.Barrier()
-    elapsed = time.perf_counter() - started
+    elapsed = backend_guard_evidence["execution_wall_seconds"]
     field = np.asarray(
         simulation.get_array(
             center=mp.Vector3(),
@@ -304,6 +312,7 @@ def _run_fixed_workload(lane: str) -> dict[str, Any]:
         "execution_diagnostic": simulation.fields.gpu_execution_diagnostic(),
         "selected_device": int(mp.gpu.selected_device),
         "selected_device_identifier": mp.gpu.selected_device_identifier,
+        "backend_guard": backend_guard_evidence,
         "elapsed_seconds": elapsed,
         "timesteps": int(simulation.timestep()),
         "field_shape": list(field.shape),
@@ -333,6 +342,14 @@ def _run_fixed_workload(lane: str) -> dict[str, Any]:
 
 
 def _validate_cpu_record(record: dict[str, Any]) -> None:
+    try:
+        backend_guard.validate_evidence(
+            record.get("backend_guard"),
+            expected_backend="cpu",
+            expected_reason=BACKEND_ACKNOWLEDGEMENT_REASON,
+        )
+    except backend_guard.BackendGuardEvidenceError as exc:
+        raise SelfCheckError(f"CPU backend-guard evidence differs: {exc}") from exc
     if (
         record.get("backend") != "cpu"
         or record.get("requested_backend") != "cpu"
@@ -351,6 +368,14 @@ def _validate_cpu_record(record: dict[str, Any]) -> None:
 
 
 def _validate_cuda_record(record: dict[str, Any]) -> None:
+    try:
+        backend_guard.validate_evidence(
+            record.get("backend_guard"),
+            expected_backend="cuda",
+            expected_reason=BACKEND_ACKNOWLEDGEMENT_REASON,
+        )
+    except backend_guard.BackendGuardEvidenceError as exc:
+        raise SelfCheckError(f"CUDA backend-guard evidence differs: {exc}") from exc
     if (
         record.get("backend") != "cuda"
         or record.get("requested_backend") != "cuda"

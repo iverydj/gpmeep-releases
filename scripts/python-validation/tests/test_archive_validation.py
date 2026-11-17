@@ -124,6 +124,7 @@ class ArchiveFixture:
             "scripts/python-validation/stochastic_reciprocity_matrix.py": "# stochastic reciprocity fixture\n",
             "scripts/gpmeep_provenance.py": "# provenance fixture\n",
             "scripts/gpmeep_qualification_contract.py": "# qualification fixture\n",
+            "scripts/gpmeep_backend_guard.py": "# backend guard fixture\n",
             "scripts/gpmeep-control-python.py": "# control-python fixture\n",
             "scripts/build-meep-cuda-mpi-python.sh": "#!/bin/sh\nexit 0\n",
             "python/tests/test_gpu_backend.py": "# GPU backend fixture\n",
@@ -499,6 +500,12 @@ class ArchiveFixture:
             "with_mpi": True,
             "gpu_compiled": True,
             "strict_cuda_marker": backend == "cuda",
+            "backend_guard": {
+                "schema": "gpmeep-validation-backend-guard-events-v2",
+                "mode": "disabled",
+                "reason": None,
+                "events": [],
+            },
             "python_executable": runtime_contract["python_executable"],
             "meep_module": runtime_contract["meep_module"],
             "extension": runtime_contract["extension"],
@@ -587,6 +594,8 @@ class ArchiveFixture:
         }
         return {
             "backend": backend,
+            "backend_acknowledgement_requested": False,
+            "backend_acknowledgement_reason": None,
             "command": [
                 self._runtime_contract()["python_executable"]["path"],
                 str((self.repo / "cases/example.py").resolve()),
@@ -973,6 +982,182 @@ class ArchiveValidationTest(unittest.TestCase):
         )
         return archive
 
+    def _verify_fixture_environment(self, run: dict) -> None:
+        base_command = list(run["command"])
+        if base_command[2:4] == [
+            "--acknowledge-backend-mismatch-reason",
+            run["backend_acknowledgement_reason"],
+        ]:
+            del base_command[2:4]
+        sealer._verify_run_environment_contract(
+            run=run,
+            backend=run["backend"],
+            case={"id": "cases/example.py"},
+            report=self.fixture.report,
+            runtime=self.fixture._runtime_contract(),
+            expected_repository=self.fixture.repo,
+            evidence_root=self.fixture.output,
+            bind_output_root=True,
+            guard_owner_index=sealer._backend_guard_owner_index(
+                base_command, self.fixture.repo
+            ),
+        )
+
+    def test_run_environment_replays_direct_site_guard_reason(self):
+        run = copy.deepcopy(self.fixture.report["results"][0]["runs"]["cpu"])
+        reason = "M3 paired correctness intentionally compares explicit CPU and CUDA"
+        run["backend_acknowledgement_requested"] = True
+        run["backend_acknowledgement_reason"] = reason
+        environment = run["environment_contract"]["environment"]
+        environment["GPMEEP_VALIDATION_BACKEND_ACKNOWLEDGEMENT_REASON"] = reason
+        run["environment_contract"]["keys"] = sorted(environment)
+        run["environment_contract"]["sha256"] = (
+            sealer.runner_contract.environment_sha256(environment)
+        )
+        self._verify_fixture_environment(run)
+        del environment["GPMEEP_VALIDATION_BACKEND_ACKNOWLEDGEMENT_REASON"]
+        run["environment_contract"]["keys"] = sorted(environment)
+        run["environment_contract"]["sha256"] = (
+            sealer.runner_contract.environment_sha256(environment)
+        )
+        with self.assertRaisesRegex(sealer.ArchiveError, "allowlist"):
+            self._verify_fixture_environment(run)
+
+    def test_run_environment_replays_oracle_owned_reason_without_site_env(self):
+        run = copy.deepcopy(self.fixture.report["results"][0]["runs"]["cpu"])
+        reason = "M3 paired correctness intentionally compares explicit CPU and CUDA"
+        run["backend_acknowledgement_requested"] = True
+        run["backend_acknowledgement_reason"] = reason
+        run["command"] = [
+            run["command"][0],
+            str(
+                self.fixture.repo
+                / "scripts/python-validation/run_example_oracle.py"
+            ),
+            "--acknowledge-backend-mismatch-reason",
+            reason,
+        ]
+        self._verify_fixture_environment(run)
+
+    def test_adapter_environment_requires_exact_owner_and_no_site_reason(self):
+        for name in ("run_example_oracle.py", "run_point_dipole_cyl_validation.py"):
+            for backend in ("cpu", "cuda"):
+                with self.subTest(adapter=name, backend=backend):
+                    run = copy.deepcopy(
+                        self.fixture.report["results"][0]["runs"][backend]
+                    )
+                    reason = "M3 paired correctness intentionally compares explicit CPU and CUDA"
+                    run["backend_acknowledgement_requested"] = True
+                    run["backend_acknowledgement_reason"] = reason
+                    owner = str(self.fixture.repo / "scripts/python-validation" / name)
+                    run["command"] = [run["command"][0], owner]
+                    self._verify_fixture_environment(run)
+                    environment = run["environment_contract"]["environment"]
+                    environment["GPMEEP_VALIDATION_BACKEND_ACKNOWLEDGEMENT_REASON"] = reason
+                    run["environment_contract"]["keys"] = sorted(environment)
+                    run["environment_contract"]["sha256"] = (
+                        sealer.runner_contract.environment_sha256(environment)
+                    )
+                    with self.assertRaisesRegex(sealer.ArchiveError, "allowlist"):
+                        self._verify_fixture_environment(run)
+                    del environment["GPMEEP_VALIDATION_BACKEND_ACKNOWLEDGEMENT_REASON"]
+                    run["environment_contract"]["keys"] = sorted(environment)
+                    run["environment_contract"]["sha256"] = (
+                        sealer.runner_contract.environment_sha256(environment)
+                    )
+                    for command, error in (
+                        ([run["command"][0], "/other/" + name], "allowlist"),
+                        ([run["command"][0], name], "allowlist"),
+                        ([run["command"][0], "/other/example.py", owner], r"not command\[1\]"),
+                        ([run["command"][0], owner, owner], "multiple"),
+                        ([run["command"][0], owner, None], "non-string"),
+                    ):
+                        with self.subTest(command=command):
+                            run["command"] = command
+                            with self.assertRaisesRegex(sealer.ArchiveError, error):
+                                self._verify_fixture_environment(run)
+
+    def _use_acknowledged_adapter(self, name: str, reason: str | None = None) -> None:
+        manifest_path = self.fixture.repo / "scripts/python-validation/manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["overrides"] = [{
+            "glob": "cases/example.py",
+            "command": [
+                "{python}", "{repo}/scripts/python-validation/" + name,
+                "{repo}/cases/example.py",
+            ],
+        }]
+        write_json(manifest_path, manifest)
+        if reason is None:
+            reason = "M3 paired correctness intentionally compares explicit CPU and CUDA"
+        for run in self.fixture.report["results"][0]["runs"].values():
+            run["backend_acknowledgement_requested"] = True
+            run["backend_acknowledgement_reason"] = reason
+            run["command"] = [
+                run["command"][0],
+                str(self.fixture.repo / "scripts/python-validation" / name),
+                "--acknowledge-backend-mismatch-reason", reason,
+                str(self.fixture.repo / "cases/example.py"),
+            ]
+        self.fixture.report["provenance"]["manifest_sha256"] = sha256_file(manifest_path)
+        subprocess.run(["git", "add", "."], cwd=self.fixture.repo, check=True)
+        self.fixture.refresh_source_and_receipt_bindings()
+
+    def test_owned_adapters_seal_and_replay_standalone_without_originals(self):
+        self._install_real_archive_inputs()
+        archives = []
+        for name in ("run_example_oracle.py", "run_point_dipole_cyl_validation.py"):
+            with self.subTest(adapter=name):
+                # A valid reason may itself equal an adapter path; it remains
+                # an option value, never a second executable owner.
+                reason = str(self.fixture.repo / "scripts/python-validation" / name)
+                self._use_acknowledged_adapter(name, reason)
+                archive = self.seal(self.root / (name + "-archive"))
+                complete = sealer.verify_archive(archive)
+                relocated = self.root / (name + "-relocated")
+                shutil.copytree(archive, relocated)
+                archives.append((relocated, complete["archive_manifest_sha256"]))
+        self.fixture.repo.rename(self.root / "unavailable-original-repo")
+        self.fixture.output.rename(self.root / "unavailable-original-output")
+        self.fixture.receipt.rename(self.root / "unavailable-original-receipt.json")
+        for archive, digest in archives:
+            with self.subTest(standalone=archive.name):
+                verify = subprocess.run(
+                    [sys.executable, "-I", "-B",
+                     str(archive / "inputs/archive_validation.py"),
+                     "verify", "--archive", str(archive),
+                     "--expected-manifest-sha256", digest],
+                    cwd=self.root, env={"PATH": os.environ.get("PATH", ""), "PYTHONPATH": ""},
+                    text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    check=False,
+                )
+                self.assertEqual(verify.returncode, 0, verify.stderr)
+                self.assertIn("verified archive", verify.stdout)
+
+    def test_owned_adapter_seal_rejects_missing_guard_or_changed_acknowledgement(self):
+        self._use_acknowledged_adapter("run_point_dipole_cyl_validation.py")
+        original = copy.deepcopy(self.fixture.report)
+        for mutation in ("missing_guard", "wrong_guard_mode", "missing_ack", "wrong_ack"):
+            with self.subTest(mutation=mutation):
+                self.fixture.report = copy.deepcopy(original)
+                run = self.fixture.report["results"][0]["runs"]["cuda"]
+                if mutation == "missing_guard":
+                    del run["statistics"]["backend_guard"]
+                elif mutation == "wrong_guard_mode":
+                    run["statistics"]["backend_guard"]["mode"] = "reason-bound-policy-scope"
+                elif mutation == "missing_ack":
+                    del run["command"][2:4]
+                else:
+                    run["command"][3] = "different acknowledgement reason"
+                stats_path = pathlib.Path(run["statistics_file"])
+                write_json(stats_path, run["statistics"])
+                run["evidence_files"]["statistics"] = {
+                    "available": True, **file_record(stats_path, self.fixture.repo)
+                }
+                self.fixture.reseal_report()
+                with self.assertRaisesRegex(sealer.ArchiveError, "backend replay differs|command differs"):
+                    self.seal(self.root / mutation)
+
     def test_checked_manifest_command_wrappers_are_fixed_archive_inputs(self):
         repo = SEALER_PATH.parents[2]
         manifest = json.loads(
@@ -1069,6 +1254,7 @@ class ArchiveValidationTest(unittest.TestCase):
             "inputs/archive_validation.py",
             "inputs/gpmeep_provenance.py",
             "inputs/gpmeep_qualification_contract.py",
+            "inputs/gpmeep_backend_guard.py",
             "inputs/sitecustomize.py",
             "inputs/absorber_branch_matrix.py",
             "inputs/perturbation_branch_matrix.py",
@@ -1093,6 +1279,66 @@ class ArchiveValidationTest(unittest.TestCase):
             sealer.verify_archive(relocated_archive)["report_sha256"],
             complete["report_sha256"],
         )
+
+    def _enable_observation_fixture(self):
+        # Synthetic collection references exercise archive transport only.
+        # Paired replay separately checks references against real stream bytes.
+        run = self.fixture.report["results"][0]["runs"]["cuda"]
+        config = {
+            "root_pid": 123, "root_start_time_ticks": 456, "label": "fixture",
+            "gpu_uuid": "GPU-11111111-1111-1111-1111-111111111111",
+            "host_stream": "/synthetic/telemetry/host.jsonl",
+            "gpu_stream": "/synthetic/telemetry/gpu.jsonl", "timeout_seconds": 33.0,
+        }
+        environment = run["environment_contract"]["environment"]
+        environment["GPMEEP_VALIDATION_GPU_OBSERVATION"] = json.dumps(config)
+        run["environment_contract"]["keys"] = sorted(environment)
+        run["environment_contract"]["sha256"] = sealer.runner_contract.environment_sha256(environment)
+        stats = run["statistics"]
+        stats["pid"] = 789
+        stats["gpu_observation"] = {
+            "schema": "gpmeep-correctness-gpu-observation-v1", "state": "OBSERVED",
+            "configuration": config, "pid": 789, "start_time_ticks": 457,
+            "run_nonce": run["run_nonce"], "wait_seconds": 0.25,
+            "child_hook_started_unix_seconds": 946684800.0,
+            "samples": {kind: {"offset": 0, "size_bytes": 100, "sha256": "a" * 64, "sequence": 0}
+                        for kind in ("host", "gpu")},
+        }
+        self._save_observation_fixture(run)
+        return run
+
+    def _save_observation_fixture(self, run):
+        path = pathlib.Path(run["statistics_file"])
+        write_json(path, run["statistics"])
+        run["evidence_files"]["statistics"] = {"available": True, **file_record(path, self.fixture.repo)}
+        self.fixture.reseal_report()
+
+    def test_observation_proof_survives_real_archive_seal_and_relocation(self):
+        self._enable_observation_fixture()
+        archive = self.seal()
+        complete = sealer.verify_archive(archive)
+        relocated = self.root / "relocated-observation-archive"
+        shutil.copytree(archive, relocated)
+        self.assertEqual(sealer.verify_archive(relocated)["report_sha256"], complete["report_sha256"])
+
+    def test_archive_rejects_rehashed_observation_proof_environment_mismatch(self):
+        run = self._enable_observation_fixture()
+        original = copy.deepcopy(run["statistics"]["gpu_observation"])
+        for mutation in ("configuration", "run_nonce", "state", "missing"):
+            with self.subTest(mutation=mutation):
+                proof = copy.deepcopy(original)
+                if mutation == "configuration":
+                    proof["configuration"]["root_pid"] += 1
+                elif mutation == "run_nonce":
+                    proof["run_nonce"] = "e" * 32
+                elif mutation == "state":
+                    proof["state"] = "TIMEOUT"
+                else:
+                    proof = {}
+                run["statistics"]["gpu_observation"] = proof
+                self._save_observation_fixture(run)
+                with self.assertRaises(sealer.ArchiveError):
+                    self.seal()
 
     def test_replays_pass_covered_from_terminal_target(self):
         self.fixture.add_covered_case(select_target=True)
@@ -1610,7 +1856,7 @@ class ArchiveValidationTest(unittest.TestCase):
         self.assertEqual(verify.returncode, 0, verify.stderr)
         self.assertIn("verified archive", verify.stdout)
 
-    def test_archived_verifier_runs_standalone_with_empty_pythonpath(self):
+    def _install_real_archive_inputs(self) -> None:
         real_inputs = {
             SEALER_PATH: (
                 self.fixture.repo
@@ -1627,11 +1873,17 @@ class ArchiveValidationTest(unittest.TestCase):
                 self.fixture.repo
                 / "scripts/gpmeep_qualification_contract.py"
             ),
+            SEALER_PATH.parents[1] / "gpmeep_backend_guard.py": (
+                self.fixture.repo / "scripts/gpmeep_backend_guard.py"
+            ),
         }
         for source, destination in real_inputs.items():
             shutil.copy2(source, destination)
         subprocess.run(["git", "add", "."], cwd=self.fixture.repo, check=True)
         self.fixture.refresh_source_and_receipt_bindings()
+
+    def test_archived_verifier_runs_standalone_with_empty_pythonpath(self):
+        self._install_real_archive_inputs()
         archive = self.seal()
         empty_cwd = self.root / "empty-cwd"
         empty_cwd.mkdir()

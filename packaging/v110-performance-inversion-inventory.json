@@ -1,0 +1,353 @@
+{
+  "schema_version": 1,
+  "inventory_id": "v110-imported-v101-release-observations",
+  "immutable": true,
+  "source_campaign": {
+    "id": "v1.0.1-final-report-386e3c4a",
+    "source_commit": "3b750a83fe9ec056793af05c0402d6473a244170",
+    "summary_evidence": {
+      "workspace_relative_path": "gpmeep-evidence/v1.1.0/m0-baseline/v101-final-REPORT_DATA.json",
+      "sha256": "0fbc86c363057ee1baa1ac3dd165a316ca98a4be5fa62f527feaf4e72ca8923a"
+    },
+    "controller_evidence": {
+      "workspace_relative_path": "gpmeep-evidence/v1.1.0/m0-baseline/v101-m4-controller-report.json",
+      "sha256": "000ae244ddd3551ccb7dd54652eb965a647bea6c299ba6f2fe52cc1818856edf"
+    },
+    "qualification": "diagnostic_seed_only_requires_v110_equal_work_remeasurement"
+  },
+  "selection_policy_version": "v110-m0-1",
+  "selection_rule": "Every CUDA-slower observation is registered. Representative cases preserve distinct high-impact physics or execution families; small duplicate launch-dominated cases remain registered but are not promoted without new evidence.",
+  "observations": [
+    {
+      "workload_id": "python/examples/phase_in_material.py",
+      "workload_name_sha256": "f0e5595e9d5447451026437ac9d6f6cc5b2b040c194432395d3edf7593586f29",
+      "workload_identity": {
+        "source_commit": "3b750a83fe9ec056793af05c0402d6473a244170",
+        "source_file_sha256": "8124820bdb3bf87d3b85a17633d415f1165a6bc82ff4e14b2a3dcec28f1e5b65",
+        "entrypoint": "python/examples/phase_in_material.py",
+        "canonical_entrypoint_args": [],
+        "precision": "fp32",
+        "physics_and_stopping_source": "entrypoint_source_bytes",
+        "campaign_route_id": "case:phase-in-material",
+        "campaign_route_sha256": "0dcb2b1f26c5c287c87b357155fc2bb89fe982bdef4b2ca7937616332532027b",
+        "campaign_task_record_sha256": "59b06809f292e8ff85bb2cb3bb72a202fef1332245279948eda706e2885275a2",
+        "campaign_result_sha256": "c69c36e93603a75f0093a8681e41b74d49540c9fbe701c84977b87fbc6c650b0",
+        "campaign_topologies": [
+          "cpu",
+          "gpu1"
+        ],
+        "case_contract_sha256": "76907d404f466effdf50ed48dd0ba739c5dd0239dcfbc07d58b16ea33dc2ffe8"
+      },
+      "source_lane": "general_cpu_vs_gpu1",
+      "representative": false,
+      "impact": "low",
+      "rationale": "Short dynamic-material seed retained for crossover-boundary coverage; not promoted before equal-work profiling."
+    },
+    {
+      "workload_id": "python/examples/material-dispersion.py",
+      "workload_name_sha256": "80a0238df89d655be2bc7102b92edcb80d082edd19d81ce5cbd36705dddd99db",
+      "workload_identity": {
+        "source_commit": "3b750a83fe9ec056793af05c0402d6473a244170",
+        "source_file_sha256": "7de0d0f6945fe8f45254d62b22de9ff937e5923a831a79ea2dde760fe2c99ba3",
+        "entrypoint": "python/examples/material-dispersion.py",
+        "canonical_entrypoint_args": [],
+        "precision": "fp32",
+        "physics_and_stopping_source": "entrypoint_source_bytes",
+        "campaign_route_id": "case:material-dispersion",
+        "campaign_route_sha256": "201c6860c71eca447a320509b4f5a24aa9b32db548141494f4dae4e55f04bfc3",
+        "campaign_task_record_sha256": "59b06809f292e8ff85bb2cb3bb72a202fef1332245279948eda706e2885275a2",
+        "campaign_result_sha256": "f4e76bbdcf95be56d02c7fda621f7365cc973d1f14811f40c55ff2ad743ebfa5",
+        "campaign_topologies": [
+          "cpu",
+          "gpu1"
+        ],
+        "case_contract_sha256": "51498be794281d6bedf132c7d875ea1253e2b42d14b1f772aaa95ebefdfe8e67"
+      },
+      "source_lane": "general_cpu_vs_gpu1",
+      "representative": false,
+      "impact": "low",
+      "rationale": "Short dispersive seed is covered more strongly by AuNP and the sparse-ADE representative workload."
+    },
+    {
+      "workload_id": "python/examples/refl-quartz.py",
+      "workload_name_sha256": "00dd5a8756e8e3c0eb9ad3b63e6195df77bcd0e62b967370f9f8c5f807d75be5",
+      "workload_identity": {
+        "source_commit": "3b750a83fe9ec056793af05c0402d6473a244170",
+        "source_file_sha256": "5996a9692e0c48c43c2ec7627f3985745c8ef3fb44f9b185311d3d25106d8564",
+        "entrypoint": "python/examples/refl-quartz.py",
+        "canonical_entrypoint_args": [],
+        "precision": "fp32",
+        "physics_and_stopping_source": "entrypoint_source_bytes",
+        "campaign_route_id": "case:refl-quartz",
+        "campaign_route_sha256": "a4ee2c71fb7bcda1ffc35bb13090a2d6d74058fae081d11beea420bdb533a671",
+        "campaign_task_record_sha256": "59b06809f292e8ff85bb2cb3bb72a202fef1332245279948eda706e2885275a2",
+        "campaign_result_sha256": "1d95b0d69c107ab55d15a752ce523402de79313f9b0ca965528422c7ee6b620b",
+        "campaign_topologies": [
+          "cpu",
+          "gpu1"
+        ],
+        "case_contract_sha256": "cce2608f1bf606ab604ef6c952e691032d81e91639cd6ec0aae44979396f14d9"
+      },
+      "source_lane": "general_cpu_vs_gpu1",
+      "representative": false,
+      "impact": "low",
+      "rationale": "Small one-dimensional reflection seed remains registered while the nonlinear one-dimensional case represents launch overhead."
+    },
+    {
+      "workload_id": "python/examples/waveguide_crossing.py",
+      "workload_name_sha256": "9551f0758a266813223d3772f2eae70b7027fe1377c571936473a52b800af901",
+      "workload_identity": {
+        "source_commit": "3b750a83fe9ec056793af05c0402d6473a244170",
+        "source_file_sha256": "ae538a93092d0254264d3b21dd31fd9325829a82c11075da6e394c1232a9a4d7",
+        "entrypoint": "python/examples/waveguide_crossing.py",
+        "canonical_entrypoint_args": [],
+        "precision": "fp32",
+        "physics_and_stopping_source": "entrypoint_source_bytes",
+        "campaign_route_id": "case:waveguide-crossing",
+        "campaign_route_sha256": "108b23f364353c24d6ddcb76797a6fe8be55c3ac294490bce4869638ff78a45f",
+        "campaign_task_record_sha256": "fdb612cda2480d91e5766760b40edf92eb26ad541b002352b1a38643f7eeb130",
+        "campaign_result_sha256": "85c1cbd8c7ff11b8eed49796e606614350ccce20f980ccca92657a6e2ef68c10",
+        "campaign_topologies": [
+          "cpu",
+          "gpu1"
+        ],
+        "case_contract_sha256": "9abd6a171b12cd8de29f09fced1ef98dfeb015327b19a2a37ec15defe7177146"
+      },
+      "source_lane": "general_cpu_vs_gpu1",
+      "representative": true,
+      "impact": "high",
+      "rationale": "Representative MaterialGrid and inverse-design initialization workload with material construction and repeated solver phases."
+    },
+    {
+      "workload_id": "python/examples/adjoint_optimization/multilayer_opt.py",
+      "workload_name_sha256": "6e23b7300038001d17ebb096d3222b62c6136aa17a34f31a018945268fc0ab68",
+      "workload_identity": {
+        "source_commit": "3b750a83fe9ec056793af05c0402d6473a244170",
+        "source_file_sha256": "028743db16c845ad4c0ca335de16591c89e1688a6693ba145ab2b3cc90e20b29",
+        "entrypoint": "python/examples/adjoint_optimization/multilayer_opt.py",
+        "canonical_entrypoint_args": [],
+        "precision": "fp32",
+        "physics_and_stopping_source": "entrypoint_source_bytes",
+        "campaign_route_id": "case:multilayer-opt",
+        "campaign_route_sha256": "dbd7b805a143ddff7d9d32c8c94d3161238a78a234c5ed2806b22459636dc142",
+        "campaign_task_record_sha256": "fdb612cda2480d91e5766760b40edf92eb26ad541b002352b1a38643f7eeb130",
+        "campaign_result_sha256": "d8ffc606f90eb9d67ca42b9ccb8a17f11ae0e597af787d4185581ea8f8b27511",
+        "campaign_topologies": [
+          "cpu",
+          "gpu1"
+        ],
+        "case_contract_sha256": "b03fdd8cf26aa3d43b6b7c05b53bdd80cd9dc575fe9a4d23aae0db32bc0b31c4"
+      },
+      "source_lane": "general_cpu_vs_gpu1",
+      "representative": true,
+      "impact": "high",
+      "rationale": "Representative adjoint optimization loop exposing host orchestration, monitor, mutation, and FDTD balance."
+    },
+    {
+      "workload_id": "python/examples/absorber-1d.py",
+      "workload_name_sha256": "ce5aaa202f7ae38cd706fa464cba62c91b8090ac273efe736ea978604e93fb50",
+      "workload_identity": {
+        "source_commit": "3b750a83fe9ec056793af05c0402d6473a244170",
+        "source_file_sha256": "5369c43088415cee4530a49cb6911fcd443af69b73cc549f00380a9508d1a2e6",
+        "entrypoint": "python/examples/absorber-1d.py",
+        "canonical_entrypoint_args": [],
+        "precision": "fp32",
+        "physics_and_stopping_source": "entrypoint_source_bytes",
+        "campaign_route_id": "case:absorber-1d",
+        "campaign_route_sha256": "03e733be306f3e07262fe3e1e635963c788f978747e2925a858d93bc4596f409",
+        "campaign_task_record_sha256": "59b06809f292e8ff85bb2cb3bb72a202fef1332245279948eda706e2885275a2",
+        "campaign_result_sha256": "2cf3fbb1afd5a2260d724f917bb355dea3540f1bd4b4f73f015ebbc6fbb4147a",
+        "campaign_topologies": [
+          "cpu",
+          "gpu1"
+        ],
+        "case_contract_sha256": "7984a1c4a78aab84b93a274fc77b604d4a742f29c522706269f539565e54748e"
+      },
+      "source_lane": "general_cpu_vs_gpu1",
+      "representative": false,
+      "impact": "low",
+      "rationale": "Very small one-dimensional absorber seed is retained but overlaps the stronger nonlinear one-dimensional crossover case."
+    },
+    {
+      "workload_id": "python/examples/parallel-wvgs-force.py",
+      "workload_name_sha256": "3fbf961de198048941c6e99f4e1c31247371036a236f78a77c4d55a4f26e1e4e",
+      "workload_identity": {
+        "source_commit": "3b750a83fe9ec056793af05c0402d6473a244170",
+        "source_file_sha256": "423eaa19d39859288b263ad8c1c7e69d6314a19890c16d4b1389de28f2e86a05",
+        "entrypoint": "python/examples/parallel-wvgs-force.py",
+        "canonical_entrypoint_args": [],
+        "precision": "fp32",
+        "physics_and_stopping_source": "entrypoint_source_bytes",
+        "campaign_route_id": "case:parallel-waveguide-force",
+        "campaign_route_sha256": "57d694e1be5cc6fc7fbaa409fca353412a2f23500585efdf3d62ce57427e53b6",
+        "campaign_task_record_sha256": "461354dcb5767da6e012e3b7d4244686ae97e9cf2abb8b70231a8a3cb8c1bbc1",
+        "campaign_result_sha256": "3489e6492346a7525638f9e60eda306066d061e0e4e0822b28f60b0d6e6d2ec9",
+        "campaign_topologies": [
+          "cpu",
+          "gpu1"
+        ],
+        "case_contract_sha256": "41e2dc26c3441b5c5243a43ac1696553e76cd3a8f147ceb9bea607c899d7d970"
+      },
+      "source_lane": "general_cpu_vs_gpu1",
+      "representative": true,
+      "impact": "high",
+      "rationale": "Long force-monitor workload represents DFT accumulation, reductions, transfers, and end-to-end engine overhead."
+    },
+    {
+      "workload_id": "python/examples/antenna_pec_ground_plane_1D.py",
+      "workload_name_sha256": "4d981a09426e8bcda936f520f5839b9a7edfb7b77b3caff23198b20a41be3efd",
+      "workload_identity": {
+        "source_commit": "3b750a83fe9ec056793af05c0402d6473a244170",
+        "source_file_sha256": "96a819e80b003aaa128543af14d029397315b4f627af5a5a22c66cd49117c969",
+        "entrypoint": "python/examples/antenna_pec_ground_plane_1D.py",
+        "canonical_entrypoint_args": [],
+        "precision": "fp32",
+        "physics_and_stopping_source": "entrypoint_source_bytes",
+        "campaign_route_id": "case:antenna-pec-1d",
+        "campaign_route_sha256": "cde3baa4e014ef087d093617ecd801aa598bcbdc060456c4f7532735f445e1bf",
+        "campaign_task_record_sha256": "59b06809f292e8ff85bb2cb3bb72a202fef1332245279948eda706e2885275a2",
+        "campaign_result_sha256": "844a892852a8cd253dae92fb5f9b0d83d82e87c0963cd2cd07249a107e09a64b",
+        "campaign_topologies": [
+          "cpu",
+          "auto",
+          "gpu1"
+        ],
+        "case_contract_sha256": "aec9e01a4b59a9eb15c025d196d9ef5ac9011bd1e5c28c22c847b2b2032930b4"
+      },
+      "source_lane": "general_cpu_vs_gpu1",
+      "representative": false,
+      "impact": "low",
+      "rationale": "Small PEC one-dimensional seed remains registered but overlaps the one-dimensional launch-overhead representative."
+    },
+    {
+      "workload_id": "python/examples/3rd-harm-1d.py",
+      "workload_name_sha256": "c22c5530b079bd33da2bd9c3d53aaff88a69e8d249b616af25506fdfd76d37a7",
+      "workload_identity": {
+        "source_commit": "3b750a83fe9ec056793af05c0402d6473a244170",
+        "source_file_sha256": "c8b8b25ba6aa284c42a63c68214d119b75b2b25e78c75fdf28241dff4536909c",
+        "entrypoint": "python/examples/3rd-harm-1d.py",
+        "canonical_entrypoint_args": [],
+        "precision": "fp32",
+        "physics_and_stopping_source": "entrypoint_source_bytes",
+        "campaign_route_id": "case:third-harmonic",
+        "campaign_route_sha256": "87b0ba6442f9050317781d760ac031d2227403bec4c1fa7db59501d8e3968093",
+        "campaign_task_record_sha256": "461354dcb5767da6e012e3b7d4244686ae97e9cf2abb8b70231a8a3cb8c1bbc1",
+        "campaign_result_sha256": "0aee5a65a784335651ff5715aac6ecb9f1363c6435cdcc22c421b1bdad98f6d6",
+        "campaign_topologies": [
+          "cpu",
+          "gpu1"
+        ],
+        "case_contract_sha256": "f0a3763819f9efd2d7bce83b2b8b5ccb127a4f4ee632e6f9fad377fbbc177529"
+      },
+      "source_lane": "general_cpu_vs_gpu1",
+      "representative": true,
+      "impact": "high",
+      "rationale": "Largest general-case inversion and distinct nonlinear polarization plus DFT workload; cannot be dismissed as a duplicate."
+    },
+    {
+      "workload_id": "python/examples/adjoint_optimization/near2far_3d_validation.py",
+      "workload_name_sha256": "b36efb1c989eed672b12766583de460e8c2e82239316ce086498e8113fb2dd5c",
+      "workload_identity": {
+        "source_commit": "3b750a83fe9ec056793af05c0402d6473a244170",
+        "source_file_sha256": "af6c30a18b1dfcc7132b3fa082b9bc80e1a3f66c3a9ddd926737993a422a2037",
+        "entrypoint": "python/examples/adjoint_optimization/near2far_3d_validation.py",
+        "canonical_entrypoint_args": [],
+        "precision": "fp32",
+        "physics_and_stopping_source": "entrypoint_source_bytes",
+        "campaign_route_id": "case:near2far-3d-adjoint",
+        "campaign_route_sha256": "3cfd7a6b091a3a169750be5742eae4b00f5d947a006e424b4e6756bc0ac90091",
+        "campaign_task_record_sha256": "4d23a23b9d595fedf9481ce36135da508e0c266342bfa798e9432481b15c7407",
+        "campaign_result_sha256": "aaec950d67dd3725b3fccf61d3972ab3d50cdc7dffb8fa86c60ca22fe890d51f",
+        "campaign_topologies": [
+          "cpu",
+          "gpu1",
+          "gpu2"
+        ],
+        "case_contract_sha256": "af676267baf880e7496518a3cc44967ea555f0b35a9a6bb83efed033779736f3"
+      },
+      "source_lane": "mpi_cpu8_vs_gpu1_gpu2",
+      "representative": true,
+      "impact": "high",
+      "rationale": "Representative three-dimensional adjoint Near2Far workload covering MPI, transforms, and compact reductions."
+    },
+    {
+      "workload_id": "python/examples/edge_emitter_3D.py",
+      "workload_name_sha256": "7b747b030a228a2cc241c4ba06fc32128a270ae9bdf999f5b91b65c2e32e04a9",
+      "workload_identity": {
+        "source_commit": "3b750a83fe9ec056793af05c0402d6473a244170",
+        "source_file_sha256": "a488e887823cef8650f36a1abe0f083734792706003121f2bd0ab028c9c1034e",
+        "entrypoint": "python/examples/edge_emitter_3D.py",
+        "canonical_entrypoint_args": [],
+        "precision": "fp32",
+        "physics_and_stopping_source": "entrypoint_source_bytes",
+        "campaign_route_id": "case:edge-emitter-3d",
+        "campaign_route_sha256": "8c3e167667e1bf111db10d467446274d7ad39db61443d378d8b7dfe839261a91",
+        "campaign_task_record_sha256": "43a6edb2648c20e5a84f801a7e90918dc081fce64186950bc418df8436e80cec",
+        "campaign_result_sha256": "e2ebe3eac180a47f8e0119b9a9e059a8d0673baef3a678405f51afe6e7246eb9",
+        "campaign_topologies": [
+          "cpu",
+          "auto",
+          "gpu1",
+          "gpu2"
+        ],
+        "case_contract_sha256": "25818e212c38b54cc4b85c837acabe2d513f282ddff5984e32c2cb273c779bd3"
+      },
+      "source_lane": "mpi_cpu8_vs_gpu1_gpu2",
+      "representative": true,
+      "impact": "high",
+      "rationale": "Representative three-dimensional emitter workload for rank-local work, initialization, and multi-GPU scaling."
+    },
+    {
+      "workload_id": "python/examples/dipole_in_vacuum_cyl_off_axis.py",
+      "workload_name_sha256": "c64a2b9f54d35f2663952603b3bb863a0cd882b3c52f3b6370c0ce373280e696",
+      "workload_identity": {
+        "source_commit": "3b750a83fe9ec056793af05c0402d6473a244170",
+        "source_file_sha256": "0a0420a14f12906a326a200e0003a64ad340e6c65bddb3c9656b80f213cc1ce0",
+        "entrypoint": "python/examples/dipole_in_vacuum_cyl_off_axis.py",
+        "canonical_entrypoint_args": [],
+        "precision": "fp32",
+        "physics_and_stopping_source": "entrypoint_source_bytes",
+        "campaign_route_id": "case:cyl-off-axis",
+        "campaign_route_sha256": "d5a52df255e5bdb8deddc7cfe1389553aa109b86b72a326394b9bf99b67e2392",
+        "campaign_task_record_sha256": "f2e34c20d36724da8039ac62af8e67f05f9a42f801a97fcc972a44cdcf37ac81",
+        "campaign_result_sha256": "c555da89ddd8f1b0d9296cce4c6166a6555bf29646d06eb56c2b64d9c7f92551",
+        "campaign_topologies": [
+          "cpu",
+          "gpu1",
+          "gpu2"
+        ],
+        "case_contract_sha256": "79ea6b84dedeea1e68edf7fa005df3aec397b6084a037e25279e8ec25ea94387"
+      },
+      "source_lane": "mpi_cpu8_vs_gpu1_gpu2",
+      "representative": true,
+      "impact": "high",
+      "rationale": "Representative cylindrical off-axis workload with severe GPU inversion and distinct coordinate kernels."
+    },
+    {
+      "workload_id": "python/tests/test_adjoint_cyl.py",
+      "workload_name_sha256": "33048645905ed6a669c8aac5426a05a3bf875a29c5d24be1e76425f2db05795b",
+      "workload_identity": {
+        "source_commit": "3b750a83fe9ec056793af05c0402d6473a244170",
+        "source_file_sha256": "43074d769ad8bf765855432200b5b4221a2c8f169696ee1c219d363ddd332f38",
+        "entrypoint": "python/tests/test_adjoint_cyl.py",
+        "canonical_entrypoint_args": [],
+        "precision": "fp32",
+        "physics_and_stopping_source": "entrypoint_source_bytes",
+        "campaign_route_id": "case:adjoint-cyl",
+        "campaign_route_sha256": "7ecfb0e08b6f6b08c5fd6312b7264eed2ad9910379c7311ed5b39b8cdd71a831",
+        "campaign_task_record_sha256": "a3b4e42b5a8744ae8baf0a4c34890a9cc0c7f98e383e30b2f5718ccdc3e59b44",
+        "campaign_result_sha256": "24515a31ee4e11fcee0bbaeab68ff8866ed26513edc6808b0d70ed15fe72201e",
+        "campaign_topologies": [
+          "cpu",
+          "gpu1",
+          "gpu2"
+        ],
+        "case_contract_sha256": "0e2db2b5189a688d72b40072853d1ff93bb3395e0f151a61c663199779ec1dbb"
+      },
+      "source_lane": "mpi_cpu8_vs_gpu1_gpu2",
+      "representative": true,
+      "impact": "high",
+      "rationale": "Largest MPI inversion and unique cylindrical adjoint derivative workload; unresolved engine or unknown cause blocks release."
+    }
+  ]
+}

@@ -256,10 +256,12 @@ mode_solver::mode_solver(int num_bands, double resolution[3], lattice lat, doubl
       Hblock{}, muinvH{}, W{}, freqs(num_bands), verbose(verbose), deterministic(deterministic),
       kpoint_index(0), curfield(NULL), curfield_type('-') {
 
+  meep_geom::geometry_state_transaction transaction;
   // See geom-ctl-io-defaults.c in libctl
   geometry_lattice = lat;
   dimensions = dims;
   ensure_periodicity = periodicity;
+  meep_geom::commit_geometry_state_mutation();
 
 #ifndef WITH_HERMITIAN_EPSILON
   meep_geom::medium_struct *m;
@@ -716,6 +718,7 @@ bool mode_solver::using_mu() { return mdata && mdata->mu_inv != NULL; }
 
 void mode_solver::init(int p, bool reset_fields, geometric_object_list *geometry,
                        meep_geom::material_data *_default_material) {
+  meep_geom::geometry_state_transaction transaction;
   int have_old_fields = 0;
 
   set_default_material(_default_material);
@@ -729,7 +732,10 @@ void mode_solver::init(int p, bool reset_fields, geometric_object_list *geometry
   }
 
   int true_rank = n[2] > 1 ? 3 : (n[1] > 1 ? 2 : 1);
-  if (true_rank < dimensions) { dimensions = true_rank; }
+  if (true_rank < dimensions) {
+    dimensions = true_rank;
+    meep_geom::commit_geometry_state_mutation();
+  }
   else if (true_rank > dimensions) {
     if (mpb_verbosity > 0)
       meep::master_printf("WARNING: rank of grid is > dimensions.\n"
@@ -831,6 +837,7 @@ void mode_solver::init(int p, bool reset_fields, geometric_object_list *geometry
 }
 
 void mode_solver::init_epsilon(geometric_object_list *geometry_in) {
+  meep_geom::geometry_state_transaction transaction;
   // Persist geometry data and move it out of the input argument.
   clear_geometry_list();
   if (geometry_in->num_items && geometry_in->items) {
@@ -933,6 +940,7 @@ void mode_solver::init_epsilon(geometric_object_list *geometry_in) {
 }
 
 void mode_solver::reset_epsilon(geometric_object_list *geometry) {
+  meep_geom::geometry_state_transaction transaction;
   int mesh[3] = {
       mesh_size,
       (dimensions > 1) ? mesh_size : 1,
@@ -1552,15 +1560,37 @@ void mode_solver::set_grid_size(vector3 gs) {
   grid_size.z = gs.z;
 }
 
-int mode_solver::get_libctl_dimensions() { return dimensions; }
+int mode_solver::get_libctl_dimensions() {
+  meep_geom::geometry_state_transaction transaction;
+  return dimensions;
+}
 
-void mode_solver::set_libctl_dimensions(int val) { dimensions = val; }
+void mode_solver::set_libctl_dimensions(int val) {
+  meep_geom::geometry_state_transaction transaction;
+  if (dimensions != val) {
+    dimensions = val;
+    meep_geom::commit_geometry_state_mutation();
+  }
+}
 
-bool mode_solver::get_libctl_ensure_periodicity() { return ensure_periodicity; }
+bool mode_solver::get_libctl_ensure_periodicity() {
+  meep_geom::geometry_state_transaction transaction;
+  return ensure_periodicity;
+}
 
-void mode_solver::set_libctl_ensure_periodicity(bool val) { ensure_periodicity = val; }
+void mode_solver::set_libctl_ensure_periodicity(bool val) {
+  meep_geom::geometry_state_transaction transaction;
+  if (ensure_periodicity != val) {
+    ensure_periodicity = val;
+    meep_geom::commit_geometry_state_mutation();
+  }
+}
 
-void mode_solver::set_libctl_geometry_lattice(lattice val) { geometry_lattice = val; }
+void mode_solver::set_libctl_geometry_lattice(lattice val) {
+  meep_geom::geometry_state_transaction transaction;
+  geometry_lattice = val;
+  meep_geom::commit_geometry_state_mutation();
+}
 
 void mode_solver::get_curfield(double *data, int size) {
   mpb_real *p = (mpb_real *)curfield;
@@ -2352,6 +2382,7 @@ mpb_real mode_solver::compute_energy_in_dielectric(mpb_real eps_low, mpb_real ep
    objects in the list have precedence, just like the ordinary
    geometry list. */
 double mode_solver::compute_energy_in_objects(geometric_object_list objects) {
+  meep_geom::geometry_state_transaction transaction;
 
   mpb_real *energy = (mpb_real *)curfield;
   mpb_real energy_sum = 0;

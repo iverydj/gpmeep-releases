@@ -4,6 +4,12 @@
 import json
 
 import meep as mp
+from meep.backend_policy import BackendRecommendationMismatch
+
+
+ACKNOWLEDGEMENT_REASON = (
+    "Installed GPU example intentionally demonstrates explicit CUDA below crossover"
+)
 
 
 if not mp.gpu.compiled:
@@ -22,7 +28,16 @@ simulation = mp.Simulation(
         )
     ],
 )
-simulation.run(until=10)
+try:
+    simulation.run(until=10)
+except BackendRecommendationMismatch as mismatch:
+    # This tiny smoke problem is intentionally below the GPU performance
+    # crossover. gpmeep never changes the selected backend: acknowledge the
+    # exact warning challenge only when CUDA execution is still desired.
+    mp.gpu.acknowledge_backend_mismatch(
+        mismatch.challenge, ACKNOWLEDGEMENT_REASON
+    )
+    simulation.run(until=10)
 record = {
     "requested_backend": mp.gpu.requested_backend,
     "active_backend": mp.gpu.active_backend,
@@ -31,6 +46,7 @@ record = {
         simulation.fields.gpu_cuda_execution_selected()
     ),
     "timesteps": int(simulation.timestep()),
+    "backend_recommendation": mp.gpu.recommendation,
     "statistics": mp.gpu.statistics(),
 }
 if record["active_backend"] != "cuda" or not record["cuda_execution_selected"]:

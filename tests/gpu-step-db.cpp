@@ -729,7 +729,15 @@ void aggregate_statistics(run_result &result) {
       global_sum(result.polarizations.cpu_update_calls),
       global_sum(result.polarizations.cpu_update_points),
       global_sum(result.polarizations.cuda_update_calls),
-      global_sum(result.polarizations.cuda_update_points)};
+      global_sum(result.polarizations.cuda_update_points),
+      global_sum(
+          result.polarizations.cuda_zero_state_elision_enabled_calls),
+      global_sum(
+          result.polarizations.cuda_zero_state_elision_enabled_points),
+      global_sum(
+          result.polarizations.cuda_zero_state_elision_inspectable_calls),
+      global_sum(
+          result.polarizations.cuda_zero_state_elision_inspectable_points)};
   result.sources = {
       global_sum(result.sources.cpu_update_calls),
       global_sum(result.sources.cpu_update_points),
@@ -847,9 +855,12 @@ run_result run_case(gpu::backend_mode mode, test_dimension which,
 run_result run_material_case(gpu::backend_mode mode, bool complex_bloch,
                              int loop_tile_base = 64,
                              bool volume_source_batch_fixture = false,
-                             int statistics_reset_step = -1) {
+                             int statistics_reset_step = -1,
+                             bool inject_graph_creation_failure = false) {
   gpu::set_backend(mode);
   gpu::reset_dispatch_statistics();
+  if (inject_graph_creation_failure)
+    gpu::detail::set_structured_curl_graph_creation_failures_for_testing(1);
 
   const grid_volume gv = vol2d(2.0, 2.0, 10.0);
   anisotropic_test_material anisotropic;
@@ -892,6 +903,7 @@ run_result run_material_case(gpu::backend_mode mode, bool complex_bloch,
     if (step + 1 == statistics_reset_step)
       gpu::reset_dispatch_statistics();
   }
+  gpu::detail::set_structured_curl_graph_creation_failures_for_testing(0);
 
   run_result result;
   const vec points[] = {vec(0.37, 0.41), vec(1.0, 1.0), vec(1.61, 1.53)};
@@ -1219,6 +1231,9 @@ struct curl_replay_host_write_result {
   gpu::curl_phase_replay_statistics before{};
   gpu::curl_phase_replay_statistics after{};
   gpu::curl_phase_replay_statistics after_replay{};
+  gpu::structured_curl_graph_statistics graph_before{};
+  gpu::structured_curl_graph_statistics graph_after{};
+  gpu::structured_curl_graph_statistics graph_after_replay{};
   gpu::dispatch_statistics dispatch_before{};
   gpu::dispatch_statistics dispatch_after{};
   gpu::dispatch_statistics dispatch_after_replay{};
@@ -1269,6 +1284,7 @@ curl_replay_host_write_result run_curl_replay_host_write_case(
   curl_replay_host_write_result result;
   gpu::reset_dispatch_statistics();
   result.before = gpu::get_curl_phase_replay_statistics();
+  result.graph_before = gpu::get_structured_curl_graph_statistics();
   result.dispatch_before = gpu::get_dispatch_statistics();
   result.resident_before = gpu::get_resident_statistics();
   result.expected_upload_bytes =
@@ -1276,11 +1292,14 @@ curl_replay_host_write_result run_curl_replay_host_write_case(
   run_single_curl_phase(
       f, B_stuff, mode == gpu::backend_mode::cuda);
   result.after = gpu::get_curl_phase_replay_statistics();
+  result.graph_after = gpu::get_structured_curl_graph_statistics();
   result.dispatch_after = gpu::get_dispatch_statistics();
   result.resident_after = gpu::get_resident_statistics();
   run_single_curl_phase(
       f, B_stuff, mode == gpu::backend_mode::cuda);
   result.after_replay = gpu::get_curl_phase_replay_statistics();
+  result.graph_after_replay =
+      gpu::get_structured_curl_graph_statistics();
   result.dispatch_after_replay = gpu::get_dispatch_statistics();
   if (mode == gpu::backend_mode::cuda)
     for (int chunk_index = 0; chunk_index < f.num_chunks; ++chunk_index)
@@ -1474,6 +1493,50 @@ run_result run_backend_transition_case(bool transition_to_cpu) {
   return result;
 }
 
+void require_active_resident_phase_transition_rollback() {
+  gpu::set_backend(gpu::backend_mode::cuda);
+  const std::uint64_t live_before =
+      gpu::get_live_resident_device_buffers();
+  const std::uint64_t generation_before =
+      gpu::detail::backend_generation();
+  const int ordinal_before = gpu::selected_device();
+  const std::string identifier_before =
+      gpu::selected_device_identifier();
+  int owner = 0;
+  std::vector<float> values(32, 0.5f);
+  {
+    gpu::detail::resident_curl_session resident(&owner, true);
+    gpu::detail::resident_ensure_mirror_fp32(
+        resident.cache(), values.data(), values.size());
+    const gpu::detail::indexed_value_fp32 subtract = {0, 0.125f};
+    gpu::detail::resident_indexed_subtract_fp32(
+        resident.cache(), values.data(), values.size(), &subtract, 1);
+    bool rejected = false;
+    try {
+      gpu::set_backend(gpu::backend_mode::cpu);
+    }
+    catch (const std::logic_error &error) {
+      rejected =
+          std::string(error.what()).find("active resident phase") !=
+          std::string::npos;
+    }
+    require(rejected &&
+                gpu::active_backend() == gpu::backend_mode::cuda &&
+                gpu::detail::cuda_active() &&
+                gpu::detail::backend_generation() == generation_before &&
+                gpu::selected_device() == ordinal_before &&
+                gpu::selected_device_identifier() == identifier_before,
+            "active resident phase backend rejection did not roll back the "
+            "committed CUDA configuration");
+    resident.finish(true);
+  }
+  require(std::abs(values[0] - 0.375f) == 0.0,
+          "active-phase rollback lost the device-authoritative dirty value");
+  gpu::detail::destroy_resident_cache_for_owner(&owner);
+  require(gpu::get_live_resident_device_buffers() == live_before,
+          "active-phase rollback leaked a resident device buffer");
+}
+
 run_result run_initialize_field_case(gpu::backend_mode mode) {
   gpu::set_backend(mode);
   const grid_volume gv = vol2d(1.8, 1.6, 10.0);
@@ -1492,28 +1555,6 @@ run_result run_initialize_field_case(gpu::backend_mode mode) {
   const vec points[] = {gv.center(), vec(0.43, 0.57), vec(1.31, 1.07)};
   for (const vec &point : points)
     result.samples.push_back(f.get_field(Ez, point));
-  aggregate_statistics(result);
-  return result;
-}
-
-run_result run_initialize_field_before_step_case(
-    gpu::backend_mode mode) {
-  gpu::set_backend(mode);
-  gpu::reset_dispatch_statistics();
-  const grid_volume gv = vol2d(1.8, 1.6, 10.0);
-  structure s(gv, vacuum, no_pml());
-  fields f(&s, 0.0, 0.0, true, 64, 64);
-  f.use_real_fields();
-  f.initialize_field(Ez, initialized_profile);
-
-  run_result result;
-  result.statistics = gpu::get_dispatch_statistics();
-  result.resident = gpu::get_resident_statistics();
-  result.field_updates = gpu::get_field_update_statistics();
-  result.polarizations = gpu::get_polarization_statistics();
-  result.sources = gpu::get_source_statistics();
-  result.boundaries = gpu::get_boundary_statistics();
-  result.dfts = gpu::get_dft_statistics();
   aggregate_statistics(result);
   return result;
 }
@@ -1861,7 +1902,8 @@ void update_owned_polarizations(fields &owner, field_type ft) {
 }
 
 void require_standard_drude_neutral_state(gpu::backend_mode mode,
-                                          int iterations) {
+                                          int iterations,
+                                          bool expect_zero_state_elision = false) {
   require(iterations > 0,
           "Drude neutral-state regression requires positive iterations");
   gpu::set_backend(gpu::backend_mode::cpu);
@@ -1925,6 +1967,27 @@ void require_standard_drude_neutral_state(gpu::backend_mode mode,
               : statistics.cpu_update_calls > 0 &&
                     statistics.cuda_update_calls == 0,
           "production Drude state regression used the wrong backend");
+  if (mode == gpu::backend_mode::cuda) {
+    if (expect_zero_state_elision)
+      require(
+          statistics.cuda_zero_state_elision_enabled_calls ==
+                  statistics.cuda_update_calls &&
+              statistics.cuda_zero_state_elision_enabled_points ==
+                  statistics.cuda_update_points &&
+              statistics.cuda_zero_state_elision_inspectable_calls ==
+                  statistics.cuda_update_calls &&
+              statistics.cuda_zero_state_elision_inspectable_points ==
+                  statistics.cuda_update_points,
+          "zero-state Lorentzian elision counters did not cover the "
+          "isotropic finite production launches");
+    else
+      require(
+          statistics.cuda_zero_state_elision_enabled_calls == 0 &&
+              statistics.cuda_zero_state_elision_enabled_points == 0 &&
+              statistics.cuda_zero_state_elision_inspectable_calls == 0 &&
+              statistics.cuda_zero_state_elision_inspectable_points == 0,
+          "disabled zero-state Lorentzian elision reported causal work");
+  }
 }
 
 void require_standard_lorentz_previous_state(gpu::backend_mode mode) {
@@ -2289,12 +2352,1756 @@ void require_integrated_ade_state_contract(bool cuda_available) {
     // The header-level CUDA primitive has its own million-step gate. These
     // integrated updates prove that production host dispatch selects that
     // increment kernel for Drude and the legacy kernel for Lorentz.
-    require_standard_drude_neutral_state(gpu::backend_mode::cuda, 64);
-    require_standard_lorentz_previous_state(gpu::backend_mode::cuda);
-    require_fine_grid_lorentz_increment_state(gpu::backend_mode::cuda);
+    {
+      scoped_environment_override enable_elision(
+          "MEEP_GPU_ENABLE_ZERO_STATE_LORENTZIAN_ELISION", nullptr);
+      scoped_environment_override disable_elision(
+          "MEEP_GPU_DISABLE_ZERO_STATE_LORENTZIAN_ELISION", "1");
+      require_standard_drude_neutral_state(gpu::backend_mode::cuda, 64);
+      require_standard_lorentz_previous_state(gpu::backend_mode::cuda);
+      require_fine_grid_lorentz_increment_state(gpu::backend_mode::cuda);
+    }
+    {
+      scoped_environment_override enable_elision(
+          "MEEP_GPU_ENABLE_ZERO_STATE_LORENTZIAN_ELISION", "1");
+      scoped_environment_override disable_elision(
+          "MEEP_GPU_DISABLE_ZERO_STATE_LORENTZIAN_ELISION", nullptr);
+      require_standard_drude_neutral_state(gpu::backend_mode::cuda, 64,
+                                           true);
+    }
+    {
+      scoped_environment_override enable_elision(
+          "MEEP_GPU_ENABLE_ZERO_STATE_LORENTZIAN_ELISION", "1");
+      scoped_environment_override disable_elision(
+          "MEEP_GPU_DISABLE_ZERO_STATE_LORENTZIAN_ELISION", "1");
+      require_standard_drude_neutral_state(gpu::backend_mode::cuda, 1);
+    }
+    const char *malformed_enable_values[] = {"", "0", "true", "01"};
+    for (const char *malformed : malformed_enable_values) {
+      scoped_environment_override enable_elision(
+          "MEEP_GPU_ENABLE_ZERO_STATE_LORENTZIAN_ELISION", malformed);
+      scoped_environment_override disable_elision(
+          "MEEP_GPU_DISABLE_ZERO_STATE_LORENTZIAN_ELISION", nullptr);
+      require_standard_drude_neutral_state(gpu::backend_mode::cuda, 1);
+    }
   }
 #else
   (void)cuda_available;
+#endif
+}
+
+void require_sparse_lorentzian_production_contract(
+    gpu::detail::lorentzian_state_kind state_kind) {
+#if MEEP_SINGLE
+  constexpr std::size_t point_count = 70000;
+  constexpr std::size_t active_period = 16;
+  constexpr int iterations = 4;
+  const std::size_t expected_active =
+      (point_count + active_period - 1) / active_period;
+  std::vector<realnum> initial_p(point_count, realnum(0.0));
+  std::vector<realnum> initial_aux(point_count, realnum(0.0));
+  std::vector<realnum> field(point_count, realnum(0.0));
+  std::vector<realnum> sigma(point_count, realnum(0.0));
+  for (std::size_t index = 0; index < point_count; ++index) {
+    field[index] = static_cast<realnum>(
+        (static_cast<int>(index % 29) - 14) * 0.015625);
+    if (index % active_period == 0) sigma[index] = realnum(0.125);
+  }
+
+  gpu::detail::index_space_fp32 space{};
+  space.extent1 = 1;
+  space.extent2 = 1;
+  space.extent3 = point_count;
+  space.field_stride3 = 1;
+  space.coefficient_start = -1;
+  space.coefficient2_start = -1;
+  const gpu::detail::lorentzian_material_fp32 material = {
+      sigma.data(), nullptr, nullptr, 0.91f, 0.87f, 0.12f, 0.12f};
+
+  const auto run = [&](const void *owner, std::vector<realnum> &p,
+                       std::vector<realnum> &aux, bool enabled) {
+    scoped_environment_override enable_sparse(
+        "MEEP_GPU_ENABLE_SPARSE_LORENTZIAN_PLAN", enabled ? "1" : nullptr);
+    scoped_environment_override disable_sparse(
+        "MEEP_GPU_DISABLE_SPARSE_LORENTZIAN_PLAN", enabled ? nullptr : "1");
+    for (int iteration = 0; iteration < iterations; ++iteration) {
+      gpu::detail::resident_curl_session session(owner, true);
+      gpu::detail::resident_update_lorentzian_fp32(
+          session.cache(), p.data(), aux.data(), field.data(), nullptr,
+          nullptr, point_count, space, 0, 0, 0, material, state_kind);
+      session.finish(false);
+    }
+    gpu::detail::sync_resident_cache_for_owner(owner);
+  };
+
+  int dense_owner = 0;
+  std::vector<realnum> dense_p = initial_p;
+  std::vector<realnum> dense_aux = initial_aux;
+  run(&dense_owner, dense_p, dense_aux, false);
+  gpu::detail::destroy_resident_cache_for_owner(&dense_owner);
+
+  gpu::reset_sparse_lorentzian_statistics();
+  int sparse_owner = 0;
+  std::vector<realnum> sparse_p = initial_p;
+  std::vector<realnum> sparse_aux = initial_aux;
+  run(&sparse_owner, sparse_p, sparse_aux, true);
+  require(std::memcmp(dense_p.data(), sparse_p.data(),
+                      point_count * sizeof(realnum)) == 0 &&
+              std::memcmp(dense_aux.data(), sparse_aux.data(),
+                          point_count * sizeof(realnum)) == 0,
+          "production sparse Lorentzian update is not bitwise equal to "
+          "the structured recurrence");
+
+  bool active_query_rejected = false;
+  bool active_reset_rejected = false;
+  {
+    gpu::detail::resident_curl_session active_session(&sparse_owner, true);
+    try {
+      (void)gpu::get_sparse_lorentzian_statistics();
+    }
+    catch (const std::logic_error &) {
+      active_query_rejected = true;
+    }
+    try {
+      gpu::reset_sparse_lorentzian_statistics();
+    }
+    catch (const std::logic_error &) {
+      active_reset_rejected = true;
+    }
+    active_session.finish(false);
+  }
+  require(active_query_rejected && active_reset_rejected,
+          "checked sparse Lorentzian statistics API accepted an active "
+          "resident phase");
+
+  const gpu::sparse_lorentzian_statistics statistics =
+      gpu::get_sparse_lorentzian_statistics();
+  require(statistics.opt_in_calls == iterations &&
+              statistics.opt_in_points == iterations * point_count &&
+              statistics.eligible_calls == iterations &&
+              statistics.ineligible_calls == 0 &&
+              statistics.first_observation_dense_calls == 1 &&
+              statistics.first_observation_dense_points == point_count &&
+              statistics.plan_build_attempts == 1 &&
+              statistics.plan_build_successes == 1 &&
+              statistics.plan_build_failures == 0 &&
+              statistics.plan_hits == iterations - 2 &&
+              statistics.accepted_total_points == point_count &&
+              statistics.accepted_active_points == expected_active &&
+              statistics.sparse_submission_calls == iterations - 1 &&
+              statistics.sparse_submission_points ==
+                  (iterations - 1) * expected_active &&
+              statistics.guard_scan_submissions == iterations - 1 &&
+              statistics.device_guard_scan_calls == iterations - 1 &&
+              statistics.device_sparse_update_calls == iterations - 1 &&
+              statistics.device_sparse_update_points ==
+                  (iterations - 1) * expected_active &&
+              statistics.device_dense_fallback_calls == 0 &&
+              statistics.live_plans == 1 &&
+              statistics.live_guards == 1 &&
+              statistics.retained_index_bytes ==
+                  expected_active * sizeof(std::ptrdiff_t) &&
+              !statistics.counter_overflow &&
+              !statistics.teardown_incomplete,
+          "production sparse Lorentzian causal statistics are incorrect");
+
+  const std::uint64_t buffers_before_failed_reset =
+      gpu::get_live_resident_device_buffers();
+  const char *reset_failure_stages[] = {
+      "statistics-reset", "statistics-reset-allocation",
+      "statistics-reset-copy"};
+  for (const char *stage : reset_failure_stages) {
+    bool reset_failed = false;
+    {
+      scoped_environment_override fail_reset(
+          "MEEP_GPU_TEST_SPARSE_LORENTZIAN_FAIL_STAGE", stage);
+      try {
+        gpu::reset_sparse_lorentzian_statistics();
+      }
+      catch (const std::runtime_error &) {
+        reset_failed = true;
+      }
+    }
+    const gpu::sparse_lorentzian_statistics after_failed_reset =
+        gpu::get_sparse_lorentzian_statistics();
+    require(reset_failed &&
+                after_failed_reset.reset_generation ==
+                    statistics.reset_generation &&
+                after_failed_reset.opt_in_calls == statistics.opt_in_calls &&
+                after_failed_reset.device_sparse_update_calls ==
+                    statistics.device_sparse_update_calls &&
+                after_failed_reset.live_plans == statistics.live_plans &&
+                gpu::get_live_resident_device_buffers() ==
+                    buffers_before_failed_reset,
+            std::string("failed sparse Lorentzian statistics reset was not "
+                        "transactional: ") + stage);
+  }
+
+  gpu::reset_sparse_lorentzian_statistics();
+  const gpu::sparse_lorentzian_statistics reset =
+      gpu::get_sparse_lorentzian_statistics();
+  require(reset.opt_in_calls == 0 && reset.plan_build_attempts == 0 &&
+              reset.device_guard_scan_calls == 0 &&
+              reset.device_sparse_update_calls == 0 &&
+              reset.device_dense_fallback_calls == 0 &&
+              reset.live_plans == 1 && reset.live_guards == 1,
+          "checked sparse Lorentzian statistics reset lost live gauges or "
+          "retained causal counts");
+  gpu::detail::destroy_resident_cache_for_owner(&sparse_owner);
+  const gpu::sparse_lorentzian_statistics destroyed =
+      gpu::get_sparse_lorentzian_statistics();
+  require(destroyed.live_plans == 0 && destroyed.live_guards == 0 &&
+              destroyed.retained_index_bytes == 0 &&
+              !destroyed.teardown_incomplete,
+          "sparse Lorentzian cache destruction retained published plans");
+#else
+  (void)state_kind;
+#endif
+}
+
+void require_sparse_lorentzian_build_failure_atomicity() {
+#if MEEP_SINGLE
+  constexpr std::size_t point_count = 70000;
+  constexpr std::size_t active_period = 16;
+  constexpr int iterations = 3;
+  std::vector<realnum> field(point_count, realnum(0.25));
+  std::vector<realnum> sigma(point_count, realnum(0.0));
+  for (std::size_t index = 0; index < point_count;
+       index += active_period)
+    sigma[index] = realnum(0.125);
+  gpu::detail::index_space_fp32 space{};
+  space.extent1 = 1;
+  space.extent2 = 1;
+  space.extent3 = point_count;
+  space.field_stride3 = 1;
+  space.coefficient_start = -1;
+  space.coefficient2_start = -1;
+  const gpu::detail::lorentzian_material_fp32 material = {
+      sigma.data(), nullptr, nullptr, 0.91f, 0.87f, 0.12f, 0.12f};
+
+  const auto run = [&](const void *owner, std::vector<realnum> &p,
+                       std::vector<realnum> &aux) {
+    for (int iteration = 0; iteration < iterations; ++iteration) {
+      gpu::detail::resident_curl_session session(owner, true);
+      gpu::detail::resident_update_lorentzian_fp32(
+          session.cache(), p.data(), aux.data(), field.data(), nullptr,
+          nullptr, point_count, space, 0, 0, 0, material,
+          gpu::detail::lorentzian_state_kind::previous);
+      session.finish(false);
+    }
+    gpu::detail::sync_resident_cache_for_owner(owner);
+  };
+
+  std::vector<realnum> dense_p(point_count, realnum(0.0));
+  std::vector<realnum> dense_aux(point_count, realnum(0.0));
+  int dense_owner = 0;
+  {
+    scoped_environment_override enable_sparse(
+        "MEEP_GPU_ENABLE_SPARSE_LORENTZIAN_PLAN", nullptr);
+    scoped_environment_override disable_sparse(
+        "MEEP_GPU_DISABLE_SPARSE_LORENTZIAN_PLAN", "1");
+    run(&dense_owner, dense_p, dense_aux);
+  }
+  gpu::detail::destroy_resident_cache_for_owner(&dense_owner);
+
+  const char *failure_stages[] = {
+      "count-allocation", "count-copy", "prefix", "offset-upload",
+      "index-allocation", "fill", "completion", "ledger-allocation",
+      "guard-allocation", "guard-scan"};
+  for (const char *stage : failure_stages) {
+    gpu::reset_sparse_lorentzian_statistics();
+    const std::uint64_t live_buffers_before_case =
+        gpu::get_live_resident_device_buffers();
+    std::vector<realnum> candidate_p(point_count, realnum(0.0));
+    std::vector<realnum> candidate_aux(point_count, realnum(0.0));
+    int owner = 0;
+    {
+      scoped_environment_override enable_sparse(
+          "MEEP_GPU_ENABLE_SPARSE_LORENTZIAN_PLAN", "1");
+      scoped_environment_override disable_sparse(
+          "MEEP_GPU_DISABLE_SPARSE_LORENTZIAN_PLAN", nullptr);
+      scoped_environment_override failure(
+          "MEEP_GPU_TEST_SPARSE_LORENTZIAN_FAIL_STAGE", stage);
+      run(&owner, candidate_p, candidate_aux);
+    }
+    require(std::memcmp(dense_p.data(), candidate_p.data(),
+                        point_count * sizeof(realnum)) == 0 &&
+                std::memcmp(dense_aux.data(), candidate_aux.data(),
+                            point_count * sizeof(realnum)) == 0,
+            std::string("sparse Lorentzian failure stage changed recurrence: ") +
+                stage);
+    const gpu::sparse_lorentzian_statistics statistics =
+        gpu::get_sparse_lorentzian_statistics();
+    const bool guard_failure = std::strcmp(stage, "guard-scan") == 0;
+    require(statistics.plan_build_attempts == 1 &&
+                statistics.plan_build_successes ==
+                    static_cast<std::uint64_t>(guard_failure) &&
+                statistics.plan_build_failures ==
+                    static_cast<std::uint64_t>(!guard_failure) &&
+                statistics.sparse_submission_calls == 0 &&
+                statistics.device_sparse_update_calls == 0 &&
+                statistics.device_dense_fallback_calls == 0 &&
+                statistics.live_plans == 0 &&
+                statistics.live_guards == 0 &&
+                gpu::get_live_resident_device_buffers() ==
+                    live_buffers_before_case + 4 &&
+                !statistics.teardown_incomplete,
+            std::string("sparse Lorentzian failure stage published work: ") +
+                stage);
+    gpu::detail::destroy_resident_cache_for_owner(&owner);
+    require(gpu::get_live_resident_device_buffers() ==
+                live_buffers_before_case,
+            std::string("sparse Lorentzian failure stage leaked a device "
+                        "allocation after teardown: ") + stage);
+  }
+#endif
+}
+
+void require_sparse_lorentzian_selection_contract() {
+#if MEEP_SINGLE
+  enum class expected_selection {
+    disabled,
+    below_workload_floor,
+    dense_locked,
+    all_zero_sparse
+  };
+  const auto run_case = [](const char *label, std::size_t point_count,
+                           std::size_t active_period,
+                           const char *enable_value,
+                           const char *disable_value,
+                           expected_selection expected,
+                           bool unused_cross_fields) {
+    constexpr int iterations = 3;
+    std::vector<realnum> p(point_count, realnum(0.0));
+    std::vector<realnum> auxiliary(point_count, realnum(0.0));
+    std::vector<realnum> field(point_count, realnum(0.25));
+    std::vector<realnum> cross_field1(point_count, realnum(-0.5));
+    std::vector<realnum> cross_field2(point_count, realnum(0.75));
+    std::vector<realnum> sigma(point_count, realnum(0.0));
+    if (active_period != 0)
+      for (std::size_t index = 0; index < point_count;
+           index += active_period)
+        sigma[index] = realnum(0.125);
+    gpu::detail::index_space_fp32 space{};
+    space.extent1 = 1;
+    space.extent2 = 1;
+    space.extent3 = point_count;
+    space.field_stride3 = 1;
+    space.coefficient_start = -1;
+    space.coefficient2_start = -1;
+    const gpu::detail::lorentzian_material_fp32 material = {
+        sigma.data(), nullptr, nullptr, 0.91f, 0.87f, 0.12f, 0.12f};
+
+    gpu::reset_sparse_lorentzian_statistics();
+    const std::uint64_t live_buffers_before =
+        gpu::get_live_resident_device_buffers();
+    int owner = 0;
+    {
+      scoped_environment_override enable_sparse(
+          "MEEP_GPU_ENABLE_SPARSE_LORENTZIAN_PLAN", enable_value);
+      scoped_environment_override disable_sparse(
+          "MEEP_GPU_DISABLE_SPARSE_LORENTZIAN_PLAN", disable_value);
+      scoped_environment_override zero_elision(
+          "MEEP_GPU_ENABLE_ZERO_STATE_LORENTZIAN_ELISION", nullptr);
+      scoped_environment_override zero_elision_disable(
+          "MEEP_GPU_DISABLE_ZERO_STATE_LORENTZIAN_ELISION", nullptr);
+      for (int iteration = 0; iteration < iterations; ++iteration) {
+        gpu::detail::resident_curl_session session(&owner, true);
+        gpu::detail::resident_update_lorentzian_fp32(
+            session.cache(), p.data(), auxiliary.data(), field.data(),
+            unused_cross_fields ? cross_field1.data() : nullptr,
+            unused_cross_fields ? cross_field2.data() : nullptr,
+            point_count, space, 0, 0, 0, material,
+            gpu::detail::lorentzian_state_kind::previous);
+        session.finish(false);
+      }
+    }
+    gpu::detail::sync_resident_cache_for_owner(&owner);
+    const gpu::sparse_lorentzian_statistics statistics =
+        gpu::get_sparse_lorentzian_statistics();
+    if (expected == expected_selection::disabled)
+      require(statistics.opt_in_calls == 0 &&
+                  statistics.eligible_calls == 0 &&
+                  statistics.ineligible_calls == 0 &&
+                  statistics.first_observation_dense_calls == 0 &&
+                  statistics.plan_build_attempts == 0 &&
+                  statistics.live_plans == 0 &&
+                  statistics.live_guards == 0,
+              std::string("sparse Lorentzian accepted a non-exact or "
+                          "disabled opt-in: ") + label);
+    else if (expected == expected_selection::below_workload_floor)
+      require(statistics.opt_in_calls == iterations &&
+                  statistics.eligible_calls == 0 &&
+                  statistics.ineligible_calls == iterations &&
+                  statistics.first_observation_dense_calls == 0 &&
+                  statistics.plan_build_attempts == 0 &&
+                  statistics.live_plans == 0,
+              std::string("sparse Lorentzian workload floor was not fail "
+                          "closed: ") + label);
+    else if (expected == expected_selection::dense_locked)
+      require(statistics.opt_in_calls == iterations &&
+                  statistics.eligible_calls == iterations &&
+                  statistics.ineligible_calls == 0 &&
+                  statistics.first_observation_dense_calls == 1 &&
+                  statistics.plan_build_attempts == 1 &&
+                  statistics.plan_build_successes == 0 &&
+                  statistics.plan_build_failures == 0 &&
+                  statistics.dense_locked_decisions == 1 &&
+                  statistics.sparse_submission_calls == 0 &&
+                  statistics.live_plans == 0 &&
+                  statistics.live_guards == 0 &&
+                  statistics.retained_index_bytes == 0,
+              std::string("sparse Lorentzian policy rejection did not lock "
+                          "dense execution: ") + label);
+    else {
+      require(statistics.opt_in_calls == iterations &&
+                  statistics.eligible_calls == iterations &&
+                  statistics.first_observation_dense_calls == 1 &&
+                  statistics.plan_build_attempts == 1 &&
+                  statistics.plan_build_successes == 1 &&
+                  statistics.plan_hits == 1 &&
+                  statistics.accepted_total_points == point_count &&
+                  statistics.accepted_active_points == 0 &&
+                  statistics.sparse_submission_calls == iterations - 1 &&
+                  statistics.sparse_submission_points == 0 &&
+                  statistics.device_sparse_update_calls == iterations - 1 &&
+                  statistics.device_sparse_update_points == 0 &&
+                  statistics.live_plans == 1 &&
+                  statistics.live_guards == 1 &&
+                  statistics.retained_index_bytes == 0,
+              std::string("all-zero sparse Lorentzian plan was not causally "
+                          "executed: ") + label);
+      const std::vector<realnum> positive_zero(
+          point_count, realnum(0.0));
+      require(std::memcmp(p.data(), positive_zero.data(),
+                          point_count * sizeof(realnum)) == 0 &&
+                  std::memcmp(auxiliary.data(), positive_zero.data(),
+                              point_count * sizeof(realnum)) == 0,
+              std::string("unused cross fields changed the diagonal sparse "
+                          "Lorentzian recurrence: ") + label);
+    }
+    gpu::detail::destroy_resident_cache_for_owner(&owner);
+    require(gpu::get_live_resident_device_buffers() == live_buffers_before,
+            std::string("sparse Lorentzian selection case leaked device "
+                        "buffers: ") + label);
+  };
+
+  run_case("malformed-enable", 70000, 16, "true", nullptr,
+           expected_selection::disabled, false);
+  run_case("disable-presence-wins", 70000, 16, "1", "0",
+           expected_selection::disabled, false);
+  run_case("below-65536", 65535, 16, "1", nullptr,
+           expected_selection::below_workload_floor, false);
+  run_case("active-fraction", 70000, 2, "1", nullptr,
+           expected_selection::dense_locked, false);
+  run_case("retained-memory-budget", 70000, 4, "1", nullptr,
+           expected_selection::dense_locked, false);
+  run_case("all-zero", 70000, 0, "1", nullptr,
+           expected_selection::all_zero_sparse, false);
+  run_case("unused-isotropic-cross-fields", 70000, 0, "1", nullptr,
+           expected_selection::all_zero_sparse, true);
+#endif
+}
+
+void require_sparse_lorentzian_nonfinite_guard_contract() {
+#if MEEP_SINGLE
+  constexpr std::size_t point_count = 70000;
+  constexpr std::size_t active_period = 16;
+  constexpr int iterations = 3;
+  const std::size_t sigma_active =
+      (point_count + active_period - 1) / active_period;
+  std::vector<realnum> field(point_count, realnum(0.25));
+  field[1] = std::numeric_limits<realnum>::quiet_NaN();
+  std::vector<realnum> sigma(point_count, realnum(0.0));
+  for (std::size_t index = 0; index < point_count;
+       index += active_period)
+    sigma[index] = realnum(0.125);
+  gpu::detail::index_space_fp32 space{};
+  space.extent1 = 1;
+  space.extent2 = 1;
+  space.extent3 = point_count;
+  space.field_stride3 = 1;
+  space.coefficient_start = -1;
+  space.coefficient2_start = -1;
+  const gpu::detail::lorentzian_material_fp32 material = {
+      sigma.data(), nullptr, nullptr, 0.91f, 0.87f, 0.12f, 0.12f};
+  const auto run = [&](const void *owner, std::vector<realnum> &p,
+                       std::vector<realnum> &auxiliary, bool sparse) {
+    scoped_environment_override enable_sparse(
+        "MEEP_GPU_ENABLE_SPARSE_LORENTZIAN_PLAN", sparse ? "1" : nullptr);
+    scoped_environment_override disable_sparse(
+        "MEEP_GPU_DISABLE_SPARSE_LORENTZIAN_PLAN", sparse ? nullptr : "1");
+    for (int iteration = 0; iteration < iterations; ++iteration) {
+      gpu::detail::resident_curl_session session(owner, true);
+      gpu::detail::resident_update_lorentzian_fp32(
+          session.cache(), p.data(), auxiliary.data(), field.data(), nullptr,
+          nullptr, point_count, space, 0, 0, 0, material,
+          gpu::detail::lorentzian_state_kind::previous);
+      session.finish(false);
+    }
+    gpu::detail::sync_resident_cache_for_owner(owner);
+  };
+
+  std::vector<realnum> dense_p(point_count, realnum(0.0));
+  std::vector<realnum> dense_auxiliary(point_count, realnum(0.0));
+  int dense_owner = 0;
+  run(&dense_owner, dense_p, dense_auxiliary, false);
+  gpu::detail::destroy_resident_cache_for_owner(&dense_owner);
+
+  gpu::reset_sparse_lorentzian_statistics();
+  std::vector<realnum> sparse_p(point_count, realnum(0.0));
+  std::vector<realnum> sparse_auxiliary(point_count, realnum(0.0));
+  int sparse_owner = 0;
+  run(&sparse_owner, sparse_p, sparse_auxiliary, true);
+  require(std::memcmp(dense_p.data(), sparse_p.data(),
+                      point_count * sizeof(realnum)) == 0 &&
+              std::memcmp(dense_auxiliary.data(), sparse_auxiliary.data(),
+                          point_count * sizeof(realnum)) == 0,
+          "nonfinite sparse Lorentzian guard changed dense IEEE recurrence");
+  const gpu::sparse_lorentzian_statistics statistics =
+      gpu::get_sparse_lorentzian_statistics();
+  require(statistics.plan_build_successes == 1 &&
+              statistics.accepted_active_points == sigma_active + 1 &&
+              statistics.guard_scan_submissions == iterations - 1 &&
+              statistics.sparse_submission_calls == iterations - 1 &&
+              statistics.device_sparse_update_calls == 0 &&
+              statistics.device_dense_fallback_calls == iterations - 1 &&
+              statistics.device_dense_fallback_points ==
+                  (iterations - 1) * point_count,
+          "nonfinite sparse Lorentzian guard did not causally select dense "
+          "device fallback");
+  gpu::detail::destroy_resident_cache_for_owner(&sparse_owner);
+#endif
+}
+
+void require_sparse_lorentzian_shared_guard_contract() {
+#if MEEP_SINGLE
+  constexpr std::size_t point_count = 70000;
+  constexpr std::size_t active_period = 16;
+  constexpr int iterations = 4;
+  const std::size_t active_count =
+      (point_count + active_period - 1) / active_period;
+  std::vector<realnum> field(point_count, realnum(0.25));
+  std::vector<realnum> sigma(point_count, realnum(0.0));
+  for (std::size_t index = 0; index < point_count;
+       index += active_period)
+    sigma[index] = realnum(0.125);
+  gpu::detail::index_space_fp32 space{};
+  space.extent1 = 1;
+  space.extent2 = 1;
+  space.extent3 = point_count;
+  space.field_stride3 = 1;
+  space.coefficient_start = -1;
+  space.coefficient2_start = -1;
+  const gpu::detail::lorentzian_material_fp32 material = {
+      sigma.data(), nullptr, nullptr, 0.91f, 0.87f, 0.12f, 0.12f};
+  const auto run = [&](const void *owner, std::vector<realnum> &p0,
+                       std::vector<realnum> &a0,
+                       std::vector<realnum> &p1,
+                       std::vector<realnum> &a1, bool sparse) {
+    scoped_environment_override enable_sparse(
+        "MEEP_GPU_ENABLE_SPARSE_LORENTZIAN_PLAN", sparse ? "1" : nullptr);
+    scoped_environment_override disable_sparse(
+        "MEEP_GPU_DISABLE_SPARSE_LORENTZIAN_PLAN", sparse ? nullptr : "1");
+    for (int iteration = 0; iteration < iterations; ++iteration) {
+      gpu::detail::resident_curl_session session(owner, true);
+      gpu::detail::resident_update_lorentzian_fp32(
+          session.cache(), p0.data(), a0.data(), field.data(), nullptr,
+          nullptr, point_count, space, 0, 0, 0, material,
+          gpu::detail::lorentzian_state_kind::previous);
+      gpu::detail::resident_update_lorentzian_fp32(
+          session.cache(), p1.data(), a1.data(), field.data(), nullptr,
+          nullptr, point_count, space, 0, 0, 0, material,
+          gpu::detail::lorentzian_state_kind::previous);
+      session.finish(false);
+    }
+    gpu::detail::sync_resident_cache_for_owner(owner);
+  };
+
+  std::vector<realnum> dense_p0(point_count, realnum(0.0));
+  std::vector<realnum> dense_a0(point_count, realnum(0.0));
+  std::vector<realnum> dense_p1(point_count, realnum(0.0));
+  std::vector<realnum> dense_a1(point_count, realnum(0.0));
+  int dense_owner = 0;
+  run(&dense_owner, dense_p0, dense_a0, dense_p1, dense_a1, false);
+  gpu::detail::destroy_resident_cache_for_owner(&dense_owner);
+
+  gpu::reset_sparse_lorentzian_statistics();
+  std::vector<realnum> sparse_p0(point_count, realnum(0.0));
+  std::vector<realnum> sparse_a0(point_count, realnum(0.0));
+  std::vector<realnum> sparse_p1(point_count, realnum(0.0));
+  std::vector<realnum> sparse_a1(point_count, realnum(0.0));
+  int sparse_owner = 0;
+  run(&sparse_owner, sparse_p0, sparse_a0, sparse_p1, sparse_a1, true);
+  require(std::memcmp(dense_p0.data(), sparse_p0.data(),
+                      point_count * sizeof(realnum)) == 0 &&
+              std::memcmp(dense_a0.data(), sparse_a0.data(),
+                          point_count * sizeof(realnum)) == 0 &&
+              std::memcmp(dense_p1.data(), sparse_p1.data(),
+                          point_count * sizeof(realnum)) == 0 &&
+              std::memcmp(dense_a1.data(), sparse_a1.data(),
+                          point_count * sizeof(realnum)) == 0,
+          "shared-guard sparse Lorentzian recurrence is not bitwise dense");
+  const gpu::sparse_lorentzian_statistics statistics =
+      gpu::get_sparse_lorentzian_statistics();
+  require(statistics.opt_in_calls == 2 * iterations &&
+              statistics.first_observation_dense_calls == 4 &&
+              statistics.plan_invalidations == 2 &&
+              statistics.plan_build_attempts == 2 &&
+              statistics.plan_build_successes == 2 &&
+              statistics.plan_hits == 2 &&
+              statistics.accepted_total_points == 2 * point_count &&
+              statistics.accepted_active_points == 2 * active_count &&
+              statistics.sparse_submission_calls == 4 &&
+              statistics.guard_scan_submissions == 2 &&
+              statistics.device_guard_scan_calls == 2 &&
+              statistics.device_sparse_update_calls == 4 &&
+              statistics.live_plans == 2 &&
+              statistics.live_guards == 1 &&
+              statistics.retained_index_bytes ==
+                  2 * active_count * sizeof(std::ptrdiff_t),
+          "multiple sparse Lorentzian plans did not share one field guard");
+  gpu::detail::destroy_resident_cache_for_owner(&sparse_owner);
+#endif
+}
+
+void require_sparse_lorentzian_control_transition_contract() {
+#if MEEP_SINGLE
+  constexpr std::size_t point_count = 70000;
+  constexpr std::size_t active_period = 16;
+  std::vector<realnum> field(point_count, realnum(0.25));
+  std::vector<realnum> sigma(point_count, realnum(0.0));
+  for (std::size_t index = 0; index < point_count;
+       index += active_period)
+    sigma[index] = realnum(0.125);
+  gpu::detail::index_space_fp32 space{};
+  space.extent1 = 1;
+  space.extent2 = 1;
+  space.extent3 = point_count;
+  space.field_stride3 = 1;
+  space.coefficient_start = -1;
+  space.coefficient2_start = -1;
+  const gpu::detail::lorentzian_material_fp32 material = {
+      sigma.data(), nullptr, nullptr, 0.91f, 0.87f, 0.12f, 0.12f};
+  const auto update = [&](const void *owner, std::vector<realnum> &p,
+                          std::vector<realnum> &auxiliary,
+                          const char *enable_value,
+                          const char *disable_value) {
+    scoped_environment_override enable_sparse(
+        "MEEP_GPU_ENABLE_SPARSE_LORENTZIAN_PLAN", enable_value);
+    scoped_environment_override disable_sparse(
+        "MEEP_GPU_DISABLE_SPARSE_LORENTZIAN_PLAN", disable_value);
+    gpu::detail::resident_curl_session session(owner, true);
+    gpu::detail::resident_update_lorentzian_fp32(
+        session.cache(), p.data(), auxiliary.data(), field.data(), nullptr,
+        nullptr, point_count, space, 0, 0, 0, material,
+        gpu::detail::lorentzian_state_kind::previous);
+    session.finish(false);
+  };
+
+  std::vector<realnum> dense_p(point_count, realnum(0.0));
+  std::vector<realnum> dense_auxiliary(point_count, realnum(0.0));
+  int dense_owner = 0;
+  for (int iteration = 0; iteration < 7; ++iteration)
+    update(&dense_owner, dense_p, dense_auxiliary, nullptr, "1");
+  gpu::detail::sync_resident_cache_for_owner(&dense_owner);
+  gpu::detail::destroy_resident_cache_for_owner(&dense_owner);
+
+  gpu::reset_sparse_lorentzian_statistics();
+  const std::uint64_t live_buffers_before =
+      gpu::get_live_resident_device_buffers();
+  std::vector<realnum> sparse_p(point_count, realnum(0.0));
+  std::vector<realnum> sparse_auxiliary(point_count, realnum(0.0));
+  int sparse_owner = 0;
+  for (int iteration = 0; iteration < 3; ++iteration)
+    update(&sparse_owner, sparse_p, sparse_auxiliary, "1", nullptr);
+  const gpu::sparse_lorentzian_statistics before_disable =
+      gpu::get_sparse_lorentzian_statistics();
+  require(before_disable.live_plans == 1 &&
+              before_disable.live_guards == 1 &&
+              before_disable.device_sparse_update_calls == 2,
+          "sparse Lorentzian control transition test did not establish a "
+          "resident plan");
+
+  update(&sparse_owner, sparse_p, sparse_auxiliary, "1", "0");
+  const gpu::sparse_lorentzian_statistics disabled =
+      gpu::get_sparse_lorentzian_statistics();
+  require(disabled.opt_in_calls == 3 &&
+              disabled.plan_invalidations == 1 &&
+              disabled.live_plans == 0 && disabled.live_guards == 0 &&
+              disabled.retained_index_bytes == 0 &&
+              disabled.device_sparse_update_calls == 2 &&
+              gpu::get_live_resident_device_buffers() ==
+                  live_buffers_before + 4,
+          "disable-presence transition did not quiesce, fold, and release "
+          "the sparse Lorentzian plan");
+
+  update(&sparse_owner, sparse_p, sparse_auxiliary, "1", nullptr);
+  const gpu::sparse_lorentzian_statistics reobserved =
+      gpu::get_sparse_lorentzian_statistics();
+  require(reobserved.opt_in_calls == 4 &&
+              reobserved.first_observation_dense_calls == 2 &&
+              reobserved.live_plans == 0,
+          "re-enabled sparse Lorentzian control reused a stale identity");
+  update(&sparse_owner, sparse_p, sparse_auxiliary, "1", nullptr);
+  gpu::detail::sync_resident_cache_for_owner(&sparse_owner);
+  const gpu::sparse_lorentzian_statistics rebuilt =
+      gpu::get_sparse_lorentzian_statistics();
+  require(rebuilt.opt_in_calls == 5 &&
+              rebuilt.plan_build_attempts == 2 &&
+              rebuilt.plan_build_successes == 2 &&
+              rebuilt.live_plans == 1 && rebuilt.live_guards == 1,
+          "re-enabled sparse Lorentzian control did not build a fresh plan");
+  update(&sparse_owner, sparse_p, sparse_auxiliary, "1", nullptr);
+  gpu::detail::sync_resident_cache_for_owner(&sparse_owner);
+  require(std::memcmp(dense_p.data(), sparse_p.data(),
+                      point_count * sizeof(realnum)) == 0 &&
+              std::memcmp(dense_auxiliary.data(), sparse_auxiliary.data(),
+                          point_count * sizeof(realnum)) == 0,
+          "sparse Lorentzian control transitions changed the recurrence");
+  gpu::detail::destroy_resident_cache_for_owner(&sparse_owner);
+  require(gpu::get_live_resident_device_buffers() == live_buffers_before,
+          "sparse Lorentzian control transition leaked device buffers");
+#endif
+}
+
+void require_sparse_lorentzian_ineligible_transition_contract() {
+#if MEEP_SINGLE
+  constexpr std::size_t point_count = 70000;
+  constexpr std::size_t active_period = 16;
+  std::vector<realnum> field(point_count, realnum(0.0));
+  std::vector<realnum> sigma(point_count, realnum(0.0));
+  for (std::size_t index = 0; index < point_count;
+       index += active_period) {
+    field[index] = realnum(0.25);
+    sigma[index] = realnum(0.125);
+  }
+  gpu::detail::index_space_fp32 space{};
+  space.extent1 = 1;
+  space.extent2 = 1;
+  space.extent3 = point_count;
+  space.field_stride3 = 1;
+  space.coefficient_start = -1;
+  space.coefficient2_start = -1;
+  const gpu::detail::lorentzian_material_fp32 safe_material = {
+      sigma.data(), nullptr, nullptr, 0.91f, 0.87f, 0.12f, 0.12f};
+  // Negative zero is finite but not bit-identical positive zero.  It is an
+  // intentionally ineligible transition which changes signed-zero state in
+  // the dense IEEE recurrence and therefore invalidates any earlier omission
+  // set even when all other identity fields later return to their old bits.
+  gpu::detail::lorentzian_material_fp32 signed_zero_material = safe_material;
+  signed_zero_material.gamma_inverse = -0.0f;
+
+  const auto run_sequence = [&](const void *owner,
+                                std::vector<realnum> &p,
+                                std::vector<realnum> &auxiliary,
+                                bool sparse) {
+    scoped_environment_override enable_sparse(
+        "MEEP_GPU_ENABLE_SPARSE_LORENTZIAN_PLAN", sparse ? "1" : nullptr);
+    scoped_environment_override disable_sparse(
+        "MEEP_GPU_DISABLE_SPARSE_LORENTZIAN_PLAN", sparse ? nullptr : "1");
+    scoped_environment_override enable_zero_elision(
+        "MEEP_GPU_ENABLE_ZERO_STATE_LORENTZIAN_ELISION", nullptr);
+    scoped_environment_override disable_zero_elision(
+        "MEEP_GPU_DISABLE_ZERO_STATE_LORENTZIAN_ELISION", "1");
+    const auto update = [&](const gpu::detail::lorentzian_material_fp32
+                                &material) {
+      gpu::detail::resident_curl_session session(owner, true);
+      gpu::detail::resident_update_lorentzian_fp32(
+          session.cache(), p.data(), auxiliary.data(), field.data(), nullptr,
+          nullptr, point_count, space, 0, 0, 0, material,
+          gpu::detail::lorentzian_state_kind::previous);
+      session.finish(false);
+    };
+    update(safe_material);  // observe
+    update(safe_material);  // build and submit
+    update(safe_material);  // prove a retained plan hit
+    update(signed_zero_material);  // must retire before dense mutation
+    update(safe_material);  // must observe again, never reuse the old plan
+    update(safe_material);  // fresh build from post-transition state
+    gpu::detail::sync_resident_cache_for_owner(owner);
+  };
+
+  std::vector<realnum> dense_p(point_count, realnum(0.0));
+  std::vector<realnum> dense_auxiliary(point_count, realnum(0.0));
+  int dense_owner = 0;
+  run_sequence(&dense_owner, dense_p, dense_auxiliary, false);
+  gpu::detail::destroy_resident_cache_for_owner(&dense_owner);
+
+  gpu::reset_sparse_lorentzian_statistics();
+  std::vector<realnum> sparse_p(point_count, realnum(0.0));
+  std::vector<realnum> sparse_auxiliary(point_count, realnum(0.0));
+  int sparse_owner = 0;
+  run_sequence(&sparse_owner, sparse_p, sparse_auxiliary, true);
+  require(std::memcmp(dense_p.data(), sparse_p.data(),
+                      point_count * sizeof(realnum)) == 0 &&
+              std::memcmp(dense_auxiliary.data(), sparse_auxiliary.data(),
+                          point_count * sizeof(realnum)) == 0,
+          "signed-zero sparse-ineligible transition reused a stale omission "
+          "plan or changed the dense IEEE recurrence");
+  const gpu::sparse_lorentzian_statistics statistics =
+      gpu::get_sparse_lorentzian_statistics();
+  require(statistics.ineligible_calls == 1 &&
+              statistics.plan_invalidations >= 1 &&
+              statistics.first_observation_dense_calls == 2 &&
+              statistics.plan_build_attempts == 2 &&
+              statistics.plan_build_successes == 1 &&
+              statistics.dense_locked_decisions >= 1 &&
+              statistics.live_plans == 0 && statistics.live_guards == 0,
+          "signed-zero sparse-ineligible transition did not retire and "
+          "reobserve its now-active signed-zero state");
+  gpu::detail::destroy_resident_cache_for_owner(&sparse_owner);
+#endif
+}
+
+void require_sparse_lorentzian_multi_cache_statistics_contract() {
+#if MEEP_SINGLE
+  constexpr std::size_t point_count = 70000;
+  constexpr std::size_t active_period = 16;
+  constexpr int initial_iterations = 3;
+  std::vector<realnum> field0(point_count, realnum(0.25));
+  std::vector<realnum> field1(point_count, realnum(-0.125));
+  std::vector<realnum> sigma0(point_count, realnum(0.0));
+  std::vector<realnum> sigma1(point_count, realnum(0.0));
+  for (std::size_t index = 0; index < point_count;
+       index += active_period) {
+    sigma0[index] = realnum(0.125);
+    sigma1[index] = realnum(0.0625);
+  }
+  gpu::detail::index_space_fp32 space{};
+  space.extent1 = 1;
+  space.extent2 = 1;
+  space.extent3 = point_count;
+  space.field_stride3 = 1;
+  space.coefficient_start = -1;
+  space.coefficient2_start = -1;
+  const gpu::detail::lorentzian_material_fp32 material0 = {
+      sigma0.data(), nullptr, nullptr, 0.91f, 0.87f, 0.12f, 0.12f};
+  const gpu::detail::lorentzian_material_fp32 material1 = {
+      sigma1.data(), nullptr, nullptr, 0.91f, 0.87f, 0.12f, 0.12f};
+  std::vector<realnum> p0(point_count, realnum(0.0));
+  std::vector<realnum> a0(point_count, realnum(0.0));
+  std::vector<realnum> p1(point_count, realnum(0.0));
+  std::vector<realnum> a1(point_count, realnum(0.0));
+  int owner0 = 0;
+  int owner1 = 0;
+  const auto update = [&](const void *owner, std::vector<realnum> &p,
+                          std::vector<realnum> &auxiliary,
+                          const std::vector<realnum> &field,
+                          const gpu::detail::lorentzian_material_fp32
+                              &material) {
+    gpu::detail::resident_curl_session session(owner, true);
+    gpu::detail::resident_update_lorentzian_fp32(
+        session.cache(), p.data(), auxiliary.data(), field.data(), nullptr,
+        nullptr, point_count, space, 0, 0, 0, material,
+        gpu::detail::lorentzian_state_kind::previous);
+    session.finish(false);
+  };
+
+  gpu::reset_sparse_lorentzian_statistics();
+  const std::uint64_t live_buffers_before =
+      gpu::get_live_resident_device_buffers();
+  {
+    scoped_environment_override enable_sparse(
+        "MEEP_GPU_ENABLE_SPARSE_LORENTZIAN_PLAN", "1");
+    scoped_environment_override disable_sparse(
+        "MEEP_GPU_DISABLE_SPARSE_LORENTZIAN_PLAN", nullptr);
+    for (int iteration = 0; iteration < initial_iterations; ++iteration) {
+      update(&owner0, p0, a0, field0, material0);
+      update(&owner1, p1, a1, field1, material1);
+    }
+    const gpu::sparse_lorentzian_statistics live =
+        gpu::get_sparse_lorentzian_statistics();
+    require(live.live_plans == 2 && live.live_guards == 2 &&
+                live.device_guard_scan_calls == 4 &&
+                live.device_sparse_update_calls == 4,
+            "sparse Lorentzian statistics did not aggregate two live caches");
+
+    bool failed_readback_rejected = false;
+    {
+      scoped_environment_override fail_query_copy(
+          "MEEP_GPU_TEST_SPARSE_LORENTZIAN_FAIL_STAGE",
+          "statistics-query-copy");
+      try {
+        (void)gpu::get_sparse_lorentzian_statistics();
+      }
+      catch (const std::runtime_error &) {
+        failed_readback_rejected = true;
+      }
+    }
+    const gpu::sparse_lorentzian_statistics after_failed_readback =
+        gpu::get_sparse_lorentzian_statistics();
+    require(failed_readback_rejected &&
+                after_failed_readback.live_plans == live.live_plans &&
+                after_failed_readback.live_guards == live.live_guards &&
+                after_failed_readback.device_guard_scan_calls ==
+                    live.device_guard_scan_calls &&
+                after_failed_readback.device_sparse_update_calls ==
+                    live.device_sparse_update_calls,
+            "failed sparse statistics ledger readback mutated or concealed "
+            "the live aggregate");
+
+    gpu::reset_sparse_lorentzian_statistics();
+    const gpu::sparse_lorentzian_statistics reset =
+        gpu::get_sparse_lorentzian_statistics();
+    require(reset.live_plans == 2 && reset.live_guards == 2 &&
+                reset.device_guard_scan_calls == 0 &&
+                reset.device_sparse_update_calls == 0,
+            "multi-cache sparse Lorentzian reset lost gauges or retained old "
+            "device ledger counts");
+    update(&owner0, p0, a0, field0, material0);
+    update(&owner1, p1, a1, field1, material1);
+  }
+  gpu::detail::sync_resident_cache_for_owner(&owner0);
+  gpu::detail::sync_resident_cache_for_owner(&owner1);
+  const gpu::sparse_lorentzian_statistics after_updates =
+      gpu::get_sparse_lorentzian_statistics();
+  require(after_updates.plan_hits == 2 &&
+              after_updates.device_guard_scan_calls == 2 &&
+              after_updates.device_sparse_update_calls == 2,
+          "multi-cache sparse Lorentzian ledgers did not record new causal "
+          "work after reset");
+  gpu::detail::destroy_resident_cache_for_owner(&owner0);
+  const gpu::sparse_lorentzian_statistics one_destroyed =
+      gpu::get_sparse_lorentzian_statistics();
+  require(one_destroyed.live_plans == 1 && one_destroyed.live_guards == 1 &&
+              one_destroyed.device_sparse_update_calls == 2,
+          "destroyed sparse Lorentzian cache ledger was not folded exactly "
+          "once");
+  gpu::detail::destroy_resident_cache_for_owner(&owner1);
+  const gpu::sparse_lorentzian_statistics all_destroyed =
+      gpu::get_sparse_lorentzian_statistics();
+  require(all_destroyed.live_plans == 0 && all_destroyed.live_guards == 0 &&
+              all_destroyed.device_sparse_update_calls == 2 &&
+              gpu::get_live_resident_device_buffers() == live_buffers_before,
+          "multi-cache sparse Lorentzian teardown lost evidence or leaked "
+          "device buffers");
+#endif
+}
+
+void require_sparse_lorentzian_quiescence_failure_contract() {
+#if MEEP_SINGLE
+  constexpr std::size_t point_count = 70000;
+  std::vector<realnum> p(point_count, realnum(0.0));
+  std::vector<realnum> auxiliary(point_count, realnum(0.0));
+  std::vector<realnum> field(point_count, realnum(0.25));
+  std::vector<realnum> sigma(point_count, realnum(0.0));
+  for (std::size_t index = 0; index < point_count; index += 16)
+    sigma[index] = realnum(0.125);
+  gpu::detail::index_space_fp32 space{};
+  space.extent1 = 1;
+  space.extent2 = 1;
+  space.extent3 = point_count;
+  space.field_stride3 = 1;
+  space.coefficient_start = -1;
+  space.coefficient2_start = -1;
+  const gpu::detail::lorentzian_material_fp32 material = {
+      sigma.data(), nullptr, nullptr, 0.91f, 0.87f, 0.12f, 0.12f};
+  scoped_environment_override enable_sparse(
+      "MEEP_GPU_ENABLE_SPARSE_LORENTZIAN_PLAN", "1");
+  scoped_environment_override disable_sparse(
+      "MEEP_GPU_DISABLE_SPARSE_LORENTZIAN_PLAN", nullptr);
+  gpu::reset_sparse_lorentzian_statistics();
+  int owner = 0;
+  for (int iteration = 0; iteration < 3; ++iteration) {
+    gpu::detail::resident_curl_session session(&owner, true);
+    gpu::detail::resident_update_lorentzian_fp32(
+        session.cache(), p.data(), auxiliary.data(), field.data(), nullptr,
+        nullptr, point_count, space, 0, 0, 0, material,
+        gpu::detail::lorentzian_state_kind::previous);
+    // Leave the third sparse submission queued.  The injected teardown failure
+    // must preserve every mirror, plan, guard, and descriptor it may reference.
+    session.finish(false);
+  }
+  const std::uint64_t buffers_before_quarantine =
+      gpu::get_live_resident_device_buffers();
+  {
+    scoped_environment_override fail_quiescence(
+        "MEEP_GPU_TEST_SPARSE_LORENTZIAN_FAIL_STAGE", "quiescence");
+    gpu::detail::discard_resident_cache_for_owner(&owner);
+  }
+  require(!gpu::detail::get_resident_cache_snapshot_for_testing(&owner).exists,
+          "failed quiescence left a quarantined cache reachable by its owner");
+  const gpu::sparse_lorentzian_statistics statistics =
+      gpu::get_sparse_lorentzian_statistics();
+  require(statistics.teardown_incomplete && statistics.live_plans == 0 &&
+              statistics.live_guards == 0 &&
+              gpu::get_live_resident_device_buffers() >=
+                  buffers_before_quarantine,
+          "failed quiescence did not retain complete device storage in a "
+          "sticky process-long quarantine");
+
+  // A changed but still sparse-eligible identity must propagate retirement
+  // failure instead of submitting a dense recurrence into a cache whose
+  // quiescence and lifetime are no longer known.
+  int identity_owner = 0;
+  std::vector<realnum> identity_p(point_count, realnum(0.0));
+  std::vector<realnum> identity_auxiliary(point_count, realnum(0.0));
+  for (int iteration = 0; iteration < 3; ++iteration) {
+    gpu::detail::resident_curl_session session(&identity_owner, true);
+    gpu::detail::resident_update_lorentzian_fp32(
+        session.cache(), identity_p.data(), identity_auxiliary.data(),
+        field.data(), nullptr, nullptr, point_count, space, 0, 0, 0,
+        material, gpu::detail::lorentzian_state_kind::previous);
+    session.finish(false);
+  }
+  gpu::detail::lorentzian_material_fp32 changed_material = material;
+  changed_material.gamma_previous = 0.86f;
+  const gpu::polarization_statistics identity_launches_before =
+      gpu::get_polarization_statistics();
+  bool identity_change_rejected = false;
+  {
+    gpu::detail::resident_curl_session session(&identity_owner, true);
+    scoped_environment_override fail_quiescence(
+        "MEEP_GPU_TEST_SPARSE_LORENTZIAN_FAIL_STAGE", "quiescence");
+    try {
+      gpu::detail::resident_update_lorentzian_fp32(
+          session.cache(), identity_p.data(), identity_auxiliary.data(),
+          field.data(), nullptr, nullptr, point_count, space, 0, 0, 0,
+          changed_material,
+          gpu::detail::lorentzian_state_kind::previous);
+    }
+    catch (const std::runtime_error &) {
+      identity_change_rejected = true;
+    }
+  }
+  const auto identity_failure =
+      gpu::detail::get_sparse_lorentzian_generation_snapshot_for_testing(
+          &identity_owner);
+  const gpu::polarization_statistics identity_launches_after =
+      gpu::get_polarization_statistics();
+  require(identity_change_rejected && identity_failure.exists &&
+              identity_failure.device_storage_quarantined &&
+              identity_failure.allocation_generation == 0 &&
+              identity_launches_after.cuda_update_calls ==
+                  identity_launches_before.cuda_update_calls &&
+              identity_launches_after.cuda_update_points ==
+                  identity_launches_before.cuda_update_points,
+          "changed sparse Lorentzian identity continued with a dense launch "
+          "after failed quiescence");
+  gpu::detail::discard_resident_cache_for_owner(&identity_owner);
+
+  // Mirror removal must prove an owning-device fence before freeing even one
+  // dependent retained plan.  The injected failure therefore retains the
+  // mirror and every descriptor allocation as one complete cache quarantine.
+  int mirror_owner = 0;
+  std::vector<realnum> mirror_values(32, realnum(0.25));
+  {
+    gpu::detail::resident_curl_session session(&mirror_owner, true);
+    gpu::detail::resident_ensure_mirror_fp32(
+        session.cache(), mirror_values.data(), mirror_values.size());
+    session.finish(false);
+  }
+  const std::uint64_t buffers_before_mirror_failure =
+      gpu::get_live_resident_device_buffers();
+  {
+    scoped_environment_override fail_quiescence(
+        "MEEP_GPU_TEST_SPARSE_LORENTZIAN_FAIL_STAGE", "quiescence");
+    gpu::detail::discard_resident_mirror_for_owner(
+        &mirror_owner, mirror_values.data());
+  }
+  const auto mirror_failure =
+      gpu::detail::get_sparse_lorentzian_generation_snapshot_for_testing(
+          &mirror_owner);
+  require(mirror_failure.exists &&
+              mirror_failure.device_storage_quarantined &&
+              mirror_failure.allocation_generation == 0 &&
+              gpu::get_live_resident_device_buffers() >=
+                  buffers_before_mirror_failure,
+          "failed mirror-discard fence released storage before complete-cache "
+          "quarantine");
+
+  // Once quarantined, no recovery/readback/checkpoint/DFT entry point may
+  // touch the retained CUDA allocation or publish it as a usable cache.  Test
+  // the direct registry lookups as well as APIs routed through the common
+  // owner-cache accessor.
+  bool sync_rejected = false;
+  bool host_write_rejected = false;
+  bool reset_reuse_rejected = false;
+  bool scalar_read_rejected = false;
+  bool checkpoint_stage_rejected = false;
+  bool checkpoint_summary_rejected = false;
+  bool checkpoint_upload_rejected = false;
+  bool dft_scale_rejected = false;
+  float scalar_value = 0.0f;
+  std::vector<float> staged_mirror(mirror_values.size(), 0.0f);
+  const void *host_write_pointers[] = {mirror_values.data()};
+  const gpu::detail::resident_checkpoint_range_fp32 checkpoint_range = {
+      &mirror_owner, mirror_values.data(), mirror_values.size()};
+  try {
+    gpu::detail::sync_resident_cache_for_owner(&mirror_owner);
+  }
+  catch (const std::runtime_error &) {
+    sync_rejected = true;
+  }
+  try {
+    gpu::detail::prepare_resident_host_writes_for_owner(
+        &mirror_owner, host_write_pointers, 1);
+  }
+  catch (const std::runtime_error &) {
+    host_write_rejected = true;
+  }
+  try {
+    gpu::detail::reset_resident_cache_for_owner_reusing_allocations(
+        &mirror_owner);
+  }
+  catch (const std::runtime_error &) {
+    reset_reuse_rejected = true;
+  }
+  try {
+    (void)gpu::detail::read_resident_field_point_fp32_for_owner(
+        &mirror_owner, mirror_values.data(), nullptr, 0,
+        &scalar_value, nullptr);
+  }
+  catch (const std::runtime_error &) {
+    scalar_read_rejected = true;
+  }
+  try {
+    (void)gpu::detail::stage_resident_range_fp32_for_owner(
+        &mirror_owner, mirror_values.data(), mirror_values.size(),
+        staged_mirror.data());
+  }
+  catch (const std::runtime_error &) {
+    checkpoint_stage_rejected = true;
+  }
+  try {
+    (void)gpu::detail::summarize_resident_checkpoint_ranges_fp32(
+        &checkpoint_range, 1);
+  }
+  catch (const std::runtime_error &) {
+    checkpoint_summary_rejected = true;
+  }
+  try {
+    (void)gpu::detail::upload_resident_range_fp32_for_owner(
+        &mirror_owner, mirror_values.data(), mirror_values.size());
+  }
+  catch (const std::runtime_error &) {
+    checkpoint_upload_rejected = true;
+  }
+  try {
+    (void)gpu::detail::scale_resident_complex_dft_fp32_for_owner(
+        &mirror_owner, mirror_values.data(), mirror_values.size() / 2,
+        1.0, 0.0);
+  }
+  catch (const std::runtime_error &) {
+    dft_scale_rejected = true;
+  }
+  require(sync_rejected && host_write_rejected && reset_reuse_rejected &&
+              scalar_read_rejected && checkpoint_stage_rejected &&
+              checkpoint_summary_rejected && checkpoint_upload_rejected &&
+              dft_scale_rejected &&
+              gpu::get_live_resident_device_buffers() >=
+                  buffers_before_mirror_failure,
+          "a direct resident API reused or released a quarantined CUDA "
+          "cache");
+  gpu::detail::discard_resident_cache_for_owner(&mirror_owner);
+
+  // A same-host-address size replacement is also a cache-wide lifetime
+  // boundary even when it has no sparse plan. It must fence before freeing
+  // the old allocation retained by any ordinary phase/boundary descriptor.
+  int replacement_owner = 0;
+  std::vector<realnum> replacement_values(64, realnum(0.375));
+  bool replacement_rejected = false;
+  const std::uint64_t buffers_before_replacement_failure =
+      gpu::get_live_resident_device_buffers();
+  {
+    gpu::detail::resident_curl_session session(&replacement_owner, true);
+    gpu::detail::resident_ensure_mirror_fp32(
+        session.cache(), replacement_values.data(),
+        replacement_values.size());
+    session.finish(false);
+  }
+  const std::uint64_t buffers_after_replacement_prepare =
+      gpu::get_live_resident_device_buffers();
+  {
+    gpu::detail::resident_curl_session session(&replacement_owner, true);
+    scoped_environment_override fail_quiescence(
+        "MEEP_GPU_TEST_SPARSE_LORENTZIAN_FAIL_STAGE", "quiescence");
+    try {
+      gpu::detail::resident_ensure_mirror_fp32(
+          session.cache(), replacement_values.data(),
+          replacement_values.size() / 2);
+    }
+    catch (const std::runtime_error &) {
+      replacement_rejected = true;
+    }
+  }
+  const auto replacement_failure =
+      gpu::detail::get_sparse_lorentzian_generation_snapshot_for_testing(
+          &replacement_owner);
+  require(replacement_rejected && replacement_failure.exists &&
+              replacement_failure.device_storage_quarantined &&
+              gpu::get_live_resident_device_buffers() ==
+                  buffers_after_replacement_prepare &&
+              buffers_after_replacement_prepare >
+                  buffers_before_replacement_failure,
+          "failed address-replacement fence released the old mirror or "
+          "continued mutation");
+  gpu::detail::discard_resident_cache_for_owner(&replacement_owner);
+
+  // The active-phase destructor and allocation-pooling cache reset are two
+  // separate lifecycle entry points. Both must turn a failed fence into a
+  // complete cache quarantine before any storage mutation.
+  int phase_owner = 0;
+  std::vector<realnum> phase_values(16, realnum(0.125));
+  const std::uint64_t buffers_before_phase_failure =
+      gpu::get_live_resident_device_buffers();
+  {
+    scoped_environment_override fail_quiescence(
+        "MEEP_GPU_TEST_SPARSE_LORENTZIAN_FAIL_STAGE", "quiescence");
+    gpu::detail::resident_curl_session session(&phase_owner, true);
+    gpu::detail::resident_ensure_mirror_fp32(
+        session.cache(), phase_values.data(), phase_values.size());
+  }
+  const auto phase_failure =
+      gpu::detail::get_sparse_lorentzian_generation_snapshot_for_testing(
+          &phase_owner);
+  require(phase_failure.exists &&
+              phase_failure.device_storage_quarantined &&
+              gpu::get_live_resident_device_buffers() >
+                  buffers_before_phase_failure,
+          "failed active-phase discard did not quarantine its complete "
+          "resident cache");
+  gpu::detail::discard_resident_cache_for_owner(&phase_owner);
+
+  int reset_owner = 0;
+  std::vector<realnum> reset_values(16, realnum(0.625));
+  {
+    gpu::detail::resident_curl_session session(&reset_owner, true);
+    gpu::detail::resident_ensure_mirror_fp32(
+        session.cache(), reset_values.data(), reset_values.size());
+    session.finish(false);
+  }
+  const std::uint64_t buffers_before_cache_reset_failure =
+      gpu::get_live_resident_device_buffers();
+  bool cache_reset_rejected = false;
+  {
+    scoped_environment_override fail_quiescence(
+        "MEEP_GPU_TEST_SPARSE_LORENTZIAN_FAIL_STAGE", "quiescence");
+    try {
+      gpu::detail::reset_resident_cache_for_owner_reusing_allocations(
+          &reset_owner);
+    }
+    catch (const std::runtime_error &) {
+      cache_reset_rejected = true;
+    }
+  }
+  const auto cache_reset_failure =
+      gpu::detail::get_sparse_lorentzian_generation_snapshot_for_testing(
+          &reset_owner);
+  require(cache_reset_rejected && cache_reset_failure.exists &&
+              cache_reset_failure.device_storage_quarantined &&
+              gpu::get_live_resident_device_buffers() ==
+                  buffers_before_cache_reset_failure,
+          "failed allocation-pooling cache reset released resident storage");
+  gpu::detail::discard_resident_cache_for_owner(&reset_owner);
+
+  // Source-profile removal has its own bounded recycling path and must obey
+  // the same fence-before-invalidation rule.
+  int source_owner = 0;
+  std::vector<realnum> source_destination(32, realnum(0.0));
+  const std::ptrdiff_t source_indices[] = {1, 7};
+  const realnum source_amplitudes[] = {
+      realnum(0.25), realnum(0.0), realnum(-0.5), realnum(0.0)};
+  {
+    gpu::detail::resident_curl_session session(&source_owner, true);
+    (void)gpu::detail::resident_indexed_source_subtract_fp32(
+        session.cache(), source_destination.data(),
+        source_destination.size(), source_indices, source_amplitudes, 2,
+        nullptr, {1.0f, 0.0f}, false);
+    session.finish(false);
+  }
+  const std::uint64_t buffers_before_source_failure =
+      gpu::get_live_resident_device_buffers();
+  bool source_discard_rejected = false;
+  {
+    scoped_environment_override fail_quiescence(
+        "MEEP_GPU_TEST_SPARSE_LORENTZIAN_FAIL_STAGE", "quiescence");
+    try {
+      gpu::detail::discard_resident_source_profile_for_owner(
+          &source_owner, source_indices, source_amplitudes);
+    }
+    catch (const std::runtime_error &) {
+      source_discard_rejected = true;
+    }
+  }
+  const auto source_failure =
+      gpu::detail::get_sparse_lorentzian_generation_snapshot_for_testing(
+          &source_owner);
+  require(source_discard_rejected && source_failure.exists &&
+              source_failure.device_storage_quarantined &&
+              gpu::get_live_resident_device_buffers() ==
+                  buffers_before_source_failure,
+          "failed source-profile discard fence released recycled or live "
+          "storage");
+  gpu::detail::discard_resident_cache_for_owner(&source_owner);
+
+  // publish-to-host destruction is distinct from the discard-only teardown
+  // above because dirty mirrors may be the sole authoritative state.
+  int publish_owner = 0;
+  std::vector<realnum> publish_values(16, realnum(0.75));
+  {
+    gpu::detail::resident_curl_session session(&publish_owner, true);
+    gpu::detail::resident_ensure_mirror_fp32(
+        session.cache(), publish_values.data(), publish_values.size());
+    session.finish(false);
+  }
+  const std::uint64_t buffers_before_publish_failure =
+      gpu::get_live_resident_device_buffers();
+  {
+    scoped_environment_override fail_quiescence(
+        "MEEP_GPU_TEST_SPARSE_LORENTZIAN_FAIL_STAGE", "quiescence");
+    gpu::detail::destroy_resident_cache_for_owner(&publish_owner);
+  }
+  require(!gpu::detail::get_resident_cache_snapshot_for_testing(
+               &publish_owner).exists &&
+              gpu::get_live_resident_device_buffers() >=
+                  buffers_before_publish_failure,
+          "failed publish-to-host destruction released device-authoritative "
+          "storage instead of quarantining it");
+
+  // Exercise a remote gather transfer plan and its composed boundary phase
+  // graph, not only local operation plans.  Later graph/owner cleanup must
+  // detach host metadata while retaining every CUDA descriptor and event.
+  int graph_registry_owner = 0;
+  int graph_buffer_token = 0;
+  int graph_cache_owner = 0;
+  std::vector<realnum> graph_source(8, realnum(0.25));
+  std::vector<realnum> graph_destination(8, realnum(0.0));
+  constexpr std::size_t graph_zero_plan_token = 0xC3A0u;
+  constexpr std::size_t graph_copy_plan_token = 0xC3A1u;
+  gpu::detail::boundary_phase_graph *boundary_graph = nullptr;
+  {
+    gpu::detail::resident_curl_session session(&graph_cache_owner, true);
+    gpu::detail::resident_ensure_mirror_fp32(
+        session.cache(), graph_source.data(), graph_source.size());
+    gpu::detail::resident_ensure_mirror_fp32(
+        session.cache(), graph_destination.data(),
+        graph_destination.size());
+    const gpu::detail::boundary_operation_fp32 zero_operation = {
+        nullptr, session.cache(), graph_destination.data(), nullptr,
+        nullptr, nullptr, 1.0f, 0.0f};
+    const gpu::detail::boundary_operation_fp32 copy_operation = {
+        session.cache(), session.cache(), graph_destination.data() + 1,
+        nullptr, graph_source.data(), nullptr, 1.0f, 0.0f};
+    gpu::detail::resident_apply_boundary_fp32(
+        &graph_registry_owner, graph_zero_plan_token, &zero_operation, 1);
+    gpu::detail::resident_apply_boundary_fp32(
+        &graph_registry_owner, graph_copy_plan_token, &copy_operation, 1);
+    gpu::detail::boundary_exchange_buffer *send_buffer =
+        gpu::detail::resident_boundary_exchange_buffer(
+            &graph_registry_owner, &graph_buffer_token, 1);
+    gpu::detail::resident_cache *source_caches[] = {session.cache()};
+    const float *source_pointers[] = {graph_source.data() + 2};
+    gpu::detail::resident_gather_boundary_fp32(
+        source_caches, send_buffer, source_pointers, 1);
+    gpu::detail::boundary_exchange_synchronize(send_buffer);
+    gpu::detail::boundary_exchange_buffer *send_buffers[] = {send_buffer};
+    boundary_graph = gpu::detail::resident_create_boundary_phase_graph(
+        &graph_registry_owner, graph_zero_plan_token,
+        graph_copy_plan_token, send_buffers, 1);
+    require(boundary_graph &&
+                gpu::detail::resident_boundary_phase_graph_ready(
+                    &graph_registry_owner, boundary_graph) &&
+                gpu::detail::resident_launch_boundary_phase_graph(
+                    &graph_registry_owner, boundary_graph),
+            "boundary quarantine test did not create and launch its remote "
+            "phase graph");
+    {
+      scoped_environment_override fail_quiescence(
+          "MEEP_GPU_TEST_SPARSE_LORENTZIAN_FAIL_STAGE", "quiescence");
+      gpu::detail::discard_resident_mirror_for_owner(
+          &graph_cache_owner, graph_destination.data());
+    }
+  }
+  const auto graph_cache_failure =
+      gpu::detail::get_sparse_lorentzian_generation_snapshot_for_testing(
+          &graph_cache_owner);
+  require(graph_cache_failure.exists &&
+              graph_cache_failure.device_storage_quarantined,
+          "remote boundary phase graph cache was not quarantined after its "
+          "failed fence");
+  const std::uint64_t buffers_before_graph_cleanup =
+      gpu::get_live_resident_device_buffers();
+  const auto graph_leaks_before =
+      gpu::detail::get_boundary_lifetime_fallback_statistics()
+          .lifetime_uncertain_leaks;
+  gpu::detail::destroy_boundary_phase_graph(boundary_graph);
+  gpu::detail::destroy_boundary_exchange_for_owner(&graph_registry_owner);
+  const auto graph_leaks_after =
+      gpu::detail::get_boundary_lifetime_fallback_statistics()
+          .lifetime_uncertain_leaks;
+  require(gpu::get_live_resident_device_buffers() ==
+              buffers_before_graph_cleanup &&
+              graph_leaks_after >= graph_leaks_before + 2,
+          "late remote transfer/phase-graph cleanup reclaimed CUDA storage "
+          "or missed quarantine evidence");
+  gpu::detail::discard_resident_cache_for_owner(&graph_cache_owner);
+
+  // Generation zero is a permanent non-reusable sentinel.  Even a boundary
+  // plan built while the allocation counter is exhausted must never become a
+  // ready fast replay, and quarantine cannot make 0 == 0 executable again.
+  gpu::detail::set_resident_allocation_generation_counter_for_testing(
+      std::numeric_limits<std::uint64_t>::max());
+  int boundary_owner = 0;
+  int boundary_global_owner = 0;
+  std::vector<realnum> boundary_source(8, realnum(0.5));
+  std::vector<realnum> boundary_destination(8, realnum(0.0));
+  constexpr std::size_t boundary_plan_token = 0xC3B0u;
+  bool zero_generation_launch_rejected = false;
+  bool quarantined_launch_rejected = false;
+  {
+    gpu::detail::resident_curl_session session(&boundary_owner, true);
+    gpu::detail::resident_ensure_mirror_fp32(
+        session.cache(), boundary_source.data(), boundary_source.size());
+    gpu::detail::resident_ensure_mirror_fp32(
+        session.cache(), boundary_destination.data(),
+        boundary_destination.size());
+    scoped_environment_override enable_span_cache(
+        "MEEP_GPU_DISABLE_BOUNDARY_SPAN_CACHE", nullptr);
+    const auto span_before = gpu::get_boundary_execution_statistics();
+    gpu::detail::resident_ensure_span_fp32(session.cache(), boundary_source.data(), 1);
+    gpu::detail::resident_ensure_span_fp32(session.cache(), boundary_source.data(), 1);
+    const auto span_after = gpu::get_boundary_execution_statistics();
+    require(span_after.span_cache_bypasses == span_before.span_cache_bypasses + 2 &&
+                span_after.span_cache_hits == span_before.span_cache_hits &&
+                span_after.span_cache_misses == span_before.span_cache_misses,
+            "allocation-generation zero reused or populated a span lookup cache");
+    const gpu::detail::boundary_operation_fp32 operation = {
+        session.cache(), session.cache(), boundary_destination.data(),
+        nullptr, boundary_source.data(), nullptr, 1.0f, 0.0f};
+    gpu::detail::resident_apply_boundary_fp32(
+        &boundary_owner, boundary_plan_token, &operation, 1);
+    gpu::detail::resident_apply_boundary_fp32(
+        &boundary_global_owner, boundary_plan_token, &operation, 1);
+    require(!gpu::detail::resident_boundary_plan_ready(
+                &boundary_owner, boundary_plan_token),
+            "allocation-generation zero boundary plan became replay-ready");
+    try {
+      (void)gpu::detail::resident_launch_boundary_plan(
+          &boundary_owner, boundary_plan_token);
+    }
+    catch (const std::logic_error &) {
+      zero_generation_launch_rejected = true;
+    }
+    {
+      scoped_environment_override fail_quiescence(
+          "MEEP_GPU_TEST_SPARSE_LORENTZIAN_FAIL_STAGE", "quiescence");
+      gpu::detail::discard_resident_mirror_for_owner(
+          &boundary_owner, boundary_destination.data());
+    }
+    try {
+      (void)gpu::detail::resident_launch_boundary_plan(
+          &boundary_owner, boundary_plan_token);
+    }
+    catch (const std::logic_error &) {
+      quarantined_launch_rejected = true;
+    }
+  }
+  const auto boundary_failure =
+      gpu::detail::get_sparse_lorentzian_generation_snapshot_for_testing(
+          &boundary_owner);
+  require(zero_generation_launch_rejected &&
+              quarantined_launch_rejected && boundary_failure.exists &&
+              boundary_failure.device_storage_quarantined &&
+              boundary_failure.allocation_generation == 0,
+          "generation-zero boundary descriptor remained executable after "
+          "cache quarantine");
+  gpu::detail::discard_resident_cache_for_owner(&boundary_owner);
+  const std::uint64_t buffers_before_late_owner_clear =
+      gpu::get_live_resident_device_buffers();
+  gpu::detail::destroy_boundary_exchange_for_owner(&boundary_owner);
+  require(gpu::get_live_resident_device_buffers() ==
+              buffers_before_late_owner_clear,
+          "late boundary owner cleanup reclaimed a descriptor after a failed "
+          "device fence");
+
+  // Device selection first synchronizes all resident caches and then clears
+  // their old-device allocations.  Under process-global descriptor
+  // quarantine, that clear must retain and quarantine the cache; a later
+  // session must neither overwrite its owning ordinal nor reactivate it.
+  std::vector<int> compatible_ordinals;
+  for (const gpu::device_info &device : gpu::enumerate_devices())
+    if (device.compatible) compatible_ordinals.push_back(device.ordinal);
+  const int migration_source_ordinal = gpu::selected_device();
+  const auto migration_target = std::find_if(
+      compatible_ordinals.begin(), compatible_ordinals.end(),
+      [migration_source_ordinal](int ordinal) {
+        return ordinal != migration_source_ordinal;
+      });
+  if (migration_target != compatible_ordinals.end()) {
+    int migration_owner = 0;
+    std::vector<realnum> migration_values(16, realnum(0.875));
+    {
+      gpu::detail::resident_curl_session session(&migration_owner, true);
+      gpu::detail::resident_ensure_mirror_fp32(
+          session.cache(), migration_values.data(), migration_values.size());
+      session.finish(false);
+    }
+    const std::uint64_t buffers_before_migration =
+        gpu::get_live_resident_device_buffers();
+    gpu::select_device(*migration_target);
+    bool migration_reactivation_rejected = false;
+    try {
+      gpu::detail::resident_curl_session session(&migration_owner, true);
+    }
+    catch (const std::runtime_error &) {
+      migration_reactivation_rejected = true;
+    }
+    const auto quarantined_migration =
+        gpu::detail::get_sparse_lorentzian_generation_snapshot_for_testing(
+            &migration_owner);
+    const auto migration_cache =
+        gpu::detail::get_resident_cache_snapshot_for_testing(
+            &migration_owner);
+    require(migration_reactivation_rejected &&
+                quarantined_migration.exists &&
+                quarantined_migration.device_storage_quarantined &&
+                migration_cache.exists && !migration_cache.phase_active &&
+                migration_cache.device_ordinal == migration_source_ordinal &&
+                migration_cache.mirror_count == 1 &&
+                gpu::get_live_resident_device_buffers() ==
+                    buffers_before_migration,
+            "device migration relabeled or reactivated retained quarantined "
+            "storage");
+    gpu::detail::discard_resident_cache_for_owner(&migration_owner);
+  }
+
+  bool reset_rejected = false;
+  try {
+    gpu::reset_sparse_lorentzian_statistics();
+  }
+  catch (const std::runtime_error &) {
+    reset_rejected = true;
+  }
+  require(reset_rejected &&
+              gpu::get_sparse_lorentzian_statistics().teardown_incomplete,
+          "statistics reset concealed incomplete sparse Lorentzian teardown");
+  const std::uint64_t buffers_before_global_clear =
+      gpu::get_live_resident_device_buffers();
+  gpu::set_backend(gpu::backend_mode::cpu);
+  require(gpu::get_live_resident_device_buffers() ==
+              buffers_before_global_clear,
+          "backend-wide registry cleanup reclaimed external device storage "
+          "after an incomplete teardown");
+#endif
+}
+
+void require_sparse_lorentzian_generation_exhaustion_contract() {
+#if MEEP_SINGLE
+  const std::uint64_t maximum =
+      std::numeric_limits<std::uint64_t>::max();
+  constexpr std::size_t point_count = 70000;
+  std::vector<realnum> field(point_count, realnum(0.25));
+  std::vector<realnum> sigma(point_count, realnum(0.0));
+  for (std::size_t index = 0; index < point_count; index += 16)
+    sigma[index] = realnum(0.125);
+  gpu::detail::index_space_fp32 space{};
+  space.extent1 = 1;
+  space.extent2 = 1;
+  space.extent3 = point_count;
+  space.field_stride3 = 1;
+  space.coefficient_start = -1;
+  space.coefficient2_start = -1;
+  const gpu::detail::lorentzian_material_fp32 material = {
+      sigma.data(), nullptr, nullptr, 0.91f, 0.87f, 0.12f, 0.12f};
+  scoped_environment_override enable_sparse(
+      "MEEP_GPU_ENABLE_SPARSE_LORENTZIAN_PLAN", "1");
+  scoped_environment_override disable_sparse(
+      "MEEP_GPU_DISABLE_SPARSE_LORENTZIAN_PLAN", nullptr);
+
+  const auto update = [&](const void *owner, std::vector<realnum> &p,
+                          std::vector<realnum> &auxiliary) {
+    gpu::detail::resident_curl_session session(owner, true);
+    gpu::detail::resident_update_lorentzian_fp32(
+        session.cache(), p.data(), auxiliary.data(), field.data(), nullptr,
+        nullptr, point_count, space, 0, 0, 0, material,
+        gpu::detail::lorentzian_state_kind::previous);
+    session.finish(false);
+  };
+
+  gpu::reset_sparse_lorentzian_statistics();
+  int epoch_owner = 0;
+  std::vector<realnum> epoch_p(point_count, realnum(0.0));
+  std::vector<realnum> epoch_aux(point_count, realnum(0.0));
+  update(&epoch_owner, epoch_p, epoch_aux);
+  update(&epoch_owner, epoch_p, epoch_aux);
+  gpu::detail::set_resident_epoch_for_testing(&epoch_owner, maximum);
+  update(&epoch_owner, epoch_p, epoch_aux);
+  const auto epoch_snapshot =
+      gpu::detail::get_sparse_lorentzian_generation_snapshot_for_testing(
+          &epoch_owner);
+  require(epoch_snapshot.exists && epoch_snapshot.epoch == 1 &&
+              epoch_snapshot.permanent_dense_lock &&
+              gpu::get_sparse_lorentzian_statistics().live_plans == 0,
+          "resident upload epoch exhaustion wrapped or retained sparse state");
+  gpu::detail::destroy_resident_cache_for_owner(&epoch_owner);
+
+  int control_owner = 0;
+  std::vector<realnum> control_p(point_count, realnum(0.0));
+  std::vector<realnum> control_aux(point_count, realnum(0.0));
+  update(&control_owner, control_p, control_aux);
+  update(&control_owner, control_p, control_aux);
+  gpu::detail::set_sparse_lorentzian_control_generation_for_testing(
+      &control_owner, maximum);
+  {
+    scoped_environment_override disable_presence(
+        "MEEP_GPU_DISABLE_SPARSE_LORENTZIAN_PLAN", "1");
+    update(&control_owner, control_p, control_aux);
+  }
+  const auto control_snapshot =
+      gpu::detail::get_sparse_lorentzian_generation_snapshot_for_testing(
+          &control_owner);
+  require(control_snapshot.exists &&
+              control_snapshot.control_generation == maximum &&
+              control_snapshot.permanent_dense_lock,
+          "sparse control generation exhaustion wrapped or remained eligible");
+  gpu::detail::destroy_resident_cache_for_owner(&control_owner);
+
+  gpu::reset_sparse_lorentzian_statistics();
+  gpu::detail::set_sparse_lorentzian_host_opt_in_counters_for_testing(
+      maximum, maximum - 10);
+  int counter_owner = 0;
+  std::vector<realnum> counter_p(point_count, realnum(0.0));
+  std::vector<realnum> counter_aux(point_count, realnum(0.0));
+  update(&counter_owner, counter_p, counter_aux);
+  const gpu::sparse_lorentzian_statistics saturated_counters =
+      gpu::get_sparse_lorentzian_statistics();
+  require(saturated_counters.opt_in_calls == maximum &&
+              saturated_counters.opt_in_points == maximum &&
+              saturated_counters.counter_overflow,
+          "sparse Lorentzian host statistics counters wrapped or concealed "
+          "overflow");
+  gpu::detail::destroy_resident_cache_for_owner(&counter_owner);
+  gpu::reset_sparse_lorentzian_statistics();
+
+  gpu::detail::set_resident_allocation_generation_counter_for_testing(
+      maximum - 1);
+  int maximum_owner = 0;
+  int exhausted_owner = 0;
+  std::vector<realnum> exhausted_p(point_count, realnum(0.0));
+  std::vector<realnum> exhausted_aux(point_count, realnum(0.0));
+  {
+    gpu::detail::resident_curl_session session(&maximum_owner, true);
+    session.finish(false);
+  }
+  const auto maximum_snapshot =
+      gpu::detail::get_sparse_lorentzian_generation_snapshot_for_testing(
+          &maximum_owner);
+  {
+    gpu::detail::resident_curl_session session(&exhausted_owner, true);
+    session.finish(false);
+  }
+  update(&exhausted_owner, exhausted_p, exhausted_aux);
+  const auto exhausted_snapshot =
+      gpu::detail::get_sparse_lorentzian_generation_snapshot_for_testing(
+          &exhausted_owner);
+  require(maximum_snapshot.allocation_generation == maximum &&
+              exhausted_snapshot.allocation_generation == 0 &&
+              exhausted_snapshot.permanent_dense_lock,
+          "resident allocation generation did not issue UINT64_MAX once and "
+          "then fail closed at zero");
+  gpu::detail::destroy_resident_cache_for_owner(&maximum_owner);
+  gpu::detail::destroy_resident_cache_for_owner(&exhausted_owner);
+
+  gpu::detail::set_sparse_lorentzian_reset_generation_for_testing(maximum - 1);
+  gpu::reset_sparse_lorentzian_statistics();
+  require(gpu::get_sparse_lorentzian_statistics().reset_generation == maximum,
+          "statistics reset generation did not issue UINT64_MAX exactly once");
+  bool first_exhausted = false;
+  bool permanently_exhausted = false;
+  try {
+    gpu::reset_sparse_lorentzian_statistics();
+  }
+  catch (const std::overflow_error &) {
+    first_exhausted = true;
+  }
+  try {
+    gpu::reset_sparse_lorentzian_statistics();
+  }
+  catch (const std::overflow_error &) {
+    permanently_exhausted = true;
+  }
+  require(first_exhausted && permanently_exhausted &&
+              gpu::get_sparse_lorentzian_statistics().reset_generation ==
+                  maximum,
+          "statistics reset generation wrapped or resumed after exhaustion");
+#endif
+}
+
+void require_sparse_lorentzian_reset_reclaim_failure_contract() {
+#if MEEP_SINGLE
+  constexpr std::size_t point_count = 70000;
+  std::vector<realnum> p(point_count, realnum(0.0));
+  std::vector<realnum> auxiliary(point_count, realnum(0.0));
+  std::vector<realnum> field(point_count, realnum(0.25));
+  std::vector<realnum> sigma(point_count, realnum(0.0));
+  for (std::size_t index = 0; index < point_count; index += 16)
+    sigma[index] = realnum(0.125);
+  gpu::detail::index_space_fp32 space{};
+  space.extent1 = 1;
+  space.extent2 = 1;
+  space.extent3 = point_count;
+  space.field_stride3 = 1;
+  space.coefficient_start = -1;
+  space.coefficient2_start = -1;
+  const gpu::detail::lorentzian_material_fp32 material = {
+      sigma.data(), nullptr, nullptr, 0.91f, 0.87f, 0.12f, 0.12f};
+  scoped_environment_override enable_sparse(
+      "MEEP_GPU_ENABLE_SPARSE_LORENTZIAN_PLAN", "1");
+  scoped_environment_override disable_sparse(
+      "MEEP_GPU_DISABLE_SPARSE_LORENTZIAN_PLAN", nullptr);
+
+  gpu::reset_sparse_lorentzian_statistics();
+  int owner = 0;
+  for (int iteration = 0; iteration < 3; ++iteration) {
+    gpu::detail::resident_curl_session session(&owner, true);
+    gpu::detail::resident_update_lorentzian_fp32(
+        session.cache(), p.data(), auxiliary.data(), field.data(), nullptr,
+        nullptr, point_count, space, 0, 0, 0, material,
+        gpu::detail::lorentzian_state_kind::previous);
+    session.finish(false);
+  }
+  const gpu::sparse_lorentzian_statistics before =
+      gpu::get_sparse_lorentzian_statistics();
+  require(before.device_sparse_update_calls > 0 && before.live_plans == 1,
+          "reset-reclaim failure test did not establish a live device ledger");
+  const std::uint64_t buffers_before =
+      gpu::get_live_resident_device_buffers();
+  bool reset_threw = false;
+  {
+    scoped_environment_override fail_reclaim(
+        "MEEP_GPU_TEST_SPARSE_LORENTZIAN_FAIL_STAGE",
+        "statistics-reset-reclaim");
+    try {
+      gpu::reset_sparse_lorentzian_statistics();
+    }
+    catch (...) {
+      reset_threw = true;
+    }
+  }
+  const gpu::sparse_lorentzian_statistics after =
+      gpu::get_sparse_lorentzian_statistics();
+  require(!reset_threw &&
+              after.reset_generation == before.reset_generation + 1 &&
+              after.opt_in_calls == 0 &&
+              after.device_sparse_update_calls == 0 &&
+              after.live_plans == before.live_plans &&
+              after.teardown_incomplete &&
+              gpu::get_live_resident_device_buffers() >= buffers_before + 1,
+          "post-commit old-ledger reclaim failure was reported as a failed "
+          "reset or published a partial reset generation");
+  bool later_reset_rejected = false;
+  try {
+    gpu::reset_sparse_lorentzian_statistics();
+  }
+  catch (const std::runtime_error &) {
+    later_reset_rejected = true;
+  }
+  require(later_reset_rejected,
+          "old-ledger reclaim failure did not preserve sticky teardown "
+          "evidence for later resets");
+  gpu::detail::destroy_resident_cache_for_owner(&owner);
 #endif
 }
 
@@ -3741,11 +5548,17 @@ void require_phase_batched_launch_equivalence() {
   }
   const gpu::phase_batch_policy_statistics fused_policy =
       gpu::get_phase_batch_policy_statistics();
+  const gpu::curl_phase_replay_statistics fused_replay =
+      gpu::get_curl_phase_replay_statistics();
   require(gpu::get_live_resident_device_buffers() == live_before,
           "phase-batched CUDA run leaked a cached descriptor or mirror");
 
   run_result automatic;
   {
+    scoped_environment_override graph_enable(
+        "MEEP_GPU_ENABLE_STRUCTURED_CURL_GRAPH", nullptr);
+    scoped_environment_override graph_disable(
+        "MEEP_GPU_DISABLE_STRUCTURED_CURL_GRAPH", nullptr);
     scoped_environment_override curl_enable(
         "MEEP_GPU_ENABLE_PHASE_BATCHED_CURL", nullptr);
     scoped_environment_override update_enable(
@@ -3765,6 +5578,8 @@ void require_phase_batched_launch_equivalence() {
       gpu::get_phase_batch_policy_statistics();
   const gpu::curl_phase_replay_statistics automatic_replay =
       gpu::get_curl_phase_replay_statistics();
+  const gpu::structured_curl_graph_statistics automatic_graph =
+      gpu::get_structured_curl_graph_statistics();
   require(gpu::get_live_resident_device_buffers() == live_before,
           "automatic phase-batched CUDA run leaked a resident buffer");
   compare_results(automatic, fused, two_dimensional_case);
@@ -3793,9 +5608,13 @@ void require_phase_batched_launch_equivalence() {
           automatic_policy.update_eh_automatic_checks ==
               automatic_policy.update_eh_automatic_selected +
                   automatic_policy.update_eh_automatic_rejected &&
+          automatic_policy.curl_automatic_checks > 0 &&
           automatic_policy.curl_automatic_selected > 0 &&
-          automatic_policy.update_eh_automatic_selected > 0 &&
+          automatic_policy.curl_automatic_rejected == 0 &&
+          automatic_policy.curl_forced_batches == 0 &&
           automatic_policy.curl_batched_operations > 0 &&
+          automatic_policy.curl_unbatched_operations == 0 &&
+          automatic_policy.update_eh_automatic_selected > 0 &&
           automatic_policy.update_eh_batched_operations > 0 &&
           (curl_replay_globally_disabled
                ? automatic_replay.checks == 0 &&
@@ -3804,15 +5623,349 @@ void require_phase_batched_launch_equivalence() {
                      automatic_replay.generation_misses == 0 &&
                      automatic_replay.mirror_misses == 0
                : automatic_replay.checks ==
-                         automatic_replay.hits + automatic_replay.unready +
-                             automatic_replay.generation_misses +
-                             automatic_replay.mirror_misses &&
-                     automatic_replay.hits > 0) &&
+                     automatic_replay.hits + automatic_replay.unready +
+                         automatic_replay.generation_misses +
+                         automatic_replay.mirror_misses) &&
+          automatic_graph.collection_checks == 0 &&
+          automatic_graph.collection_launches == 0 &&
+          automatic_graph.plan_creations == 0 &&
+          automatic_graph.plan_rebuilds == 0 &&
+          automatic_graph.plan_reuses == 0 &&
+          automatic_graph.plan_destroys == 0 &&
+          automatic_graph.live_plans == 0 &&
+          automatic_graph.logical_operations == 0 &&
+          automatic_graph.unsupported_fallbacks == 0 &&
+          automatic_graph.creation_fallbacks == 0 &&
+          automatic_graph.launch_failures == 0 &&
+          automatic_graph.replay_checks == 0 &&
+          automatic_graph.replay_launches == 0 &&
+          automatic_graph.replay_unready == 0 &&
+          automatic_graph.replay_generation_misses == 0 &&
+          automatic_graph.replay_mirror_misses == 0 &&
           automatic.statistics.cuda_curl_calls ==
               fused.statistics.cuda_curl_calls &&
+          automatic.statistics.cuda_curl_points ==
+              fused.statistics.cuda_curl_points &&
           automatic.field_updates.cuda_update_eh_calls ==
               fused.field_updates.cuda_update_eh_calls,
-      "automatic phase policy did not select the favorable small topology");
+      "production phase policy did not select favorable small curl/E/H "
+      "topologies with consistent replay accounting");
+  require(
+      curl_replay_globally_disabled
+          ? fused_replay.checks == 0 && fused_replay.hits == 0 &&
+                fused_replay.unready == 0 &&
+                fused_replay.generation_misses == 0 &&
+                fused_replay.mirror_misses == 0
+          : fused_replay.checks ==
+                    fused_replay.hits + fused_replay.unready +
+                        fused_replay.generation_misses +
+                        fused_replay.mirror_misses &&
+                fused_replay.hits > 0,
+      "explicitly forced curl replay did not satisfy its outcome contract");
+
+  gpu::dispatch_statistics rejected_1d_dispatch{};
+  gpu::phase_batch_policy_statistics rejected_1d_policy{};
+  gpu::curl_phase_replay_statistics rejected_1d_replay{};
+  bool rejected_1d_nested_guard = false;
+  {
+    scoped_environment_override graph_enable(
+        "MEEP_GPU_ENABLE_STRUCTURED_CURL_GRAPH", nullptr);
+    scoped_environment_override graph_disable(
+        "MEEP_GPU_DISABLE_STRUCTURED_CURL_GRAPH", nullptr);
+    scoped_environment_override curl_enable(
+        "MEEP_GPU_ENABLE_PHASE_BATCHED_CURL", nullptr);
+    scoped_environment_override curl_disable(
+        "MEEP_GPU_DISABLE_PHASE_BATCHED_CURL", nullptr);
+    gpu::set_backend(gpu::backend_mode::cuda);
+    gpu::reset_dispatch_statistics();
+    const int ranks = count_processors();
+    require(ranks > 0 && ranks <= std::numeric_limits<int>::max() / 2,
+            "negative curl-cache fixture rank count is invalid");
+    // Preserve two local curl operations per rank.  A fixed two-chunk fixture
+    // becomes a singleton on each rank under the ordinary two-rank check
+    // harness, and singleton phases intentionally bypass the negative cache.
+    // Scale the 1D length with the global chunk count so every chunk retains
+    // the same number of Yee points as the qualified singleton fixture.
+    const grid_volume gv =
+        vol1d(2.5 * static_cast<double>(ranks), 12.0);
+    structure s(gv, vacuum, no_pml(), identity(), 2 * ranks);
+    fields f(&s, 0.0, 0.0, true, 0);
+    f.use_real_fields();
+    gaussian_src_time electric_source(0.31, 0.12);
+    gaussian_src_time magnetic_source(0.23, 0.10);
+    f.add_point_source(Ex, electric_source, vec(0.71), 0.7);
+    f.add_point_source(Hy, magnetic_source, vec(1.63), -0.4);
+
+    // Seed the stable rejected verdict, then reset exactly as the measured
+    // phase-policy benchmark does. Cached hits must retain complete direct-
+    // operation accounting after the reset.
+    for (int step = 0; step < 8; ++step) f.step();
+    const gpu::detail::curl_phase_replay_plan_snapshot rejected_plan =
+        gpu::detail::get_curl_phase_replay_plan_snapshot_for_testing(
+            &f, static_cast<int>(B_stuff));
+    require(rejected_plan.exists && rejected_plan.automatic_rejected &&
+                rejected_plan.topology_fingerprint != 0 &&
+                rejected_plan.operation_count == 2,
+            "stable rejected 1D curl topology was not cached");
+    gpu::reset_dispatch_statistics();
+    for (int step = 0; step < 64; ++step) f.step();
+    rejected_1d_dispatch = gpu::get_dispatch_statistics();
+    rejected_1d_policy = gpu::get_phase_batch_policy_statistics();
+    rejected_1d_replay = gpu::get_curl_phase_replay_statistics();
+
+    // A cache hit must never bypass the thread-local nested-collection guard.
+    int outer_owner = 0;
+    gpu::detail::resident_curl_phase_batch outer(
+        &outer_owner, 101, gpu::detail::phase_batch_mode::automatic,
+        202, false, false);
+    try {
+      gpu::detail::resident_curl_phase_batch cached_inner(
+          &f, static_cast<int>(B_stuff),
+          gpu::detail::phase_batch_mode::automatic,
+          rejected_plan.topology_fingerprint, false, false);
+    }
+    catch (const std::logic_error &) {
+      rejected_1d_nested_guard = true;
+    }
+  }
+  require(
+      rejected_1d_dispatch.cuda_curl_calls > 0 &&
+          rejected_1d_dispatch.cpu_curl_calls == 0 &&
+          rejected_1d_policy.curl_automatic_checks > 0 &&
+          rejected_1d_policy.curl_automatic_selected == 0 &&
+          rejected_1d_policy.curl_automatic_rejected ==
+              rejected_1d_policy.curl_automatic_checks &&
+          rejected_1d_policy.curl_unbatched_operations ==
+              rejected_1d_dispatch.cuda_curl_calls &&
+          rejected_1d_nested_guard &&
+          rejected_1d_replay.checks == 0,
+      "stable rejected 1D curl topology repeated descriptor/replay work: "
+      "checks=" +
+          std::to_string(rejected_1d_policy.curl_automatic_checks) +
+          " rejected=" +
+          std::to_string(rejected_1d_policy.curl_automatic_rejected) +
+          " replay=" + std::to_string(rejected_1d_replay.checks));
+
+  run_result structured_graph;
+  gpu::structured_curl_graph_statistics structured_graph_statistics{};
+  gpu::phase_batch_policy_statistics structured_graph_legacy_policy{};
+  gpu::curl_phase_replay_statistics structured_graph_legacy_replay{};
+  {
+    scoped_environment_override graph_enable(
+        "MEEP_GPU_ENABLE_STRUCTURED_CURL_GRAPH", "1");
+    scoped_environment_override graph_disable(
+        "MEEP_GPU_DISABLE_STRUCTURED_CURL_GRAPH", nullptr);
+    scoped_environment_override curl_enable(
+        "MEEP_GPU_ENABLE_PHASE_BATCHED_CURL", nullptr);
+    scoped_environment_override curl_disable(
+        "MEEP_GPU_DISABLE_PHASE_BATCHED_CURL", nullptr);
+    require(gpu::detail::structured_curl_graph_opted_in(),
+            "structured-curl Graph fixture did not install its opt-in");
+    structured_graph =
+        run_material_case(gpu::backend_mode::cuda, false, 64, true);
+    structured_graph_statistics =
+        gpu::get_structured_curl_graph_statistics();
+    structured_graph_legacy_policy =
+        gpu::get_phase_batch_policy_statistics();
+    structured_graph_legacy_replay =
+        gpu::get_curl_phase_replay_statistics();
+  }
+  compare_results(automatic, structured_graph, two_dimensional_case);
+  require(
+      structured_graph.statistics.cuda_curl_calls >=
+              automatic.statistics.cuda_curl_calls &&
+          structured_graph.statistics.cuda_curl_points ==
+              automatic.statistics.cuda_curl_points,
+      "structured-curl Graph changed curl work or reported fewer submissions "
+      "than the fused automatic policy");
+  require(
+      structured_graph_statistics.collection_checks ==
+              structured_graph_statistics.collection_launches +
+                  structured_graph_statistics.unsupported_fallbacks +
+                  structured_graph_statistics.creation_fallbacks &&
+          structured_graph_statistics.replay_checks ==
+              structured_graph_statistics.replay_launches +
+                  structured_graph_statistics.replay_unready +
+                  structured_graph_statistics.replay_generation_misses +
+                  structured_graph_statistics.replay_mirror_misses &&
+          structured_graph_statistics.collection_launches > 0 &&
+          structured_graph_statistics.plan_creations > 0 &&
+          structured_graph_statistics.plan_reuses > 0 &&
+          structured_graph_statistics.logical_operations > 0 &&
+          structured_graph_statistics.logical_operations <=
+              structured_graph.statistics.cuda_curl_calls &&
+          structured_graph_statistics.creation_fallbacks == 0 &&
+          structured_graph_statistics.launch_failures == 0 &&
+          structured_graph_statistics.live_plans == 0 &&
+          structured_graph_statistics.plan_destroys ==
+              structured_graph_statistics.plan_creations +
+                  structured_graph_statistics.plan_rebuilds,
+      "structured-curl Graph did not satisfy submission, conservation, or "
+      "teardown contracts");
+  require(
+      curl_replay_globally_disabled
+          ? structured_graph_statistics.replay_checks == 0 &&
+                structured_graph_statistics.replay_launches == 0
+          : structured_graph_statistics.replay_checks > 0 &&
+                structured_graph_statistics.replay_launches > 0,
+      "structured-curl Graph replay did not follow the global replay control");
+  require(
+      structured_graph_legacy_policy.curl_automatic_checks == 0 &&
+          structured_graph_legacy_policy.curl_automatic_selected == 0 &&
+          structured_graph_legacy_policy.curl_automatic_rejected == 0 &&
+          structured_graph_legacy_policy.curl_forced_batches == 0 &&
+          structured_graph_legacy_policy.curl_batched_operations == 0 &&
+          structured_graph_legacy_policy.curl_unbatched_operations == 0 &&
+          structured_graph_legacy_replay.checks == 0 &&
+          structured_graph_legacy_replay.hits == 0 &&
+          structured_graph_legacy_replay.unready == 0 &&
+          structured_graph_legacy_replay.generation_misses == 0 &&
+          structured_graph_legacy_replay.mirror_misses == 0,
+      "structured-curl Graph contaminated legacy fused-phase telemetry");
+
+  run_result graph_creation_fallback;
+  gpu::structured_curl_graph_statistics graph_fallback_statistics{};
+  {
+    scoped_environment_override graph_enable(
+        "MEEP_GPU_ENABLE_STRUCTURED_CURL_GRAPH", "1");
+    scoped_environment_override graph_disable(
+        "MEEP_GPU_DISABLE_STRUCTURED_CURL_GRAPH", nullptr);
+    scoped_environment_override curl_enable(
+        "MEEP_GPU_ENABLE_PHASE_BATCHED_CURL", nullptr);
+    scoped_environment_override curl_disable(
+        "MEEP_GPU_DISABLE_PHASE_BATCHED_CURL", nullptr);
+    graph_creation_fallback = run_material_case(
+        gpu::backend_mode::cuda, false, 64, true, -1, true);
+    graph_fallback_statistics =
+        gpu::get_structured_curl_graph_statistics();
+  }
+  compare_results(automatic, graph_creation_fallback, two_dimensional_case);
+  require(
+      graph_creation_fallback.statistics.cuda_curl_calls >=
+              automatic.statistics.cuda_curl_calls &&
+          graph_creation_fallback.statistics.cuda_curl_points ==
+              automatic.statistics.cuda_curl_points &&
+          graph_fallback_statistics.creation_fallbacks == 1 &&
+          graph_fallback_statistics.collection_checks ==
+              graph_fallback_statistics.collection_launches +
+                  graph_fallback_statistics.unsupported_fallbacks +
+                  graph_fallback_statistics.creation_fallbacks &&
+          graph_fallback_statistics.plan_creations > 0 &&
+          graph_fallback_statistics.launch_failures == 0 &&
+          graph_fallback_statistics.live_plans == 0 &&
+          graph_fallback_statistics.plan_destroys ==
+              graph_fallback_statistics.plan_creations +
+                  graph_fallback_statistics.plan_rebuilds,
+      "structured-curl Graph creation failure did not fall back, recover, and "
+      "tear down deterministically");
+
+  const run_result graph_direct_cpu =
+      run_beta_case(gpu::backend_mode::cpu, 0.19, true);
+  run_result graph_direct_cuda;
+  gpu::structured_curl_graph_statistics graph_direct_statistics{};
+  {
+    scoped_environment_override graph_enable(
+        "MEEP_GPU_ENABLE_STRUCTURED_CURL_GRAPH", "1");
+    scoped_environment_override graph_disable(
+        "MEEP_GPU_DISABLE_STRUCTURED_CURL_GRAPH", nullptr);
+    scoped_environment_override curl_enable(
+        "MEEP_GPU_ENABLE_PHASE_BATCHED_CURL", nullptr);
+    scoped_environment_override curl_disable(
+        "MEEP_GPU_DISABLE_PHASE_BATCHED_CURL", nullptr);
+    graph_direct_cuda =
+        run_beta_case(gpu::backend_mode::cuda, 0.19, true);
+    graph_direct_statistics =
+        gpu::get_structured_curl_graph_statistics();
+  }
+  compare_results(
+      graph_direct_cpu, graph_direct_cuda, two_dimensional_case);
+  require(
+      graph_direct_cuda.statistics.cuda_curl_calls > 0 &&
+          graph_direct_statistics.collection_checks == 0 &&
+          graph_direct_statistics.collection_launches == 0 &&
+          graph_direct_statistics.unsupported_fallbacks == 0 &&
+          graph_direct_statistics.creation_fallbacks == 0 &&
+          graph_direct_statistics.plan_creations == 0 &&
+          graph_direct_statistics.logical_operations == 0 &&
+          graph_direct_statistics.replay_checks == 0 &&
+          graph_direct_statistics.replay_launches == 0 &&
+          graph_direct_statistics.replay_unready == 0 &&
+          graph_direct_statistics.launch_failures == 0 &&
+          graph_direct_statistics.live_plans == 0,
+      "structured-curl Graph did not bypass a known direct-beta phase before "
+      "collection");
+
+  const run_result graph_bfast_cpu = run_bfast_case(
+      gpu::backend_mode::cpu, two_dimensional_case, true, true, true);
+  run_result graph_bfast_cuda;
+  gpu::structured_curl_graph_statistics graph_bfast_statistics{};
+  {
+    scoped_environment_override graph_enable(
+        "MEEP_GPU_ENABLE_STRUCTURED_CURL_GRAPH", "1");
+    scoped_environment_override graph_disable(
+        "MEEP_GPU_DISABLE_STRUCTURED_CURL_GRAPH", nullptr);
+    scoped_environment_override curl_enable(
+        "MEEP_GPU_ENABLE_PHASE_BATCHED_CURL", nullptr);
+    scoped_environment_override curl_disable(
+        "MEEP_GPU_DISABLE_PHASE_BATCHED_CURL", nullptr);
+    graph_bfast_cuda = run_bfast_case(
+        gpu::backend_mode::cuda, two_dimensional_case, true, true, true);
+    graph_bfast_statistics = gpu::get_structured_curl_graph_statistics();
+  }
+  compare_results(graph_bfast_cpu, graph_bfast_cuda, two_dimensional_case);
+  require(
+      graph_bfast_cuda.statistics.cuda_curl_calls > 0 &&
+          graph_bfast_statistics.collection_checks == 0 &&
+          graph_bfast_statistics.collection_launches == 0 &&
+          graph_bfast_statistics.unsupported_fallbacks == 0 &&
+          graph_bfast_statistics.creation_fallbacks == 0 &&
+          graph_bfast_statistics.plan_creations == 0 &&
+          graph_bfast_statistics.logical_operations == 0 &&
+          graph_bfast_statistics.replay_checks == 0 &&
+          graph_bfast_statistics.replay_launches == 0 &&
+          graph_bfast_statistics.replay_unready == 0 &&
+          graph_bfast_statistics.launch_failures == 0 &&
+          graph_bfast_statistics.live_plans == 0 &&
+          gpu::get_live_resident_device_buffers() == live_before,
+      "structured-curl Graph did not bypass a known BFAST phase before "
+      "collection");
+
+  const run_result graph_cylindrical_cpu = run_cylindrical_case(
+      gpu::backend_mode::cpu, 2, false, true, true, true);
+  run_result graph_cylindrical_cuda;
+  gpu::structured_curl_graph_statistics graph_cylindrical_statistics{};
+  {
+    scoped_environment_override graph_enable(
+        "MEEP_GPU_ENABLE_STRUCTURED_CURL_GRAPH", "1");
+    scoped_environment_override graph_disable(
+        "MEEP_GPU_DISABLE_STRUCTURED_CURL_GRAPH", nullptr);
+    scoped_environment_override curl_enable(
+        "MEEP_GPU_ENABLE_PHASE_BATCHED_CURL", nullptr);
+    scoped_environment_override curl_disable(
+        "MEEP_GPU_DISABLE_PHASE_BATCHED_CURL", nullptr);
+    graph_cylindrical_cuda = run_cylindrical_case(
+        gpu::backend_mode::cuda, 2, false, true, true, true);
+    graph_cylindrical_statistics =
+        gpu::get_structured_curl_graph_statistics();
+  }
+  compare_results(
+      graph_cylindrical_cpu, graph_cylindrical_cuda, two_dimensional_case);
+  require(
+      graph_cylindrical_cuda.statistics.cuda_curl_calls > 0 &&
+          graph_cylindrical_statistics.collection_checks == 0 &&
+          graph_cylindrical_statistics.collection_launches == 0 &&
+          graph_cylindrical_statistics.unsupported_fallbacks == 0 &&
+          graph_cylindrical_statistics.creation_fallbacks == 0 &&
+          graph_cylindrical_statistics.plan_creations == 0 &&
+          graph_cylindrical_statistics.logical_operations == 0 &&
+          graph_cylindrical_statistics.replay_checks == 0 &&
+          graph_cylindrical_statistics.replay_launches == 0 &&
+          graph_cylindrical_statistics.replay_unready == 0 &&
+          graph_cylindrical_statistics.launch_failures == 0 &&
+          graph_cylindrical_statistics.live_plans == 0 &&
+          gpu::get_live_resident_device_buffers() == live_before,
+      "structured-curl Graph did not bypass a known cylindrical phase before "
+      "collection");
 
   run_result replay_disabled;
   gpu::curl_phase_replay_statistics replay_disabled_statistics{};
@@ -3820,11 +5973,11 @@ void require_phase_batched_launch_equivalence() {
     scoped_environment_override replay_disable(
         "MEEP_GPU_DISABLE_CURL_PHASE_REPLAY", "1");
     scoped_environment_override curl_enable(
-        "MEEP_GPU_ENABLE_PHASE_BATCHED_CURL", nullptr);
+        "MEEP_GPU_ENABLE_PHASE_BATCHED_CURL", "1");
     scoped_environment_override update_enable(
-        "MEEP_GPU_ENABLE_PHASE_BATCHED_UPDATE_EH", nullptr);
+        "MEEP_GPU_ENABLE_PHASE_BATCHED_UPDATE_EH", "1");
     scoped_environment_override source_enable(
-        "MEEP_GPU_ENABLE_PHASE_BATCHED_SOURCE", nullptr);
+        "MEEP_GPU_ENABLE_PHASE_BATCHED_SOURCE", "1");
     scoped_environment_override curl_batch(
         "MEEP_GPU_DISABLE_PHASE_BATCHED_CURL", nullptr);
     scoped_environment_override update_batch(
@@ -3838,7 +5991,7 @@ void require_phase_batched_launch_equivalence() {
   }
   require(gpu::get_live_resident_device_buffers() == live_before,
           "curl replay-disabled control leaked a resident buffer");
-  compare_results(automatic, replay_disabled, two_dimensional_case);
+  compare_results(fused, replay_disabled, two_dimensional_case);
   require(
       replay_disabled_statistics.checks == 0 &&
           replay_disabled_statistics.hits == 0 &&
@@ -3846,16 +5999,16 @@ void require_phase_batched_launch_equivalence() {
           replay_disabled_statistics.generation_misses == 0 &&
           replay_disabled_statistics.mirror_misses == 0 &&
           replay_disabled.statistics.cuda_curl_calls ==
-              automatic.statistics.cuda_curl_calls &&
+              fused.statistics.cuda_curl_calls &&
           replay_disabled.statistics.cuda_curl_points ==
-              automatic.statistics.cuda_curl_points,
+              fused.statistics.cuda_curl_points,
       "curl phase replay opt-out changed results or logical dispatch");
 
   run_result direct_mixed;
   gpu::curl_phase_replay_statistics direct_mixed_replay{};
   {
     scoped_environment_override curl_enable(
-        "MEEP_GPU_ENABLE_PHASE_BATCHED_CURL", nullptr);
+        "MEEP_GPU_ENABLE_PHASE_BATCHED_CURL", "1");
     scoped_environment_override curl_disable(
         "MEEP_GPU_DISABLE_PHASE_BATCHED_CURL", nullptr);
     direct_mixed =
@@ -4001,6 +6154,14 @@ void require_phase_batched_launch_equivalence() {
 
 void require_curl_replay_direct_transition_contract() {
 #if MEEP_SINGLE
+  // Curl batching is fail-closed in the production default because entering
+  // phase collection regresses the qualified structured-grid path. This
+  // fixture deliberately verifies the expert-only replay transaction, so it
+  // must opt in explicitly instead of inheriting the production policy.
+  scoped_environment_override curl_enable(
+      "MEEP_GPU_ENABLE_PHASE_BATCHED_CURL", "1");
+  scoped_environment_override curl_disable(
+      "MEEP_GPU_DISABLE_PHASE_BATCHED_CURL", nullptr);
   const bool replay_disabled =
       std::getenv("MEEP_GPU_DISABLE_CURL_PHASE_REPLAY") != nullptr;
   const curl_replay_direct_transition transitions[] = {
@@ -4354,6 +6515,722 @@ void require_curl_replay_invalidation_and_failure_contract() {
     std::cout
         << "PASS: curl replay host-write, generation, cache-reset, and "
            "launch-failure transactions recover deterministically\n";
+#endif
+}
+
+void require_structured_curl_graph_invalidation_and_failure_contract() {
+#if MEEP_SINGLE
+  if (count_processors() != 1) {
+    if (am_master())
+      std::cout
+          << "SKIP: structured-curl Graph invalidation/failure transaction "
+             "requires one MPI rank\n";
+    return;
+  }
+  if (std::getenv("MEEP_GPU_DISABLE_CURL_PHASE_REPLAY") != nullptr) {
+    if (am_master())
+      std::cout
+          << "SKIP: structured-curl Graph invalidation/failure transaction "
+             "requires replay enabled\n";
+    return;
+  }
+  scoped_environment_override graph_enable(
+      "MEEP_GPU_ENABLE_STRUCTURED_CURL_GRAPH", "1");
+  scoped_environment_override graph_disable(
+      "MEEP_GPU_DISABLE_STRUCTURED_CURL_GRAPH", nullptr);
+  scoped_environment_override curl_enable(
+      "MEEP_GPU_ENABLE_PHASE_BATCHED_CURL", nullptr);
+  scoped_environment_override curl_disable(
+      "MEEP_GPU_DISABLE_PHASE_BATCHED_CURL", nullptr);
+
+  const curl_replay_host_write_result host_cpu =
+      run_curl_replay_host_write_case(gpu::backend_mode::cpu);
+  const curl_replay_host_write_result host_cuda =
+      run_curl_replay_host_write_case(gpu::backend_mode::cuda);
+  const gpu::structured_curl_graph_statistics host_after_destroy =
+      gpu::get_structured_curl_graph_statistics();
+  compare_results(
+      host_cpu.physics, host_cuda.physics, two_dimensional_case);
+  require(
+      host_cuda.graph_after.replay_checks -
+                  host_cuda.graph_before.replay_checks ==
+              1 &&
+          host_cuda.graph_after.replay_mirror_misses -
+                  host_cuda.graph_before.replay_mirror_misses ==
+              1 &&
+          host_cuda.graph_after.replay_launches ==
+              host_cuda.graph_before.replay_launches &&
+          host_cuda.graph_after.collection_checks -
+                  host_cuda.graph_before.collection_checks ==
+              1 &&
+          host_cuda.graph_after.collection_launches -
+                  host_cuda.graph_before.collection_launches ==
+              1 &&
+          host_cuda.graph_after_replay.replay_checks -
+                  host_cuda.graph_after.replay_checks ==
+              1 &&
+          host_cuda.graph_after_replay.replay_launches -
+                  host_cuda.graph_after.replay_launches ==
+              1 &&
+          host_cuda.dispatch_after.host_to_device_bytes -
+                  host_cuda.dispatch_before.host_to_device_bytes ==
+              host_cuda.expected_upload_bytes &&
+          host_cuda.dispatch_after_replay.host_to_device_bytes ==
+              host_cuda.dispatch_after.host_to_device_bytes &&
+          host_after_destroy.live_plans == 0,
+      "structured-curl Graph did not reject a host-invalidated mirror, "
+      "replay after publication, and tear down its plans");
+
+  constexpr int b_phase_key = static_cast<int>(B_stuff);
+  {
+    std::vector<float> generation_probe(29, 0.125f);
+    gpu::set_backend(gpu::backend_mode::cuda);
+    gpu::reset_dispatch_statistics();
+    const grid_volume gv = vol2d(1.8, 1.6, 10.0);
+    structure s(gv, vacuum, pml(0.3));
+    fields f(&s, 0.0, 0.0, true, 64, 64);
+    f.use_bloch(vec(0.0, 0.0));
+    gaussian_src_time source(0.29, 0.11);
+    f.add_point_source(
+        Ez, source, gv.center(), std::complex<double>(0.8, -0.23));
+    for (int step = 0; step < 16; ++step) f.step();
+    fields_chunk *chunk = nullptr;
+    for (int index = 0; index < f.num_chunks; ++index)
+      if (f.chunks[index]->is_mine()) {
+        chunk = f.chunks[index];
+        break;
+      }
+    require(chunk != nullptr,
+            "structured-curl Graph generation fixture found no local chunk");
+    const gpu::detail::curl_phase_replay_plan_snapshot warm =
+        gpu::detail::get_curl_phase_replay_plan_snapshot_for_testing(
+            &f, b_phase_key);
+    require(warm.exists && warm.complete_phase &&
+                warm.stable_reuses >= 2 && warm.structured_graph &&
+                warm.has_structured_graph,
+            "structured-curl Graph generation fixture did not warm a graph");
+
+    {
+      scoped_environment_override disable_tile_coalescing(
+          "MEEP_GPU_DISABLE_TILE_COALESCING", "1");
+      gpu::reset_dispatch_statistics();
+      run_single_curl_phase(f, B_stuff, true);
+      const gpu::structured_curl_graph_statistics topology =
+          gpu::get_structured_curl_graph_statistics();
+      const gpu::detail::curl_phase_replay_plan_snapshot rebuilt_topology =
+          gpu::detail::get_curl_phase_replay_plan_snapshot_for_testing(
+              &f, b_phase_key);
+      require(
+          topology.replay_checks == 1 &&
+              topology.replay_unready == 1 &&
+              topology.replay_launches == 0 &&
+              topology.replay_generation_misses == 0 &&
+              topology.replay_mirror_misses == 0 &&
+              topology.collection_checks == 1 &&
+              topology.collection_launches == 1 &&
+              topology.plan_rebuilds == 1 &&
+              topology.plan_destroys == 1 &&
+              rebuilt_topology.exists && rebuilt_topology.complete_phase &&
+              rebuilt_topology.stable_reuses == 0 &&
+              rebuilt_topology.structured_graph &&
+              rebuilt_topology.has_structured_graph,
+          "structured-curl Graph topology change did not reject replay and "
+          "rebuild its executable");
+    }
+    // Restoring the topology is itself a new identity. Rebuild once, then
+    // establish the two stable collections required by the replay gate.
+    run_single_curl_phase(f, B_stuff, true);
+    run_single_curl_phase(f, B_stuff, true);
+    run_single_curl_phase(f, B_stuff, true);
+    const gpu::detail::curl_phase_replay_plan_snapshot topology_rewarmed =
+        gpu::detail::get_curl_phase_replay_plan_snapshot_for_testing(
+            &f, b_phase_key);
+    require(topology_rewarmed.complete_phase &&
+                topology_rewarmed.stable_reuses >= 2 &&
+                topology_rewarmed.structured_graph &&
+                topology_rewarmed.has_structured_graph,
+            "structured-curl Graph did not rewarm after restoring topology");
+
+    {
+      gpu::detail::resident_curl_session resident(chunk, true);
+      gpu::detail::resident_ensure_mirror_fp32(
+          resident.cache(), generation_probe.data(),
+          generation_probe.size());
+      resident.finish(false);
+    }
+
+    gpu::reset_dispatch_statistics();
+    run_single_curl_phase(f, B_stuff, true);
+    const gpu::structured_curl_graph_statistics first =
+        gpu::get_structured_curl_graph_statistics();
+    const gpu::detail::curl_phase_replay_plan_snapshot rebuilt =
+        gpu::detail::get_curl_phase_replay_plan_snapshot_for_testing(
+            &f, b_phase_key);
+    require(
+        first.replay_checks == 1 &&
+            first.replay_generation_misses == 1 &&
+            first.replay_launches == 0 && first.replay_unready == 0 &&
+            first.replay_mirror_misses == 0 &&
+            first.collection_checks == 1 &&
+            first.collection_launches == 1 &&
+            first.plan_rebuilds == 1 && first.plan_destroys == 1 &&
+            first.launch_failures == 0 && rebuilt.exists &&
+            rebuilt.complete_phase && rebuilt.stable_reuses == 0 &&
+            rebuilt.structured_graph && rebuilt.has_structured_graph,
+        "structured-curl Graph generation miss did not rebuild the bound "
+        "graph transaction exactly once");
+    run_single_curl_phase(f, B_stuff, true);
+    const gpu::detail::curl_phase_replay_plan_snapshot reuse_one =
+        gpu::detail::get_curl_phase_replay_plan_snapshot_for_testing(
+            &f, b_phase_key);
+    run_single_curl_phase(f, B_stuff, true);
+    const gpu::detail::curl_phase_replay_plan_snapshot reuse_two =
+        gpu::detail::get_curl_phase_replay_plan_snapshot_for_testing(
+            &f, b_phase_key);
+    run_single_curl_phase(f, B_stuff, true);
+    const gpu::structured_curl_graph_statistics recovered =
+        gpu::get_structured_curl_graph_statistics();
+    require(
+        reuse_one.complete_phase && reuse_one.stable_reuses == 1 &&
+            reuse_two.complete_phase && reuse_two.stable_reuses == 2 &&
+            recovered.replay_checks == 4 &&
+            recovered.replay_launches == 1 &&
+            recovered.replay_unready == 2 &&
+            recovered.replay_generation_misses == 1 &&
+            recovered.replay_mirror_misses == 0 &&
+            recovered.replay_checks ==
+                recovered.replay_launches + recovered.replay_unready +
+                    recovered.replay_generation_misses +
+                    recovered.replay_mirror_misses,
+        "structured-curl Graph did not recover after two generation-stable "
+        "collections");
+
+    gpu::detail::reset_resident_cache_for_owner_reusing_allocations(chunk);
+    const gpu::detail::curl_phase_replay_plan_snapshot reset =
+        gpu::detail::get_curl_phase_replay_plan_snapshot_for_testing(
+            &f, b_phase_key);
+    gpu::reset_dispatch_statistics();
+    run_single_curl_phase(f, B_stuff, true);
+    const gpu::structured_curl_graph_statistics reset_rebuild =
+        gpu::get_structured_curl_graph_statistics();
+    const gpu::detail::curl_phase_replay_plan_snapshot reset_plan =
+        gpu::detail::get_curl_phase_replay_plan_snapshot_for_testing(
+            &f, b_phase_key);
+    require(
+        !reset.exists && reset_rebuild.replay_checks == 1 &&
+            reset_rebuild.replay_unready == 1 &&
+            reset_rebuild.replay_launches == 0 &&
+            reset_rebuild.collection_checks == 1 &&
+            reset_rebuild.collection_launches == 1 &&
+            reset_rebuild.plan_creations == 1 &&
+            reset_rebuild.live_plans == 1 && reset_plan.exists &&
+            reset_plan.complete_phase && reset_plan.stable_reuses == 0 &&
+            reset_plan.structured_graph && reset_plan.has_structured_graph,
+        "structured-curl Graph cache reset did not destroy and recreate its "
+        "address-bearing plan");
+  }
+  const gpu::structured_curl_graph_statistics generation_destroyed =
+      gpu::get_structured_curl_graph_statistics();
+  require(generation_destroyed.live_plans == 0 &&
+              generation_destroyed.plan_destroys == 1,
+          "structured-curl Graph generation fixture leaked its recreated plan");
+
+#if MEEP_HAVE_CUDA
+  std::vector<int> compatible_ordinals;
+  for (const gpu::device_info &device : gpu::enumerate_devices())
+    if (device.compatible) compatible_ordinals.push_back(device.ordinal);
+  const int original_ordinal = gpu::selected_device();
+  const auto migration_target = std::find_if(
+      compatible_ordinals.begin(), compatible_ordinals.end(),
+      [original_ordinal](int ordinal) { return ordinal != original_ordinal; });
+  if (migration_target != compatible_ordinals.end()) {
+    gpu::reset_dispatch_statistics();
+    const grid_volume gv = vol2d(1.8, 1.6, 10.0);
+    structure s(gv, vacuum, pml(0.3));
+    fields f(&s, 0.0, 0.0, true, 64, 64);
+    f.use_bloch(vec(0.0, 0.0));
+    gaussian_src_time source(0.29, 0.11);
+    f.add_point_source(
+        Ez, source, gv.center(), std::complex<double>(0.8, -0.23));
+    for (int step = 0; step < 16; ++step) f.step();
+    const gpu::detail::curl_phase_replay_plan_snapshot warm =
+        gpu::detail::get_curl_phase_replay_plan_snapshot_for_testing(
+            &f, b_phase_key);
+    const gpu::structured_curl_graph_statistics warm_statistics =
+        gpu::get_structured_curl_graph_statistics();
+    const int warm_runtime_ordinal =
+        meep_cuda::current_device_ordinal_for_testing();
+    require(warm.exists && warm.complete_phase &&
+                warm.stable_reuses >= 2 && warm.structured_graph &&
+                warm.has_structured_graph &&
+                warm.device_ordinal == original_ordinal &&
+                warm_runtime_ordinal == original_ordinal &&
+                warm_statistics.live_plans > 0,
+            "structured-curl Graph device fixture did not warm a graph");
+
+    // Deterministically recreate the old-device/new-device hazard from a
+    // graph replacement: successful old-plan teardown deliberately leaves
+    // this host thread on another ordinal.  The replacement must restore its
+    // collection ordinal before both creation and launch.
+    gpu::reset_dispatch_statistics();
+    gpu::detail::set_structured_curl_graph_post_destroy_device_for_testing(
+        *migration_target);
+    {
+      scoped_environment_override disable_tile_coalescing(
+          "MEEP_GPU_DISABLE_TILE_COALESCING", "1");
+      run_single_curl_phase(f, B_stuff, true);
+    }
+    gpu::detail::set_structured_curl_graph_post_destroy_device_for_testing(-1);
+    const gpu::structured_curl_graph_statistics reselection =
+        gpu::get_structured_curl_graph_statistics();
+    const gpu::detail::curl_phase_replay_plan_snapshot rebuilt =
+        gpu::detail::get_curl_phase_replay_plan_snapshot_for_testing(
+            &f, b_phase_key);
+    const int rebuilt_runtime_ordinal =
+        meep_cuda::current_device_ordinal_for_testing();
+    // live_plans is a process-wide gauge, not a resettable interval counter.
+    // This fixture warms both B and D plans before replacing only B, so a
+    // successful one-for-one replacement must preserve the warm gauge rather
+    // than force it to one.
+    const bool replacement_reselected =
+        reselection.plan_rebuilds == 1 && reselection.plan_destroys == 1 &&
+        reselection.plan_destroy_failures == 0 &&
+        reselection.quarantined_plans == 0 &&
+        reselection.live_plans == warm_statistics.live_plans &&
+        rebuilt.exists &&
+        rebuilt.complete_phase && rebuilt.has_structured_graph &&
+        !rebuilt.quarantined && rebuilt.device_ordinal == original_ordinal &&
+        rebuilt_runtime_ordinal == original_ordinal;
+    if (!replacement_reselected) {
+      std::ostringstream diagnostic;
+      diagnostic
+          << "structured-curl Graph replacement did not reselect the new "
+             "plan's device after old-plan teardown"
+          << "; original=" << original_ordinal
+          << ", target=" << *migration_target
+          << ", warm_runtime=" << warm_runtime_ordinal
+          << ", warm_plan=" << warm.device_ordinal
+          << ", rebuilt_runtime=" << rebuilt_runtime_ordinal
+          << ", rebuilt_plan=" << rebuilt.device_ordinal
+          << ", rebuilds=" << reselection.plan_rebuilds
+          << ", destroys=" << reselection.plan_destroys
+          << ", destroy_failures=" << reselection.plan_destroy_failures
+          << ", quarantined=" << reselection.quarantined_plans
+          << ", warm_live=" << warm_statistics.live_plans
+          << ", live=" << reselection.live_plans
+          << ", exists=" << rebuilt.exists
+          << ", complete=" << rebuilt.complete_phase
+          << ", has_graph=" << rebuilt.has_structured_graph
+          << ", plan_quarantined=" << rebuilt.quarantined;
+      require(false, diagnostic.str());
+    }
+
+    const gpu::structured_curl_graph_statistics before_migration =
+        gpu::get_structured_curl_graph_statistics();
+    gpu::select_device(*migration_target);
+    const gpu::detail::curl_phase_replay_plan_snapshot migrated =
+        gpu::detail::get_curl_phase_replay_plan_snapshot_for_testing(
+            &f, b_phase_key);
+    const gpu::structured_curl_graph_statistics after_migration =
+        gpu::get_structured_curl_graph_statistics();
+    require(
+        !migrated.exists && after_migration.live_plans == 0 &&
+            after_migration.plan_destroys -
+                    before_migration.plan_destroys ==
+                before_migration.live_plans,
+        "structured-curl Graph device transition retained an executable "
+        "bound to the prior ordinal");
+    gpu::select_device(original_ordinal);
+  }
+#endif
+  const gpu::structured_curl_graph_statistics migration_destroyed =
+      gpu::get_structured_curl_graph_statistics();
+  require(migration_destroyed.live_plans == 0,
+          "structured-curl Graph device-transition fixture leaked a plan");
+
+  {
+    gpu::set_backend(gpu::backend_mode::cuda);
+    gpu::reset_dispatch_statistics();
+    const grid_volume gv = vol2d(1.8, 1.6, 10.0);
+    structure s(gv, vacuum, pml(0.3));
+    fields f(&s, 0.0, 0.0, true, 64, 64);
+    f.use_bloch(vec(0.0, 0.0));
+    gaussian_src_time source(0.29, 0.11);
+    f.add_point_source(
+        Ez, source, gv.center(), std::complex<double>(0.8, -0.23));
+    for (int step = 0; step < 16; ++step) f.step();
+    const gpu::detail::curl_phase_replay_plan_snapshot warm =
+        gpu::detail::get_curl_phase_replay_plan_snapshot_for_testing(
+            &f, b_phase_key);
+    require(warm.exists && warm.complete_phase &&
+                warm.stable_reuses >= 2 && warm.structured_graph &&
+                warm.has_structured_graph,
+            "structured-curl Graph failure fixture did not warm a graph");
+
+    gpu::reset_dispatch_statistics();
+    gpu::detail::set_curl_phase_replay_launch_failures_for_testing(1);
+    bool injected = false;
+    try {
+      run_single_curl_phase(f, B_stuff, true);
+    }
+    catch (const std::runtime_error &error) {
+      injected = std::string(error.what()) ==
+                 "injected CUDA curl phase replay launch failure";
+    }
+    gpu::detail::set_curl_phase_replay_launch_failures_for_testing(0);
+    const gpu::structured_curl_graph_statistics failed =
+        gpu::get_structured_curl_graph_statistics();
+    const gpu::dispatch_statistics failed_dispatch =
+        gpu::get_dispatch_statistics();
+    const gpu::detail::curl_phase_replay_plan_snapshot failed_plan =
+        gpu::detail::get_curl_phase_replay_plan_snapshot_for_testing(
+            &f, b_phase_key);
+    require(
+        injected && failed.replay_checks == 1 &&
+            failed.replay_launches == 0 && failed.replay_unready == 1 &&
+            failed.replay_generation_misses == 0 &&
+            failed.replay_mirror_misses == 0 &&
+            failed.launch_failures == 1 &&
+            failed_dispatch.cuda_curl_calls == 0 &&
+            failed_dispatch.cuda_curl_points == 0 &&
+            !failed_plan.complete_phase && failed_plan.stable_reuses == 0 &&
+            failed_plan.structured_graph && failed_plan.has_structured_graph,
+        "structured-curl Graph pre-submission failure was not fail-closed");
+    run_single_curl_phase(f, B_stuff, true);
+    const gpu::detail::curl_phase_replay_plan_snapshot failure_reuse_one =
+        gpu::detail::get_curl_phase_replay_plan_snapshot_for_testing(
+            &f, b_phase_key);
+    run_single_curl_phase(f, B_stuff, true);
+    const gpu::detail::curl_phase_replay_plan_snapshot failure_reuse_two =
+        gpu::detail::get_curl_phase_replay_plan_snapshot_for_testing(
+            &f, b_phase_key);
+    run_single_curl_phase(f, B_stuff, true);
+    const gpu::structured_curl_graph_statistics failure_recovered =
+        gpu::get_structured_curl_graph_statistics();
+    require(
+        failure_reuse_one.complete_phase &&
+            failure_reuse_one.stable_reuses == 1 &&
+            failure_reuse_two.complete_phase &&
+            failure_reuse_two.stable_reuses == 2 &&
+            failure_recovered.replay_checks == 4 &&
+            failure_recovered.replay_launches == 1 &&
+            failure_recovered.replay_unready == 3 &&
+            failure_recovered.replay_generation_misses == 0 &&
+            failure_recovered.replay_mirror_misses == 0 &&
+            failure_recovered.replay_checks ==
+                failure_recovered.replay_launches +
+                    failure_recovered.replay_unready +
+                    failure_recovered.replay_generation_misses +
+                    failure_recovered.replay_mirror_misses,
+        "structured-curl Graph failure did not recover after two stable "
+        "collections");
+  }
+  const gpu::structured_curl_graph_statistics failure_destroyed =
+      gpu::get_structured_curl_graph_statistics();
+  require(failure_destroyed.live_plans == 0,
+          "structured-curl Graph failure fixture leaked a plan");
+  if (am_master())
+    std::cout
+        << "PASS: structured-curl Graph mirror, generation, cache-reset, "
+           "creation, replay-failure, and teardown transactions\n";
+#endif
+}
+
+enum class structured_curl_graph_failure_mode {
+  api_return,
+  post_enqueue,
+  destroy_sync,
+  owner_destroy_sync,
+  async_device
+};
+
+void require_structured_curl_graph_quarantine_contract(
+    structured_curl_graph_failure_mode failure_mode) {
+#if MEEP_SINGLE && MEEP_HAVE_CUDA
+  require(count_processors() == 1,
+          "structured-curl Graph quarantine regression requires one MPI "
+          "rank");
+  scoped_environment_override graph_enable(
+      "MEEP_GPU_ENABLE_STRUCTURED_CURL_GRAPH", "1");
+  scoped_environment_override graph_disable(
+      "MEEP_GPU_DISABLE_STRUCTURED_CURL_GRAPH", nullptr);
+  scoped_environment_override curl_enable(
+      "MEEP_GPU_ENABLE_PHASE_BATCHED_CURL", nullptr);
+  scoped_environment_override curl_disable(
+      "MEEP_GPU_DISABLE_PHASE_BATCHED_CURL", nullptr);
+
+  gpu::set_backend(gpu::backend_mode::cuda);
+  gpu::reset_dispatch_statistics();
+  const grid_volume gv = vol2d(1.8, 1.6, 10.0);
+  structure s(gv, vacuum, pml(0.3));
+  fields f(&s, 0.0, 0.0, true, 64, 64);
+  f.use_bloch(vec(0.0, 0.0));
+  gaussian_src_time source(0.29, 0.11);
+  f.add_point_source(
+      Ez, source, gv.center(), std::complex<double>(0.8, -0.23));
+  for (int step = 0; step < 16; ++step) f.step();
+
+  constexpr int b_phase_key = static_cast<int>(B_stuff);
+  const gpu::detail::curl_phase_replay_plan_snapshot warm =
+      gpu::detail::get_curl_phase_replay_plan_snapshot_for_testing(
+          &f, b_phase_key);
+  const gpu::structured_curl_graph_statistics warm_statistics =
+      gpu::get_structured_curl_graph_statistics();
+  // A fields::step fixture owns both B and D phase Graphs. live_plans and
+  // quarantined_plans are process-wide state gauges and deliberately survive
+  // reset_dispatch_statistics(). A launch failure quarantines only the
+  // selected B plan; an owner/destroy traversal observes the sticky uncertain
+  // device state and retains every live plan owned by this fixture.
+  require(warm.exists && warm.complete_phase &&
+              warm.stable_reuses >= 2 && warm.structured_graph &&
+              warm.has_structured_graph && !warm.quarantined &&
+              warm.cache_dependencies > 0 && warm.writable_mirrors > 0 &&
+              warm_statistics.live_plans > 0 &&
+              warm_statistics.quarantined_plans == 0,
+          "structured-curl Graph quarantine fixture did not warm a complete "
+          "address-bearing graph");
+
+  std::vector<fields_chunk *> local_chunks;
+  struct host_field_snapshot {
+    const realnum *pointer;
+    std::vector<realnum> values;
+  };
+  std::vector<host_field_snapshot> magnetic_before;
+  for (int chunk_index = 0; chunk_index < f.num_chunks; ++chunk_index) {
+    fields_chunk *chunk = f.chunks[chunk_index];
+    if (!chunk->is_mine()) continue;
+    local_chunks.push_back(chunk);
+    gpu::detail::sync_resident_cache_for_owner(chunk);
+    const int complex_parts = 2 - chunk->is_real;
+    for (component c = Bx; c <= Bz; c = component(c + 1))
+      for (int complex_part = 0; complex_part < complex_parts;
+           ++complex_part)
+        if (chunk->f[c][complex_part])
+          magnetic_before.push_back(
+              {chunk->f[c][complex_part],
+               std::vector<realnum>(
+                   chunk->f[c][complex_part],
+                   chunk->f[c][complex_part] + chunk->gv.ntot())});
+  }
+  require(!local_chunks.empty() && !magnetic_before.empty(),
+          "structured-curl Graph quarantine fixture found no resident "
+          "writable fields");
+
+  gpu::reset_dispatch_statistics();
+  if (failure_mode ==
+      structured_curl_graph_failure_mode::owner_destroy_sync) {
+    const std::uint64_t buffers_before =
+        gpu::get_live_resident_device_buffers();
+    const gpu::detail::resident_cache_registry_snapshot_for_testing
+        caches_before =
+            gpu::detail::get_resident_cache_registry_snapshot_for_testing();
+    fields_chunk *const detached_cache_owner = local_chunks.front();
+
+    meep_cuda::set_structured_curl_graph_destroy_sync_failures_for_testing(1);
+    gpu::detail::destroy_resident_cache_for_owner(detached_cache_owner);
+    meep_cuda::set_structured_curl_graph_destroy_sync_failures_for_testing(0);
+
+    const gpu::structured_curl_graph_statistics failed =
+        gpu::get_structured_curl_graph_statistics();
+    const gpu::detail::curl_phase_replay_plan_snapshot retained =
+        gpu::detail::get_curl_phase_replay_plan_snapshot_for_testing(
+            &f, b_phase_key);
+    const std::uint64_t buffers_after =
+        gpu::get_live_resident_device_buffers();
+    const gpu::detail::resident_cache_registry_snapshot_for_testing
+        caches_after =
+            gpu::detail::get_resident_cache_registry_snapshot_for_testing();
+    require(
+        !gpu::detail::get_resident_cache_snapshot_for_testing(
+             detached_cache_owner)
+             .exists &&
+            retained.exists && retained.has_structured_graph &&
+            retained.quarantined && !retained.complete_phase &&
+            retained.stable_reuses == 0 &&
+            retained.cache_dependencies ==
+                retained.quarantined_dependencies &&
+            retained.cache_dependencies > 0 &&
+            failed.plan_destroy_failures == 1 &&
+            failed.plan_destroys == 0 &&
+            failed.live_plans == warm_statistics.live_plans &&
+            failed.quarantined_plans ==
+                warm_statistics.quarantined_plans +
+                    warm_statistics.live_plans &&
+            caches_before.active_quarantined_caches == 0 &&
+            caches_before.detached_quarantined_caches == 0 &&
+            caches_after.active_caches + 1 == caches_before.active_caches &&
+            caches_after.detached_quarantined_caches == 1 &&
+            caches_after.active_quarantined_caches +
+                    caches_after.detached_quarantined_caches ==
+                retained.quarantined_dependencies &&
+            buffers_after == buffers_before,
+        "direct resident-cache teardown did not retain the cache, graph, "
+        "metadata, and device allocations after a failed graph fence");
+
+    // The detached owner is no longer in the active registry. A repeated
+    // destructor call must not rediscover the process-long quarantine, retry
+    // graph destruction, or adjust live allocation accounting.
+    gpu::detail::destroy_resident_cache_for_owner(detached_cache_owner);
+    const gpu::structured_curl_graph_statistics repeated =
+        gpu::get_structured_curl_graph_statistics();
+    const gpu::detail::resident_cache_registry_snapshot_for_testing
+        caches_repeated =
+            gpu::detail::get_resident_cache_registry_snapshot_for_testing();
+    require(
+        repeated.plan_destroy_failures == 1 &&
+            repeated.plan_destroys == 0 &&
+            repeated.live_plans == warm_statistics.live_plans &&
+            repeated.quarantined_plans ==
+                warm_statistics.quarantined_plans +
+                    warm_statistics.live_plans &&
+            caches_repeated.active_caches == caches_after.active_caches &&
+            caches_repeated.active_quarantined_caches ==
+                caches_after.active_quarantined_caches &&
+            caches_repeated.detached_quarantined_caches ==
+                caches_after.detached_quarantined_caches &&
+            gpu::get_live_resident_device_buffers() == buffers_after,
+        "repeated resident-cache teardown retried or freed a quarantined "
+        "graph dependency");
+    if (am_master())
+      std::cout
+          << "PASS: direct resident-cache graph destroy failure retains the "
+             "complete cache and graph process-long\n";
+    return;
+  }
+  if (failure_mode == structured_curl_graph_failure_mode::destroy_sync ||
+      failure_mode == structured_curl_graph_failure_mode::async_device) {
+    const bool real_async_device_failure =
+        failure_mode == structured_curl_graph_failure_mode::async_device;
+    if (real_async_device_failure)
+      meep_cuda::set_structured_curl_graph_async_device_failures_for_testing(1);
+    else
+      meep_cuda::set_structured_curl_graph_destroy_sync_failures_for_testing(1);
+    gpu::detail::destroy_resident_curl_phase_batches_for_owner(&f);
+    meep_cuda::set_structured_curl_graph_destroy_sync_failures_for_testing(0);
+    meep_cuda::set_structured_curl_graph_async_device_failures_for_testing(0);
+
+    const gpu::structured_curl_graph_statistics failed =
+        gpu::get_structured_curl_graph_statistics();
+    const std::uint64_t cuda_sync_failures =
+        meep_cuda::
+            structured_curl_graph_destroy_cuda_sync_failures_for_testing();
+    const gpu::detail::curl_phase_replay_plan_snapshot retained =
+        gpu::detail::get_curl_phase_replay_plan_snapshot_for_testing(
+            &f, b_phase_key);
+    require(
+        retained.exists && retained.has_structured_graph &&
+            retained.quarantined && !retained.complete_phase &&
+            retained.stable_reuses == 0 &&
+            retained.cache_dependencies ==
+                retained.quarantined_dependencies &&
+            retained.cache_dependencies > 0 &&
+            failed.plan_destroy_failures == 1 &&
+            failed.plan_destroys == 0 &&
+            failed.live_plans == warm_statistics.live_plans &&
+            failed.quarantined_plans ==
+                warm_statistics.quarantined_plans +
+                    warm_statistics.live_plans &&
+            cuda_sync_failures == (real_async_device_failure ? 1u : 0u),
+        "structured-curl Graph failed destroy did not retain the complete "
+        "plan and every captured allocation at the expected fence boundary");
+
+    // A second teardown request must neither retry destruction nor adjust
+    // live accounting after the process-long quarantine decision.
+    gpu::detail::destroy_resident_curl_phase_batches_for_owner(&f);
+    const gpu::structured_curl_graph_statistics repeated =
+        gpu::get_structured_curl_graph_statistics();
+    require(repeated.plan_destroy_failures == 1 &&
+                repeated.plan_destroys == 0 &&
+                repeated.live_plans == warm_statistics.live_plans &&
+                repeated.quarantined_plans ==
+                    warm_statistics.quarantined_plans +
+                        warm_statistics.live_plans,
+            "structured-curl Graph quarantine retried destruction or hid a "
+            "live executable");
+  }
+  else {
+    if (failure_mode == structured_curl_graph_failure_mode::api_return)
+      meep_cuda::set_structured_curl_graph_launch_api_failures_for_testing(1);
+    else
+      meep_cuda::set_structured_curl_graph_post_enqueue_failures_for_testing(
+          1);
+
+    bool injected = false;
+    try {
+      run_single_curl_phase(f, B_stuff, true);
+    }
+    catch (const std::runtime_error &error) {
+      const std::string diagnostic(error.what());
+      injected =
+          failure_mode == structured_curl_graph_failure_mode::api_return
+              ? diagnostic.find(
+                    "injected cudaGraphLaunch structured curl graph API "
+                    "return") != std::string::npos
+              : diagnostic ==
+                    "injected structured curl graph synthetic post-enqueue "
+                    "uncertainty";
+    }
+    meep_cuda::set_structured_curl_graph_launch_api_failures_for_testing(0);
+    meep_cuda::set_structured_curl_graph_post_enqueue_failures_for_testing(0);
+
+    bool host_unchanged = true;
+    for (const host_field_snapshot &snapshot : magnetic_before)
+      host_unchanged =
+          host_unchanged &&
+          std::memcmp(snapshot.pointer, snapshot.values.data(),
+                      snapshot.values.size() * sizeof(realnum)) == 0;
+    const gpu::structured_curl_graph_statistics failed =
+        gpu::get_structured_curl_graph_statistics();
+    const gpu::dispatch_statistics dispatch =
+        gpu::get_dispatch_statistics();
+    const gpu::detail::curl_phase_replay_plan_snapshot retained =
+        gpu::detail::get_curl_phase_replay_plan_snapshot_for_testing(
+            &f, b_phase_key);
+    require(
+        injected && host_unchanged && retained.exists &&
+            retained.has_structured_graph && retained.quarantined &&
+            !retained.complete_phase && retained.stable_reuses == 0 &&
+            retained.writable_mirrors > 0 &&
+            retained.cache_dependencies ==
+                retained.quarantined_dependencies &&
+            retained.cache_dependencies > 0 && failed.replay_checks == 1 &&
+            failed.replay_launches == 1 && failed.launch_failures == 1 &&
+            failed.quarantined_plans ==
+                warm_statistics.quarantined_plans + 1 &&
+            failed.live_plans == warm_statistics.live_plans &&
+            failed.plan_destroys == 0 &&
+            failed.plan_destroy_failures == 0 &&
+            dispatch.cuda_curl_calls == 0 &&
+            dispatch.cuda_curl_points == 0 &&
+            dispatch.cpu_curl_calls == 0 &&
+            dispatch.cpu_curl_points == 0,
+        "structured-curl Graph uncertain launch failure retried work, "
+        "published writable mirrors, or lost captured lifetimes");
+  }
+
+  bool quarantined_cache_rejected = false;
+  for (fields_chunk *chunk : local_chunks) {
+    const auto snapshot =
+        gpu::detail::get_sparse_lorentzian_generation_snapshot_for_testing(
+            chunk);
+    if (!snapshot.exists || !snapshot.device_storage_quarantined) continue;
+    try {
+      gpu::detail::sync_resident_cache_for_owner(chunk);
+    }
+    catch (const std::runtime_error &) {
+      quarantined_cache_rejected = true;
+    }
+    break;
+  }
+  require(quarantined_cache_rejected,
+          "structured-curl Graph quarantine left a captured cache usable");
+  if (am_master())
+    std::cout
+        << "PASS: structured-curl Graph API/synthetic-post-enqueue/"
+           "destroy-fence failure "
+           "retains graph, metadata, and captured allocations fail-closed\n";
+#else
+  (void)failure_mode;
 #endif
 }
 
@@ -5305,6 +8182,10 @@ void require_cuda_tile_coalescing_equivalence() {
   {
     scoped_environment_override control(
         "MEEP_GPU_DISABLE_TILE_COALESCING", nullptr);
+    scoped_environment_override curl_enable(
+        "MEEP_GPU_ENABLE_PHASE_BATCHED_CURL", "1");
+    scoped_environment_override curl_disable(
+        "MEEP_GPU_DISABLE_PHASE_BATCHED_CURL", nullptr);
     // Reset after the replay plan is warm so the measured interval contains
     // only steady-state execution. Replay must preserve the same public
     // tile-coalescing telemetry as the ordinary descriptor walk.
@@ -10712,8 +13593,18 @@ void require_resident_scalar_query(bool complex_fields) {
       cuda_chunk->get_field(Ez, chosen_location);
   const gpu::dispatch_statistics after =
       gpu::get_dispatch_statistics();
+  const gpu::resident_point_read_statistics point_after =
+      gpu::get_resident_point_read_statistics();
   const std::uint64_t expected_scalar_bytes =
       complex_fields ? 2 * sizeof(float) : sizeof(float);
+  require(point_after.cuda_read_attempts == 1 &&
+              point_after.cuda_read_completions == 1 &&
+              point_after.cuda_read_failures == 0 &&
+              point_after.scalars_copied == (complex_fields ? 2u : 1u) &&
+              point_after.device_to_host_calls == (complex_fields ? 2u : 1u) &&
+              point_after.device_to_host_bytes == expected_scalar_bytes &&
+              point_after.host_nanoseconds > 0,
+          "resident scalar read diagnostics did not record the actual copies");
   require(after.device_to_host_bytes - before.device_to_host_bytes ==
               expected_scalar_bytes,
           "resident field query copied more than its requested scalar(s)");
@@ -10754,6 +13645,16 @@ void require_resident_scalar_query(bool complex_fields) {
               before_rejected_bounds.device_to_host_bytes,
           "resident scalar bounds rejection accounted a partial transfer");
 
+  const auto point_rejected = gpu::get_resident_point_read_statistics();
+  require(point_rejected.cuda_read_attempts == 2 &&
+              point_rejected.cuda_read_completions == 1 &&
+              point_rejected.cuda_read_failures == 1 &&
+              point_rejected.scalars_copied == point_after.scalars_copied &&
+              point_rejected.device_to_host_calls == point_after.device_to_host_calls &&
+              point_rejected.device_to_host_bytes == point_after.device_to_host_bytes &&
+              point_rejected.host_nanoseconds >= point_after.host_nanoseconds,
+          "rejected scalar read diagnostics counted a nonexistent transfer");
+
   gpu::detail::sync_resident_cache_for_owner(cuda_chunk);
   const gpu::dispatch_statistics synchronized =
       gpu::get_dispatch_statistics();
@@ -10779,6 +13680,10 @@ void require_resident_scalar_query(bool complex_fields) {
               rejected_real == 123.0f &&
               rejected_imaginary == 456.0f,
           "clean resident mirror did not use the existing host-read path");
+  const auto point_clean = gpu::get_resident_point_read_statistics();
+  require(point_clean.cuda_read_attempts == point_rejected.cuda_read_attempts &&
+              point_clean.host_nanoseconds == point_rejected.host_nanoseconds,
+          "clean scalar lookup entered CUDA readback diagnostics");
   if (complex_fields) {
     // Dirty only the imaginary mirror so the direct read must combine a
     // device scalar with an untouched clean host scalar.  Keep the failed
@@ -10818,6 +13723,14 @@ void require_resident_scalar_query(bool complex_fields) {
             chosen_field_index, &mixed_real, &mixed_imaginary);
     const gpu::dispatch_statistics after_mixed =
         gpu::get_dispatch_statistics();
+    const auto point_mixed = gpu::get_resident_point_read_statistics();
+    require(point_mixed.cuda_read_attempts == 4 &&
+                point_mixed.cuda_read_completions == 2 &&
+                point_mixed.cuda_read_failures == 2 &&
+                point_mixed.scalars_copied == point_after.scalars_copied + 1 &&
+                point_mixed.device_to_host_calls == point_after.device_to_host_calls + 1 &&
+                point_mixed.device_to_host_bytes == expected_scalar_bytes + sizeof(float),
+            "mixed-dirty scalar diagnostics changed the readback accounting");
     require(mixed_components == 2u && mixed_real == 789.0f &&
                 mixed_imaginary == 0.0f,
             "resident scalar mixed clean/dirty result was incorrect");
@@ -10836,6 +13749,13 @@ void require_resident_scalar_query(bool complex_fields) {
               << (complex_fields ? "complex" : "real")
               << " scalar_d2h_bytes=" << expected_scalar_bytes
               << " full_sync_d2h_bytes=" << full_sync_bytes << '\n';
+  gpu::reset_dispatch_statistics();
+  const auto point_reset = gpu::get_resident_point_read_statistics();
+  require(point_reset.cuda_read_attempts == 0 && point_reset.cuda_read_completions == 0 &&
+              point_reset.cuda_read_failures == 0 && point_reset.scalars_copied == 0 &&
+              point_reset.device_to_host_calls == 0 && point_reset.device_to_host_bytes == 0 &&
+              point_reset.host_nanoseconds == 0,
+          "dispatch reset did not clear point readback diagnostics");
 #else
   (void)complex_fields;
 #endif
@@ -11651,8 +14571,111 @@ void require_finite_check_plan_lifecycle() {
 #endif
 }
 
+void require_prepared_span_cache_lifecycle() {
+#if MEEP_SINGLE
+  scoped_environment_override enable_cache(
+      "MEEP_GPU_DISABLE_BOUNDARY_SPAN_CACHE", nullptr);
+  gpu::set_backend(gpu::backend_mode::cuda);
+  const std::uint64_t live_before = gpu::get_live_resident_device_buffers();
+  int owner = 0;
+  std::vector<float> field(512, 0.25f), unrelated(16, 0.5f);
+  const auto require_cold_then_hit = [&](gpu::detail::resident_cache *cache, float *point) {
+    gpu::reset_dispatch_statistics();
+    gpu::detail::resident_ensure_span_fp32(cache, point, 1);
+    gpu::detail::resident_ensure_span_fp32(cache, point, 1);
+    const auto counters = gpu::get_boundary_execution_statistics();
+    require(counters.span_cache_misses == 1 && counters.span_cache_hits == 1 &&
+                counters.span_cache_bypasses == 0,
+            "prepared span cache failed cold/hit or retained a stale range");
+  };
+  {
+    gpu::detail::resident_curl_session resident(&owner, true);
+    gpu::detail::resident_ensure_mirror_fp32(resident.cache(), field.data(), field.size());
+    gpu::detail::resident_ensure_mirror_fp32(resident.cache(), unrelated.data(), unrelated.size());
+    require_cold_then_hit(resident.cache(), field.data() + 5);
+    bool rejected_extent = false;
+    try {
+      gpu::detail::resident_ensure_span_fp32(resident.cache(), field.data() + 5, field.size());
+    }
+    catch (const std::invalid_argument &) { rejected_extent = true; }
+    require(rejected_extent, "cached span accepted a different partially overlapping extent");
+    gpu::detail::resident_ensure_mirror_fp32(resident.cache(), field.data() + 5, 1);
+    bool rejected_overlap = false;
+    try { gpu::detail::resident_ensure_span_fp32(resident.cache(), field.data() + 5, 1); }
+    catch (const std::invalid_argument &) { rejected_overlap = true; }
+    require(rejected_overlap, "cached span survived an overlapping mirror insertion");
+    require_cold_then_hit(resident.cache(), unrelated.data() + 1);
+    resident.finish(false);
+  }
+  // Removal alone must invalidate a warm, surviving range. No insertion can
+  // hide a missing removal hook, even though allocation generation is kept.
+  gpu::detail::discard_resident_source_profile_for_owner(&owner, nullptr, field.data() + 5);
+  {
+    gpu::detail::resident_curl_session resident(&owner, true);
+    require_cold_then_hit(resident.cache(), unrelated.data() + 1);
+    require_cold_then_hit(resident.cache(), field.data() + 5);
+    resident.finish(false);
+  }
+  gpu::detail::discard_resident_source_profile_for_owner(&owner, nullptr, field.data());
+  {
+    gpu::detail::resident_curl_session resident(&owner, true);
+    require_cold_then_hit(resident.cache(), unrelated.data() + 1);
+    gpu::detail::resident_ensure_mirror_fp32(resident.cache(), field.data(), 256);
+    require_cold_then_hit(resident.cache(), field.data() + 5);
+    gpu::detail::resident_ensure_mirror_fp32(resident.cache(), field.data(), field.size());
+    require_cold_then_hit(resident.cache(), field.data() + 5);
+    for (std::size_t index = 0; index < 256; ++index)
+      gpu::detail::resident_ensure_span_fp32(resident.cache(), field.data() + index, 1);
+    // The oldest range was evicted; its next use must miss then hit.
+    require_cold_then_hit(resident.cache(), field.data());
+    {
+      scoped_environment_override disable_cache("MEEP_GPU_DISABLE_BOUNDARY_SPAN_CACHE", "1");
+      gpu::reset_dispatch_statistics();
+      gpu::detail::resident_ensure_span_fp32(resident.cache(), field.data(), 1);
+      const auto counters = gpu::get_boundary_execution_statistics();
+      require(counters.span_cache_bypasses == 1 && counters.span_cache_hits == 0 &&
+                  counters.span_cache_misses == 0,
+              "disabled span cache reused or populated the lookup cache");
+    }
+    resident.finish(false);
+  }
+  gpu::detail::reset_resident_cache_for_owner_reusing_allocations(&owner);
+  {
+    gpu::detail::resident_curl_session resident(&owner, true);
+    gpu::reset_dispatch_statistics();
+    // Query the warm old address BEFORE any ensure_mirror. Missing resolutions
+    // are not cached: one miss creates a mirror, the second caches its range.
+    gpu::detail::resident_ensure_span_fp32(resident.cache(), field.data(), 1);
+    require(gpu::get_boundary_execution_statistics().span_cache_misses == 1 &&
+                gpu::get_boundary_execution_statistics().span_cache_hits == 0 &&
+                gpu::get_dispatch_statistics().host_to_device_bytes == sizeof(float),
+            "reset reused a stale span before mirror recreation");
+    gpu::detail::resident_ensure_span_fp32(resident.cache(), field.data(), 1);
+    gpu::detail::resident_ensure_span_fp32(resident.cache(), field.data(), 1);
+    require(gpu::get_boundary_execution_statistics().span_cache_misses == 2 &&
+                gpu::get_boundary_execution_statistics().span_cache_hits == 1,
+            "reset span recreation did not establish a fresh validated range");
+    gpu::detail::resident_ensure_mirror_fp32(resident.cache(), unrelated.data(), unrelated.size());
+    require_cold_then_hit(resident.cache(), field.data());
+    resident.finish(false);
+  }
+  gpu::detail::discard_resident_mirror_for_owner(&owner, unrelated.data());
+  {
+    gpu::detail::resident_curl_session resident(&owner, true);
+    require_cold_then_hit(resident.cache(), field.data());
+    resident.finish(false);
+  }
+  gpu::detail::destroy_resident_cache_for_owner(&owner);
+  require(gpu::get_live_resident_device_buffers() == live_before,
+          "prepared span cache lifecycle leaked a resident allocation");
+  std::cout << "PASS: prepared span cache lifecycle\n";
+#endif
+}
+
 void require_resident_host_write_transaction() {
 #if MEEP_SINGLE
+  scoped_environment_override enable_cache(
+      "MEEP_GPU_DISABLE_BOUNDARY_SPAN_CACHE", nullptr);
   gpu::set_backend(gpu::backend_mode::cuda);
   const std::uint64_t live_before =
       gpu::get_live_resident_device_buffers();
@@ -11697,7 +14720,8 @@ void require_resident_host_write_transaction() {
       "active host-write rejection invalidated a resident mirror");
 
   // A clean but resident field can be invalidated by an interior pointer.
-  // Its first later subspan use must refresh the complete owning allocation
+  // Its first later subspan use is a validated-range cache hit, but must still
+  // refresh the complete owning allocation
   // once, preserve the allocation, and make the host write visible to a
   // device consumer.
   const void *host_writes[] = {field.data() + 5, field.data()};
@@ -11714,6 +14738,8 @@ void require_resident_host_write_transaction() {
         resident.cache(), field.data() + 5, 1);
     const gpu::dispatch_statistics after_first_span =
         gpu::get_dispatch_statistics();
+    require(gpu::get_boundary_execution_statistics().span_cache_hits == 1,
+            "host-write freshness regression did not exercise a span cache hit");
     const gpu::resident_statistics resident_after_first_span =
         gpu::get_resident_statistics();
     require(
@@ -18323,46 +21349,6 @@ void require_unsupported_polarization_is_atomic() {
           "failed polarization preflight partially dispatched a curl");
 }
 
-run_result run_automatic_polarization_fallback_case(
-    gpu::backend_mode mode) {
-  gpu::set_backend(mode);
-  gpu::reset_dispatch_statistics();
-
-  const grid_volume gv = vol2d(1.8, 1.6, 10.0);
-  structure s(gv, vacuum, no_pml());
-  // add_susceptibility prepends states. Add the unsupported, deterministic
-  // noisy subclass first so the standard Lorentzian performs CUDA work
-  // before automatic mode must publish resident state for the CPU fallback.
-  s.add_susceptibility(
-      vacuum, E_stuff,
-      noisy_lorentzian_susceptibility(0.0, 0.39, 0.06));
-  s.add_susceptibility(
-      vacuum, E_stuff,
-      lorentzian_susceptibility(0.31, 0.05));
-  fields f(&s, 0.0, 0.0, true, 64, 64);
-  f.use_real_fields();
-  gaussian_src_time source(0.29, 0.11);
-  f.add_point_source(Ez, source, gv.center(), 0.8);
-  for (int step = 0; step < 18; ++step)
-    f.step();
-
-  run_result result;
-  const vec points[] = {
-      gv.center(), vec(0.43, 0.57), vec(1.31, 1.07)};
-  for (const vec &point : points)
-    result.samples.push_back(f.get_field(Ez, point));
-  result.samples.push_back(
-      std::complex<double>(f.field_energy(), 0.0));
-  result.statistics = gpu::get_dispatch_statistics();
-  result.resident = gpu::get_resident_statistics();
-  result.field_updates = gpu::get_field_update_statistics();
-  result.polarizations = gpu::get_polarization_statistics();
-  result.sources = gpu::get_source_statistics();
-  result.boundaries = gpu::get_boundary_statistics();
-  aggregate_statistics(result);
-  return result;
-}
-
 void require_automatic_policy_boundaries() {
   constexpr std::uint64_t reference_free_memory =
       20ULL * 1024ULL * 1024ULL * 1024ULL;
@@ -18525,6 +21511,40 @@ void require_automatic_phase_batch_policy_boundaries() {
           operations, boundary_blocks, per_operation_limit + 1u,
           multiprocessors),
       "automatic phase-batch policy accepted a pathologically skewed phase");
+  constexpr std::size_t curl_boundary_blocks =
+      static_cast<std::size_t>(multiprocessors) * 24u;
+  require(
+      gpu::detail::automatic_curl_phase_batch_selected(
+          operations, curl_boundary_blocks,
+          curl_boundary_blocks / operations, multiprocessors) &&
+          !gpu::detail::automatic_curl_phase_batch_selected(
+              operations, curl_boundary_blocks + 1u,
+              curl_boundary_blocks / operations, multiprocessors) &&
+          !gpu::detail::automatic_curl_phase_batch_selected(
+              operations, curl_boundary_blocks,
+              static_cast<std::size_t>(multiprocessors) * 12u + 1u,
+              multiprocessors),
+      "automatic curl phase-wide block/SM boundary is not exact");
+  require(
+      gpu::detail::automatic_curl_phase_batch_selected(
+          8u, 687u, 139u, multiprocessors) &&
+          !gpu::detail::automatic_curl_phase_batch_selected(
+              8u, 8192u, 2048u, multiprocessors),
+      "automatic curl policy did not distinguish launch-bound production "
+      "topology from a large stress-grid phase");
+  require(
+      !gpu::detail::automatic_curl_phase_batch_selected(
+          operations - 1u, 1u, 1u, multiprocessors) &&
+          !gpu::detail::automatic_curl_phase_batch_selected(
+              operations, 0u, 1u, multiprocessors) &&
+          !gpu::detail::automatic_curl_phase_batch_selected(
+              operations, 1u, 0u, multiprocessors) &&
+          !gpu::detail::automatic_curl_phase_batch_selected(
+              operations, 1u, 2u, multiprocessors) &&
+          !gpu::detail::automatic_curl_phase_batch_selected(
+              operations, 1u, 1u, 0),
+      "automatic curl phase-batch policy accepted an underfilled or "
+      "inconsistent topology");
   require(
       !gpu::detail::automatic_dft_multi_monitor_batch_selected(0) &&
           !gpu::detail::automatic_dft_multi_monitor_batch_selected(3) &&
@@ -18548,7 +21568,8 @@ void require_automatic_phase_batch_policy_boundaries() {
                 gpu::detail::phase_batch_mode::automatic &&
             gpu::detail::phase_batched_update_eh_mode() ==
                 gpu::detail::phase_batch_mode::automatic,
-        "unset phase-batch controls did not select automatic mode");
+        "unset phase-batch controls did not select the distinct automatic "
+        "curl and E/H policies");
   }
   {
     scoped_environment_override curl_enable(
@@ -18579,6 +21600,58 @@ void require_automatic_phase_batch_policy_boundaries() {
         gpu::detail::phase_batched_curl_mode() ==
             gpu::detail::phase_batch_mode::disabled,
         "phase-batch disable control did not override forced mode");
+  }
+  {
+    scoped_environment_override graph_enable(
+        "MEEP_GPU_ENABLE_STRUCTURED_CURL_GRAPH", nullptr);
+    scoped_environment_override graph_disable(
+        "MEEP_GPU_DISABLE_STRUCTURED_CURL_GRAPH", nullptr);
+    scoped_environment_override curl_enable(
+        "MEEP_GPU_ENABLE_PHASE_BATCHED_CURL", nullptr);
+    scoped_environment_override curl_disable(
+        "MEEP_GPU_DISABLE_PHASE_BATCHED_CURL", nullptr);
+    require(!gpu::detail::structured_curl_graph_opted_in(),
+            "unset structured-curl Graph control was not fail-closed");
+  }
+  {
+    scoped_environment_override graph_enable(
+        "MEEP_GPU_ENABLE_STRUCTURED_CURL_GRAPH", "1");
+    scoped_environment_override graph_disable(
+        "MEEP_GPU_DISABLE_STRUCTURED_CURL_GRAPH", nullptr);
+    scoped_environment_override curl_enable(
+        "MEEP_GPU_ENABLE_PHASE_BATCHED_CURL", nullptr);
+    scoped_environment_override curl_disable(
+        "MEEP_GPU_DISABLE_PHASE_BATCHED_CURL", nullptr);
+    require(gpu::detail::structured_curl_graph_opted_in(),
+            "exact structured-curl Graph opt-in was not accepted");
+  }
+  {
+    scoped_environment_override graph_enable(
+        "MEEP_GPU_ENABLE_STRUCTURED_CURL_GRAPH", "true");
+    scoped_environment_override graph_disable(
+        "MEEP_GPU_DISABLE_STRUCTURED_CURL_GRAPH", nullptr);
+    require(!gpu::detail::structured_curl_graph_opted_in(),
+            "non-exact structured-curl Graph opt-in was accepted");
+  }
+  {
+    scoped_environment_override graph_enable(
+        "MEEP_GPU_ENABLE_STRUCTURED_CURL_GRAPH", "1");
+    scoped_environment_override graph_disable(
+        "MEEP_GPU_DISABLE_STRUCTURED_CURL_GRAPH", "0");
+    require(!gpu::detail::structured_curl_graph_opted_in(),
+            "structured-curl Graph disable presence did not win");
+  }
+  {
+    scoped_environment_override graph_enable(
+        "MEEP_GPU_ENABLE_STRUCTURED_CURL_GRAPH", "1");
+    scoped_environment_override graph_disable(
+        "MEEP_GPU_DISABLE_STRUCTURED_CURL_GRAPH", nullptr);
+    scoped_environment_override curl_enable(
+        "MEEP_GPU_ENABLE_PHASE_BATCHED_CURL", "1");
+    scoped_environment_override curl_disable(
+        "MEEP_GPU_DISABLE_PHASE_BATCHED_CURL", nullptr);
+    require(!gpu::detail::structured_curl_graph_opted_in(),
+            "forced legacy curl kernel did not take Graph precedence");
   }
   {
     scoped_environment_override dft_enable(
@@ -18622,204 +21695,12 @@ void require_automatic_phase_batch_policy_boundaries() {
   }
 }
 
-void require_automatic_polarization_owner_fallback_is_atomic() {
-  const run_result cpu = run_automatic_polarization_fallback_case(
-      gpu::backend_mode::cpu);
-  const char *saved_auto_minimum =
-      std::getenv("MEEP_GPU_AUTO_MIN_CELLS");
-  const bool had_saved_auto_minimum = saved_auto_minimum != nullptr;
-  const std::string saved_auto_minimum_value =
-      saved_auto_minimum ? saved_auto_minimum : "";
-  // This regression exercises mixed phase fallback semantics, not the
-  // automatic size policy, so make its intentionally tiny domain a CUDA
-  // candidate. Whole-owner feature preflight must still select CPU before
-  // any CUDA phase because the noisy susceptibility is unsupported.
-  setenv("MEEP_GPU_AUTO_MIN_CELLS", "0", 1);
-  const run_result automatic =
-      run_automatic_polarization_fallback_case(
-          gpu::backend_mode::automatic);
-  if (had_saved_auto_minimum)
-    setenv(
-        "MEEP_GPU_AUTO_MIN_CELLS",
-        saved_auto_minimum_value.c_str(), 1);
-  else
-    unsetenv("MEEP_GPU_AUTO_MIN_CELLS");
-  compare_results(cpu, automatic, two_dimensional_case);
-  require(gpu::active_backend() == gpu::backend_mode::cpu,
-          "unsupported automatic owner did not select CPU");
-  require(automatic.statistics.cpu_curl_calls > 0 &&
-              automatic.statistics.cuda_curl_calls == 0 &&
-              automatic.field_updates.cpu_update_eh_calls > 0 &&
-              automatic.field_updates.cuda_update_eh_calls == 0 &&
-              automatic.polarizations.cpu_update_calls > 0 &&
-              automatic.polarizations.cuda_update_calls == 0 &&
-              automatic.sources.cuda_update_calls == 0 &&
-              automatic.boundaries.cuda_update_calls == 0 &&
-              automatic.statistics.host_to_device_bytes == 0 &&
-              automatic.statistics.device_to_host_bytes == 0 &&
-              automatic.resident.device_buffer_allocations == 0,
-          "automatic unsupported-feature preflight was not an atomic "
-          "whole-owner CPU decision");
-}
-
-void require_automatic_owner_revalidates_environment() {
-  require(count_processors() == 1,
-          "automatic environment revalidation is singleton-only");
-  scoped_environment_override initial_minimum(
-      "MEEP_GPU_AUTO_MIN_CELLS", "999999999");
-  gpu::set_backend(gpu::backend_mode::automatic);
-  gpu::reset_dispatch_statistics();
-
-  const grid_volume gv = vol2d(1.8, 1.6, 10.0);
-  structure s(gv, vacuum, no_pml());
-  fields f(&s, 0.0, 0.0, true, 64, 64);
-  f.use_real_fields();
-  gaussian_src_time source(0.29, 0.11);
-  f.add_point_source(Ez, source, gv.center(), 0.8);
-  f.step();
-  require(!f.gpu_cuda_execution_selected() &&
-              gpu::active_backend() == gpu::backend_mode::cpu,
-          "large automatic threshold did not cache a CPU owner");
-  const double time_before_invalid_configuration = f.time();
-
-  bool invalid_configuration_rejected = false;
-  {
-    scoped_environment_override invalid_oversubscription(
-        "MEEP_GPU_ALLOW_OVERSUBSCRIBE", "invalid-after-cache");
-    require(
-        std::string(f.gpu_execution_diagnostic()).find("invalidated") !=
-            std::string::npos,
-        "owner query did not invalidate a cached CPU decision after an "
-        "environment change");
-    try {
-      f.step();
-    }
-    catch (const std::runtime_error &error) {
-      invalid_configuration_rejected =
-          std::string(error.what()).find(
-              "MEEP_GPU_ALLOW_OVERSUBSCRIBE") != std::string::npos;
-    }
-  }
-  require(invalid_configuration_rejected,
-          "cached automatic CPU owner hid a malformed oversubscription "
-          "configuration");
-  require(f.time() == time_before_invalid_configuration,
-          "rejected dynamic automatic configuration advanced time");
-
-  bool invalid_device_rejected = false;
-  {
-    scoped_environment_override invalid_device(
-        "MEEP_GPU_DEVICE", "invalid-after-cache");
-    try {
-      f.step();
-    }
-    catch (const std::runtime_error &error) {
-      invalid_device_rejected =
-          std::string(error.what()).find("MEEP_GPU_DEVICE") !=
-          std::string::npos;
-    }
-  }
-  require(invalid_device_rejected,
-          "cached automatic CPU owner hid a malformed explicit device");
-  require(f.time() == time_before_invalid_configuration,
-          "rejected dynamic device configuration advanced time");
-
-  gpu::reset_dispatch_statistics();
-  {
-    scoped_environment_override force_candidate(
-        "MEEP_GPU_AUTO_MIN_CELLS", "0");
-    f.step();
-    const gpu::dispatch_statistics dispatch =
-        gpu::get_dispatch_statistics();
-    require(f.gpu_cuda_execution_selected() &&
-                gpu::active_backend() == gpu::backend_mode::cuda &&
-                dispatch.cuda_curl_calls > 0 &&
-                dispatch.cpu_curl_calls == 0,
-            "changed automatic minimum reused the stale CPU owner instead "
-            "of selecting CUDA");
-
-    const char *configured_transport =
-        std::getenv("MEEP_GPU_MPI_TRANSPORT");
-    const std::string changed_transport =
-        configured_transport && std::string(configured_transport) == "pinned"
-            ? "auto"
-            : "pinned";
-    const double time_before_changed_transport = f.time();
-    bool changed_transport_rejected = false;
-    gpu::reset_dispatch_statistics();
-    {
-      scoped_environment_override changed_transport_policy(
-          "MEEP_GPU_MPI_TRANSPORT", changed_transport.c_str());
-      try {
-        f.step();
-      }
-      catch (const std::runtime_error &error) {
-        changed_transport_rejected =
-            std::string(error.what()).find("changed after") !=
-            std::string::npos;
-      }
-    }
-    const gpu::dispatch_statistics after_changed_transport =
-        gpu::get_dispatch_statistics();
-    require(changed_transport_rejected &&
-                f.time() == time_before_changed_transport &&
-                after_changed_transport.cpu_curl_calls == 0 &&
-                after_changed_transport.cuda_curl_calls == 0,
-            "cached automatic CUDA owner accepted a dynamic valid MPI "
-            "transport change or dispatched a partial step");
-
-    const char *configured_completion =
-        std::getenv("MEEP_GPU_MPI_COMPLETION");
-    const std::string changed_completion =
-        configured_completion &&
-                std::string(configured_completion) == "waitall"
-            ? "waitsome"
-            : "waitall";
-    const double time_before_changed_completion = f.time();
-    bool changed_completion_rejected = false;
-    gpu::reset_dispatch_statistics();
-    {
-      scoped_environment_override changed_completion_policy(
-          "MEEP_GPU_MPI_COMPLETION", changed_completion.c_str());
-      try {
-        f.step();
-      }
-      catch (const std::runtime_error &error) {
-        changed_completion_rejected =
-            std::string(error.what()).find("changed after") !=
-            std::string::npos;
-      }
-    }
-    const gpu::dispatch_statistics after_changed_completion =
-        gpu::get_dispatch_statistics();
-    require(changed_completion_rejected &&
-                f.time() == time_before_changed_completion &&
-                after_changed_completion.cpu_curl_calls == 0 &&
-                after_changed_completion.cuda_curl_calls == 0,
-            "cached automatic CUDA owner accepted a dynamic valid MPI "
-            "completion-policy change or dispatched a partial step");
-
-    gpu::reset_dispatch_statistics();
-    f.step();
-    const gpu::dispatch_statistics after_transport_restore =
-        gpu::get_dispatch_statistics();
-    require(f.gpu_cuda_execution_selected() &&
-                after_transport_restore.cuda_curl_calls > 0 &&
-                after_transport_restore.cpu_curl_calls == 0,
-            "automatic CUDA owner did not recover after restoring MPI "
-            "transport and completion policy");
-  }
-  gpu::set_backend(gpu::backend_mode::cpu);
-}
-
 void require_failed_dynamic_environment_preserves_device_claim() {
   const int world_size = count_processors();
   require(world_size == 2,
           "dynamic device-claim regression requires exactly two MPI ranks");
 
-  scoped_environment_override force_candidate(
-      "MEEP_GPU_AUTO_MIN_CELLS", "0");
-  scoped_environment_override automatic_device(
+  scoped_environment_override default_device(
       "MEEP_GPU_DEVICE", nullptr);
   scoped_environment_override exclusive_devices(
       "MEEP_GPU_ALLOW_OVERSUBSCRIBE", "0");
@@ -18835,7 +21716,7 @@ void require_failed_dynamic_environment_preserves_device_claim() {
 
   if (group == 0) {
     try {
-      gpu::set_backend(gpu::backend_mode::automatic);
+      gpu::set_backend(gpu::backend_mode::cuda);
       const grid_volume gv = vol2d(1.8, 1.6, 10.0);
       owner_structure.reset(new structure(gv, vacuum, no_pml()));
       owner_fields.reset(
@@ -18892,7 +21773,7 @@ void require_failed_dynamic_environment_preserves_device_claim() {
   else {
     bool competing_claim_rejected = false;
     try {
-      gpu::set_backend(gpu::backend_mode::automatic);
+      gpu::set_backend(gpu::backend_mode::cuda);
       gpu::select_device(0);
       const grid_volume gv = vol2d(1.8, 1.6, 10.0);
       structure competing_structure(gv, vacuum, no_pml());
@@ -18932,213 +21813,6 @@ void require_failed_dynamic_environment_preserves_device_claim() {
   require(every_rank_succeeded && local_success,
           "failed dynamic CUDA configuration released the live owner's "
           "MPI-world device claim or the restored owner did not resume CUDA");
-}
-
-void require_automatic_feature_fallback_recovers() {
-  require(count_processors() == 1,
-          "automatic feature-fallback recovery is singleton-only");
-  scoped_environment_override force_candidate(
-      "MEEP_GPU_AUTO_MIN_CELLS", "0");
-  gpu::set_backend(gpu::backend_mode::automatic);
-  gpu::reset_dispatch_statistics();
-
-  const grid_volume gv = vol2d(1.8, 1.6, 10.0);
-  structure s(gv, vacuum, no_pml());
-  s.add_susceptibility(
-      vacuum, E_stuff,
-      noisy_lorentzian_susceptibility(0.0, 0.39, 0.06));
-  s.add_susceptibility(
-      vacuum, E_stuff,
-      lorentzian_susceptibility(0.31, 0.05));
-  fields f(&s, 0.0, 0.0, true, 64, 64);
-  f.use_real_fields();
-  gaussian_src_time source(0.29, 0.11);
-  f.add_point_source(Ez, source, gv.center(), 0.8);
-  f.step();
-  require(!f.gpu_cuda_execution_selected() &&
-              gpu::active_backend() == gpu::backend_mode::cpu &&
-              std::string(f.gpu_execution_diagnostic()).find(
-                  "feature preflight failed") != std::string::npos,
-          "unsupported automatic feature did not cache a feature-specific "
-          "CPU fallback");
-
-  struct detached_state_guard {
-    struct entry {
-      polarization_state **link;
-      polarization_state *node;
-    };
-    std::vector<entry> entries;
-    ~detached_state_guard() {
-      for (auto item = entries.rbegin(); item != entries.rend(); ++item) {
-        item->node->next = *item->link;
-        *item->link = item->node;
-      }
-    }
-  } detached;
-  for (int chunk_index = 0; chunk_index < f.num_chunks; ++chunk_index) {
-    fields_chunk *chunk = f.chunks[chunk_index];
-    if (!chunk->is_mine()) continue;
-    polarization_state **link = &chunk->pol[E_stuff];
-    while (*link) {
-      polarization_state *candidate = *link;
-      if (candidate->s &&
-          typeid(*candidate->s) ==
-              typeid(noisy_lorentzian_susceptibility)) {
-        *link = candidate->next;
-        candidate->next = nullptr;
-        detached.entries.push_back({link, candidate});
-        break;
-      }
-      link = &candidate->next;
-    }
-  }
-  require(!detached.entries.empty(),
-          "feature-fallback recovery fixture found no noisy polarization");
-
-  gpu::reset_dispatch_statistics();
-  f.step();
-  const gpu::dispatch_statistics dispatch =
-      gpu::get_dispatch_statistics();
-  const gpu::polarization_statistics polarizations =
-      gpu::get_polarization_statistics();
-  require(f.gpu_cuda_execution_selected() &&
-              gpu::active_backend() == gpu::backend_mode::cuda &&
-              dispatch.cuda_curl_calls > 0 &&
-              dispatch.cpu_curl_calls == 0 &&
-              polarizations.cuda_update_calls > 0 &&
-              polarizations.cpu_update_calls == 0,
-          "automatic owner remained stuck on CPU after its unsupported "
-          "feature was removed");
-  gpu::set_backend(gpu::backend_mode::cpu);
-}
-
-void require_interleaved_automatic_owner_decisions() {
-  require(count_processors() == 1,
-          "interleaved automatic-owner regression is singleton-only");
-  const std::uint64_t live_before =
-      gpu::get_live_resident_device_buffers();
-  {
-    const grid_volume small_gv = vol2d(1.8, 1.6, 10.0);
-    const grid_volume large_gv = vol2d(8.0, 8.0, 12.0);
-    require(large_gv.ntot() > small_gv.ntot() + 1,
-            "automatic-owner test volumes are not ordered");
-    const size_t threshold =
-        small_gv.ntot() +
-        (large_gv.ntot() - small_gv.ntot()) / 2;
-    const std::string threshold_text = std::to_string(threshold);
-    scoped_environment_override automatic_minimum(
-        "MEEP_GPU_AUTO_MIN_CELLS", threshold_text.c_str());
-    gpu::set_backend(gpu::backend_mode::automatic);
-
-    structure small_structure(small_gv, vacuum, no_pml());
-    structure large_structure(large_gv, vacuum, no_pml());
-    fields small(&small_structure, 0.0, 0.0, true, 64, 64);
-    fields large(&large_structure, 0.0, 0.0, true, 64, 64);
-    small.use_real_fields();
-    large.use_real_fields();
-    gaussian_src_time small_source(0.27, 0.09);
-    gaussian_src_time large_source(0.31, 0.11);
-    small.add_point_source(Ez, small_source, small_gv.center(), 0.7);
-    large.add_point_source(Ez, large_source, large_gv.center(), 0.8);
-
-    small.step();
-    require(gpu::active_backend() == gpu::backend_mode::cpu,
-            "small automatic owner did not select CPU");
-    require(!small.gpu_cuda_execution_selected() &&
-                std::string(small.gpu_execution_diagnostic()).find(
-                    "selected CPU") != std::string::npos,
-            "small fields owner did not retain its CPU decision");
-    for (int warmup = 0; warmup < 4; ++warmup)
-      large.step();
-    require(gpu::active_backend() == gpu::backend_mode::cuda,
-            "large automatic owner did not select CUDA");
-    require(large.gpu_cuda_execution_selected() &&
-                std::string(large.gpu_execution_diagnostic()).find(
-                    "selected CUDA") != std::string::npos,
-            "large fields owner did not retain its CUDA decision");
-    const std::uint64_t warm_live =
-        gpu::get_live_resident_device_buffers();
-    require(warm_live > live_before,
-            "large automatic owner created no resident CUDA state");
-
-    gpu::reset_dispatch_statistics();
-    small.step();
-    const gpu::dispatch_statistics after_small =
-        gpu::get_dispatch_statistics();
-    require(gpu::active_backend() == gpu::backend_mode::cpu &&
-                after_small.cpu_curl_calls > 0 &&
-                after_small.cuda_curl_calls == 0 &&
-                after_small.host_to_device_bytes == 0 &&
-                after_small.device_to_host_bytes == 0 &&
-                gpu::get_live_resident_device_buffers() == warm_live,
-            "cached small-owner CPU activation disturbed the live CUDA "
-            "owner");
-    require(large.gpu_cuda_execution_selected(),
-            "CPU owner activation overwrote another owner's CUDA decision");
-
-    large.step();
-    const gpu::dispatch_statistics after_large =
-        gpu::get_dispatch_statistics();
-    require(gpu::active_backend() == gpu::backend_mode::cuda &&
-                after_large.cuda_curl_calls > 0 &&
-                gpu::get_live_resident_device_buffers() == warm_live,
-            "cached large-owner CUDA activation rebuilt or lost resident "
-            "state after an interleaved CPU step");
-
-    small.step();
-    require(gpu::active_backend() == gpu::backend_mode::cpu &&
-                gpu::get_live_resident_device_buffers() == warm_live,
-            "second small-owner activation invalidated another owner's "
-            "resident state");
-
-    // Keep two independent CUDA owners warm, then explicitly destroy one
-    // chunk cache.  The peer owner must reuse all of its persistent phase
-    // plans without an allocation or upload.  This catches the historical
-    // global-plan clear hidden by a CPU owner which never owned a cache.
-    structure peer_structure(large_gv, vacuum, no_pml());
-    fields peer(&peer_structure, 0.0, 0.0, true, 64, 64);
-    peer.use_real_fields();
-    gaussian_src_time peer_source(0.33, 0.10);
-    peer.add_point_source(Ez, peer_source, large_gv.center(), 0.6);
-    for (int warmup = 0; warmup < 5; ++warmup)
-      peer.step();
-    require(peer.gpu_cuda_execution_selected(),
-            "peer automatic owner did not select CUDA");
-    gpu::reset_dispatch_statistics();
-    peer.step();
-    const gpu::resident_statistics stable_peer =
-        gpu::get_resident_statistics();
-    require(stable_peer.device_buffer_allocations == 0,
-            "peer CUDA owner was not warm before cache-isolation test");
-
-    gpu::detail::destroy_resident_cache_for_owner(large.chunks[0]);
-    const std::uint64_t live_after_foreign_destroy =
-        gpu::get_live_resident_device_buffers();
-    gpu::reset_dispatch_statistics();
-    peer.step();
-    const gpu::dispatch_statistics isolated_peer_dispatch =
-        gpu::get_dispatch_statistics();
-    const gpu::resident_statistics isolated_peer_resident =
-        gpu::get_resident_statistics();
-    require(peer.gpu_cuda_execution_selected() &&
-                isolated_peer_dispatch.cuda_curl_calls > 0 &&
-                isolated_peer_dispatch.cpu_curl_calls == 0 &&
-                isolated_peer_dispatch.host_to_device_bytes == 0 &&
-                isolated_peer_resident.device_buffer_allocations == 0 &&
-                gpu::get_live_resident_device_buffers() ==
-                    live_after_foreign_destroy,
-            "destroying one CUDA owner cache invalidated another owner's "
-            "persistent execution plans");
-
-    gpu::set_backend(gpu::backend_mode::cpu);
-    require(!peer.gpu_cuda_execution_selected() &&
-                std::string(peer.gpu_execution_diagnostic()).find(
-                    "invalidated") != std::string::npos,
-            "fields owner API exposed a stale decision after a process "
-            "backend generation change");
-  }
-  require(gpu::get_live_resident_device_buffers() == live_before,
-          "interleaved automatic owners leaked resident device buffers");
 }
 
 void require_resized_dft_preflight_is_atomic() {
@@ -19685,6 +22359,169 @@ void require_integrated_source_cache_lifecycle() {
 
   require(global_sum(gpu::get_live_resident_device_buffers()) == live_before,
           "destroyed fields chunk retained resident CUDA buffers");
+}
+
+double phase_reuse_initial_epsilon(const vec &p) {
+  return p.x() < 0.5 ? 2.25 : 1.0;
+}
+double phase_reuse_target_epsilon(const vec &p) {
+  return p.y() < 0.5 ? 4.0 : 1.0;
+}
+
+class phase_reuse_anisotropic_material : public anisotropic_test_material {
+public:
+  explicit phase_reuse_anisotropic_material(double scale) : scale_(scale) {}
+  void eff_chi1inv_row(component c, double row[3], const volume &v,
+                       double tol = DEFAULT_SUBPIXEL_TOL,
+                       int eval = DEFAULT_SUBPIXEL_MAXEVAL) override {
+    anisotropic_test_material::eff_chi1inv_row(c, row, v, tol, eval);
+    for (int i = 0; i < 3; ++i) row[i] *= scale_;
+  }
+private:
+  double scale_;
+};
+
+struct material_phasing_run {
+  std::vector<std::complex<double> > samples;
+  gpu::material_phasing_statistics phasing;
+  gpu::resident_statistics resident;
+  gpu::dispatch_statistics dispatch;
+  gpu::field_update_statistics field_updates;
+};
+
+material_phasing_run run_material_phasing_reuse(
+    gpu::backend_mode backend, const char *disable, bool conductivity, bool anisotropic,
+    bool warm_copy) {
+  scoped_environment_override control(
+      "MEEP_GPU_DISABLE_PHASE_MATERIAL_MIRROR_REUSE", disable);
+  gpu::set_backend(backend);
+  const grid_volume gv = vol2d(1.4, 1.2, 10.0);
+  structure initial(gv, phase_reuse_initial_epsilon, no_pml());
+  structure target(gv, phase_reuse_target_epsilon, no_pml());
+  phase_reuse_anisotropic_material initial_tensor(1.0), target_tensor(0.8);
+  if (anisotropic) {
+    initial.set_epsilon(initial_tensor);
+    target.set_epsilon(target_tensor);
+  }
+  if (conductivity) {
+    initial.set_conductivity(Ez, lossy);
+    target.set_conductivity(Ez, lossy);
+  }
+  fields f(&initial);
+  f.use_real_fields();
+  continuous_src_time source(0.43);
+  f.add_point_source(Ez, source, gv.center());
+  f.require_source_components();
+  f.step();
+  if (anisotropic)
+    require(f.have_component(Ex) && f.have_component(Ey) && f.have_component(Hz),
+            "anisotropic phasing did not allocate both polarizations");
+  const int phase_steps = f.phase_in_material(&target, 16 * f.dt);
+  require(phase_steps >= 15, "material reuse fixture lost its phasing steps");
+  gpu::reset_dispatch_statistics();
+  material_phasing_run result;
+  for (int step = 0; step < phase_steps + 4; ++step) {
+    std::unique_ptr<fields> held;
+    std::vector<realnum> held_coefficients;
+    gpu::material_phasing_statistics before_copy_step{};
+    if (warm_copy && step == 5) {
+      // Public copy-on-write must fall back even after reuse is established.
+      held.reset(new fields(f));
+      const realnum *coefficients = held->chunks[0]->s->chi1inv[Ez][Z];
+      require(coefficients != nullptr, "COW fixture has no epsilon array");
+      held_coefficients.assign(coefficients, coefficients + held->chunks[0]->gv.ntot());
+      require(held->chunks[0]->s == f.chunks[0]->s,
+              "fields copy did not share the warm material structure");
+      before_copy_step = gpu::get_material_phasing_statistics();
+    }
+    f.step();
+    if (held) {
+      require(held->chunks[0]->s != f.chunks[0]->s &&
+                  std::equal(held_coefficients.begin(), held_coefficients.end(),
+                             held->chunks[0]->s->chi1inv[Ez][Z]),
+              "warm phasing COW mutated the retained coefficient owner");
+      if (backend == gpu::backend_mode::cuda && !disable)
+        require(gpu::get_material_phasing_statistics().ineligible ==
+                    before_copy_step.ineligible + 1,
+                "warm phasing COW did not force full cache invalidation");
+    }
+    if (step % 4 == 0 || step == phase_steps + 3)
+      FOR_COMPONENTS(c) {
+        if (!f.have_component(c)) continue;
+        LOOP_OVER_VOL(gv, c, index) {
+          result.samples.push_back(f.get_field(c, gv.loc(c, index)));
+        }
+      }
+  }
+  result.phasing = gpu::get_material_phasing_statistics();
+  result.resident = gpu::get_resident_statistics();
+  result.dispatch = gpu::get_dispatch_statistics();
+  result.field_updates = gpu::get_field_update_statistics();
+  if (backend == gpu::backend_mode::cuda) {
+    require(result.phasing.checks == static_cast<std::uint64_t>(phase_steps) &&
+                result.phasing.checks == result.phasing.reused +
+                    result.phasing.disabled + result.phasing.ineligible,
+            "material phasing native census differs");
+    require(result.dispatch.cuda_curl_calls > 0 && result.dispatch.cpu_curl_calls == 0,
+            "material phasing silently used CPU curl");
+    require(result.field_updates.cuda_update_eh_calls > 0 &&
+                result.field_updates.cpu_update_eh_calls == 0,
+            "material phasing silently used CPU E/H updates");
+  }
+  else {
+    require(result.phasing.checks == 0 && result.phasing.reused == 0,
+            "CPU phasing recorded CUDA reuse");
+  }
+  return result;
+}
+
+void require_material_phasing_mirror_reuse() {
+  const std::uint64_t live_before = gpu::get_live_resident_device_buffers();
+  const auto compare = [](const material_phasing_run &left,
+                          const material_phasing_run &right) {
+    require(left.samples.size() == right.samples.size() && !left.samples.empty(),
+            "material phasing sample census differs");
+    double magnitude = 0;
+    for (std::size_t i = 0; i < left.samples.size(); ++i) {
+      magnitude = std::max(magnitude, std::abs(left.samples[i]));
+      require(std::abs(left.samples[i] - right.samples[i]) <=
+                  3e-5 + 3e-4 * std::max(std::abs(left.samples[i]), std::abs(right.samples[i])),
+              "material phasing complete fields differ");
+    }
+    require(magnitude > 1e-4, "material phasing fixture did not excite fields");
+  };
+  for (int scenario = 0; scenario < 4; ++scenario) {
+    const bool conductivity = scenario == 1;
+    const bool anisotropic = scenario == 2;
+    const bool warm_copy = scenario == 3;
+    const material_phasing_run cpu =
+        run_material_phasing_reuse(gpu::backend_mode::cpu, nullptr, conductivity, anisotropic, warm_copy);
+    const material_phasing_run off =
+        run_material_phasing_reuse(gpu::backend_mode::cuda, "1", conductivity, anisotropic, warm_copy);
+    const material_phasing_run on =
+        run_material_phasing_reuse(gpu::backend_mode::cuda, nullptr, conductivity, anisotropic, warm_copy);
+    compare(cpu, off);
+    compare(cpu, on);
+    compare(off, on);
+    require(off.phasing.disabled == off.phasing.checks && off.phasing.reused == 0 &&
+                off.phasing.ineligible == 0,
+            "material phasing OFF did not take the legacy path");
+    if (conductivity) {
+      require(on.phasing.reused == 0 && on.phasing.ineligible == on.phasing.checks,
+              "conductive material phasing did not retain full fallback");
+    }
+    else {
+      require(on.phasing.reused > 0 && on.phasing.ineligible == (warm_copy ? 2u : 1u) &&
+                  on.phasing.disabled == 0,
+              "stable phasing did not reuse mirrors after the first fallback");
+      require(on.resident.device_buffer_allocations < off.resident.device_buffer_allocations &&
+                  on.dispatch.host_to_device_bytes < off.dispatch.host_to_device_bytes,
+              "stable phasing did not avoid repeated allocations and field uploads");
+    }
+    require(gpu::get_live_resident_device_buffers() == live_before,
+            "material phasing owner destruction leaked resident buffers");
+  }
+  if (am_master()) std::cout << "PASS: material phasing stable mirror reuse and conductive fallback\n";
 }
 
 void require_distributed_component_allocation_consensus() {
@@ -20726,12 +23563,10 @@ int main(int argc, char **argv) {
         setenv("MEEP_GPU_DEVICE", "invalid", 1);
       if (std::getenv("MEEP_GPU_TEST_RANK_BACKEND_MISMATCH"))
         gpu::set_backend(
-            my_rank() == 0 ? gpu::backend_mode::automatic
+            my_rank() == 0 ? gpu::backend_mode::cuda
                            : gpu::backend_mode::cpu);
-      if (std::getenv("MEEP_GPU_TEST_RANK_AUTO_THRESHOLD_MISMATCH")) {
-        gpu::set_backend(gpu::backend_mode::automatic);
-        setenv("MEEP_GPU_AUTO_MIN_CELLS",
-               my_rank() == 0 ? "0" : "1", 1);
+      if (std::getenv("MEEP_GPU_TEST_AUTOMATIC_BACKEND_TOKEN")) {
+        gpu::set_backend(static_cast<gpu::backend_mode>(1));
       }
       f.step();
       if (std::getenv("MEEP_GPU_TEST_OUTER_UNWIND_SUCCESS")) {
@@ -20755,6 +23590,20 @@ int main(int argc, char **argv) {
         const int current_device = gpu::selected_device();
         require(current_device == 0 || current_device == 1,
                 "device-swap regression requires CUDA ordinals 0 and 1");
+        f.gpmeep_begin_backend_operation();
+        bool rejected = false;
+        try {
+          gpu::select_device(current_device == 0 ? 1 : 0);
+        }
+        catch (const std::runtime_error &error) {
+          rejected =
+              std::string(error.what()).find(
+                  "preflighted fields operation is active") !=
+              std::string::npos;
+        }
+        require(rejected && gpu::selected_device() == current_device,
+                "an active fields operation did not pin its CUDA device");
+        f.gpmeep_release_backend_pin();
         gpu::select_device(current_device == 0 ? 1 : 0);
         f.step();
       }
@@ -20775,7 +23624,7 @@ int main(int argc, char **argv) {
                       gpu::backend_diagnostic().c_str());
       broadcast(0, root_diagnostic, diagnostic_capacity);
       require(gpu::backend_diagnostic() == root_diagnostic,
-              "distributed automatic backend diagnostic is not canonical");
+              "distributed explicit backend diagnostic is not canonical");
       const bool owner_cuda = f.gpu_cuda_execution_selected();
       const bool process_cuda =
           gpu::active_backend() == gpu::backend_mode::cuda;
@@ -20791,18 +23640,10 @@ int main(int argc, char **argv) {
               "fields-owner backend query disagrees with preflight result");
       if (std::getenv("MEEP_GPU_TEST_EXPECT_CPU")) {
         require(gpu::active_backend() == gpu::backend_mode::cpu,
-                "automatic distributed preflight did not fall back to CPU");
+                "explicit CPU distributed preflight changed the backend");
         require(statistics.cpu_curl_calls > 0 &&
                     statistics.cuda_curl_calls == 0,
-                "automatic distributed preflight fallback did not use CPU");
-        if (gpu::requested_backend() == gpu::backend_mode::automatic) {
-          const gpu::runtime_touch_statistics runtime =
-              gpu::get_runtime_touch_statistics();
-          require(runtime.availability_probes == 0 &&
-                      runtime.device_enumerations == 0 &&
-                      runtime.device_selections == 0,
-                  "small automatic MPI CPU selection touched CUDA");
-        }
+                "explicit CPU distributed preflight did not use CPU");
       }
       else {
         require(gpu::active_backend() == gpu::backend_mode::cuda,
@@ -20810,16 +23651,6 @@ int main(int argc, char **argv) {
         require(statistics.cuda_curl_calls > 0 &&
                     statistics.cpu_curl_calls == 0,
                 "distributed preflight did not use an exclusive CUDA curl");
-        if (gpu::requested_backend() == gpu::backend_mode::automatic) {
-          const gpu::runtime_touch_statistics runtime =
-              gpu::get_runtime_touch_statistics();
-          require(
-              and_to_all(runtime.availability_probes > 0 &&
-                         runtime.device_enumerations > 0 &&
-                         runtime.device_selections > 0),
-              "automatic CUDA MPI selection did not perform observable "
-              "runtime discovery and device selection on every rank");
-        }
       }
       if (std::getenv("MEEP_GPU_TEST_EXPECT_PINNED_TRANSPORT")) {
         require(
@@ -20957,8 +23788,6 @@ int main(int argc, char **argv) {
     bool cuda_available = every_runtime_available;
     if (any_runtime_available != every_runtime_available)
       diagnostic = "CUDA runtime availability differs between MPI ranks";
-    const bool automatic_fallback_expected =
-        !any_runtime_available;
     if (cuda_available) {
       // Required CUDA performs eager device qualification.  Automatic mode
       // is deliberately lazy and must not touch CUDA until a fields owner
@@ -20978,12 +23807,48 @@ int main(int argc, char **argv) {
     }
     const bool ade_state_only =
         std::getenv("MEEP_GPU_TEST_ADE_STATE_ONLY") != nullptr;
+    const bool sparse_lorentzian_only =
+        std::getenv("MEEP_GPU_TEST_SPARSE_LORENTZIAN_ONLY") != nullptr;
+    const bool sparse_lorentzian_quiescence_failure_only =
+        std::getenv(
+            "MEEP_GPU_TEST_SPARSE_LORENTZIAN_QUIESCENCE_FAILURE_ONLY") !=
+        nullptr;
+    const bool sparse_lorentzian_exhaustion_only =
+        std::getenv(
+            "MEEP_GPU_TEST_SPARSE_LORENTZIAN_EXHAUSTION_ONLY") != nullptr;
+    const bool sparse_lorentzian_reset_reclaim_failure_only =
+        std::getenv(
+            "MEEP_GPU_TEST_SPARSE_LORENTZIAN_RESET_RECLAIM_FAILURE_ONLY") !=
+        nullptr;
     const bool mixed_dispersive_only =
         std::getenv("MEEP_GPU_TEST_MIXED_DISPERSIVE_ONLY") != nullptr;
+    const bool structured_curl_graph_only =
+        std::getenv("MEEP_GPU_TEST_STRUCTURED_CURL_GRAPH_ONLY") != nullptr;
+    const char *structured_curl_graph_failure_mode_value =
+        std::getenv("MEEP_GPU_TEST_STRUCTURED_CURL_GRAPH_FAILURE_MODE");
+    const bool structured_curl_graph_failure_only =
+        structured_curl_graph_failure_mode_value != nullptr;
     require(!ade_state_only || cuda_available,
             "production ADE state contract requires CUDA on every rank");
+    require(!sparse_lorentzian_only || cuda_available,
+            "production sparse Lorentzian contract requires CUDA on every "
+            "rank");
+    require(!sparse_lorentzian_quiescence_failure_only || cuda_available,
+            "sparse Lorentzian quiescence-failure contract requires CUDA on "
+            "every rank");
+    require(!sparse_lorentzian_exhaustion_only || cuda_available,
+            "sparse Lorentzian generation-exhaustion contract requires CUDA "
+            "on every rank");
+    require(!sparse_lorentzian_reset_reclaim_failure_only || cuda_available,
+            "sparse Lorentzian reset-reclaim failure contract requires CUDA "
+            "on every rank");
     require(!mixed_dispersive_only || cuda_available,
             "mixed dispersive multi-GPU regression requires CUDA on every "
+            "rank");
+    require(!structured_curl_graph_only || cuda_available,
+            "structured-curl Graph regression requires CUDA on every rank");
+    require(!structured_curl_graph_failure_only || cuda_available,
+            "structured-curl Graph failure regression requires CUDA on every "
             "rank");
     if (cuda_available) {
       const std::vector<gpu::device_info> devices = gpu::enumerate_devices();
@@ -21005,6 +23870,136 @@ int main(int argc, char **argv) {
               device_override && *device_override
                   ? "explicit per-rank MPI GPU mapping is incorrect"
                   : "default node-local MPI rank to GPU mapping is incorrect");
+
+      if (structured_curl_graph_failure_only) {
+        require(count_processors() == 1,
+                "focused structured-curl Graph failure regression requires "
+                "one MPI rank");
+        const std::string mode(structured_curl_graph_failure_mode_value);
+        require(
+            mode == "api-return" || mode == "post-enqueue" ||
+                mode == "destroy-sync" || mode == "owner-destroy-sync" ||
+            mode == "async-device",
+            "MEEP_GPU_TEST_STRUCTURED_CURL_GRAPH_FAILURE_MODE must be "
+            "api-return, post-enqueue, destroy-sync, "
+            "owner-destroy-sync, or async-device");
+        require_structured_curl_graph_quarantine_contract(
+            mode == "api-return"
+                ? structured_curl_graph_failure_mode::api_return
+                : mode == "post-enqueue"
+                      ? structured_curl_graph_failure_mode::post_enqueue
+                      : mode == "destroy-sync"
+                            ? structured_curl_graph_failure_mode::destroy_sync
+                            : mode == "owner-destroy-sync"
+                                  ? structured_curl_graph_failure_mode::
+                                        owner_destroy_sync
+                                  : structured_curl_graph_failure_mode::
+                                        async_device);
+        return 0;
+      }
+
+      if (structured_curl_graph_only) {
+        require(count_processors() == 1,
+                "focused structured-curl Graph regression requires one MPI "
+                "rank");
+        require_phase_batched_launch_equivalence();
+        require_structured_curl_graph_invalidation_and_failure_contract();
+        gpu::set_backend(gpu::backend_mode::cpu);
+        if (am_master())
+          std::cout
+              << "PASS: focused structured-curl Graph numerical, identity, "
+                 "failure, and lifecycle contracts\n";
+        return 0;
+      }
+
+      if (std::getenv("MEEP_GPU_TEST_TRANSITION_ROLLBACK_ONLY")) {
+        require(count_processors() == 1,
+                "focused transition rollback requires one MPI rank");
+        require_active_resident_phase_transition_rollback();
+        require_finite_check_plan_lifecycle();
+        gpu::set_backend(gpu::backend_mode::cpu);
+        if (am_master())
+          std::cout
+              << "PASS: active resident phase and deferred finite-check "
+                 "transitions roll back without losing CUDA state\n";
+        return 0;
+      }
+
+      if (std::getenv("MEEP_GPU_TEST_BACKEND_TRANSITION_ONLY")) {
+        const run_result transition_cpu =
+            run_backend_transition_case(false);
+        const run_result transition_cuda_cpu =
+            run_backend_transition_case(true);
+        compare_results(transition_cpu, transition_cuda_cpu,
+                        two_dimensional_case);
+        require(transition_cuda_cpu.statistics.cuda_curl_calls > 0 &&
+                    transition_cuda_cpu.statistics.cpu_curl_calls > 0,
+                "focused backend transition did not execute CUDA then CPU "
+                "curls");
+        gpu::set_backend(gpu::backend_mode::cpu);
+        if (am_master())
+          std::cout
+              << "PASS: dirty resident CUDA-to-CPU transition preserves "
+                 "the CPU oracle and dispatches both backends\n";
+        return 0;
+      }
+
+      if (sparse_lorentzian_only) {
+        require(count_processors() == 1 || count_processors() == 2,
+                "focused sparse Lorentzian production regression requires "
+                "one or two MPI ranks");
+        require_sparse_lorentzian_production_contract(
+            gpu::detail::lorentzian_state_kind::previous);
+        require_sparse_lorentzian_production_contract(
+            gpu::detail::lorentzian_state_kind::increment);
+        require_sparse_lorentzian_build_failure_atomicity();
+        require_sparse_lorentzian_selection_contract();
+        require_sparse_lorentzian_nonfinite_guard_contract();
+        require_sparse_lorentzian_shared_guard_contract();
+        require_sparse_lorentzian_control_transition_contract();
+        require_sparse_lorentzian_ineligible_transition_contract();
+        require_sparse_lorentzian_multi_cache_statistics_contract();
+        if (am_master())
+          std::cout
+              << "PASS: production sparse Lorentzian previous/increment "
+                 "bitwise recurrence, transactional plan, guard, ledger, "
+                 "checked reset, and lifecycle contract\n";
+        gpu::set_backend(gpu::backend_mode::cpu);
+        return 0;
+      }
+      if (sparse_lorentzian_quiescence_failure_only) {
+        require(count_processors() == 1,
+                "sparse Lorentzian quiescence-failure regression requires "
+                "one MPI rank");
+        require_sparse_lorentzian_quiescence_failure_contract();
+        if (am_master())
+          std::cout
+              << "PASS: failed sparse Lorentzian quiescence quarantines the "
+                 "complete cache and preserves sticky teardown evidence\n";
+        return 0;
+      }
+      if (sparse_lorentzian_exhaustion_only) {
+        require(count_processors() == 1,
+                "sparse Lorentzian generation-exhaustion regression requires "
+                "one MPI rank");
+        require_sparse_lorentzian_generation_exhaustion_contract();
+        if (am_master())
+          std::cout
+              << "PASS: sparse Lorentzian epoch, control, allocation, and "
+                 "statistics generations fail closed at exhaustion\n";
+        return 0;
+      }
+      if (sparse_lorentzian_reset_reclaim_failure_only) {
+        require(count_processors() == 1,
+                "sparse Lorentzian reset-reclaim failure regression requires "
+                "one MPI rank");
+        require_sparse_lorentzian_reset_reclaim_failure_contract();
+        if (am_master())
+          std::cout
+              << "PASS: post-commit sparse Lorentzian ledger reclaim failure "
+                 "completes one atomic reset and remains sticky\n";
+        return 0;
+      }
 
       if (std::getenv("MEEP_GPU_TEST_DFT_CHECKPOINT_D2H_RANK_FAILURE"))
         trigger_distributed_dft_checkpoint_rank_failure(false);
@@ -21334,99 +24329,18 @@ int main(int argc, char **argv) {
         return 0;
       }
 
-      const char *saved_auto_minimum =
-          std::getenv("MEEP_GPU_AUTO_MIN_CELLS");
-      const bool had_saved_auto_minimum =
-          saved_auto_minimum != nullptr;
-      const std::string saved_auto_minimum_value =
-          saved_auto_minimum ? saved_auto_minimum : "";
-      setenv("MEEP_GPU_AUTO_MIN_CELLS", "65536", 1);
-      const run_result automatic_initialization =
-          run_initialize_field_before_step_case(
-              gpu::backend_mode::automatic);
-      require(
-          gpu::active_backend() == gpu::backend_mode::cpu &&
-              automatic_initialization.boundaries.cpu_update_calls > 0 &&
-              automatic_initialization.boundaries.cuda_update_calls == 0 &&
-              automatic_initialization.statistics.cuda_curl_calls == 0 &&
-              automatic_initialization.field_updates.cuda_update_eh_calls ==
-                  0 &&
-              automatic_initialization.polarizations.cuda_update_calls == 0 &&
-              automatic_initialization.sources.cuda_update_calls == 0 &&
-              automatic_initialization.dfts.cuda_update_calls == 0 &&
-              automatic_initialization.statistics.host_to_device_bytes ==
-                  0 &&
-              automatic_initialization.statistics.device_to_host_bytes ==
-                  0 &&
-              automatic_initialization.resident.device_buffer_allocations ==
-                  0,
-          "automatic CUDA workload policy touched CUDA during a small "
-          "pre-step field initialization");
-      const gpu::runtime_touch_statistics initialization_runtime =
-          gpu::get_runtime_touch_statistics();
-      require(initialization_runtime.availability_probes == 0 &&
-                  initialization_runtime.device_enumerations == 0 &&
-                  initialization_runtime.device_selections == 0,
-              "automatic small initialization touched the CUDA runtime");
-      const run_result automatic_small =
-          run_case(gpu::backend_mode::automatic, two_dimensional_case);
-      require(gpu::active_backend() == gpu::backend_mode::cpu,
-              "automatic CUDA workload policy did not keep a small "
-              "domain on the CPU");
-      require(
-          gpu::requested_backend() == gpu::backend_mode::automatic,
-          "automatic CUDA workload policy permanently changed the "
-          "process-level requested backend");
-      require(automatic_small.statistics.cpu_curl_calls > 0 &&
-                  automatic_small.statistics.cuda_curl_calls == 0,
-              "automatic CUDA workload policy dispatched a small domain "
-              "to CUDA");
-      const gpu::runtime_touch_statistics small_runtime =
-          gpu::get_runtime_touch_statistics();
-      require(small_runtime.availability_probes == 0 &&
-                  small_runtime.device_enumerations == 0 &&
-                  small_runtime.device_selections == 0,
-              "automatic small-domain CPU selection touched CUDA");
-
-      setenv("MEEP_GPU_AUTO_MIN_CELLS", "0", 1);
-      const run_result automatic_forced =
-          run_case(gpu::backend_mode::automatic, two_dimensional_case,
-                   false);
-      compare_results(
-          automatic_small, automatic_forced, two_dimensional_case);
-      require(gpu::active_backend() == gpu::backend_mode::cuda,
-              "a later automatic simulation did not re-probe CUDA after "
-              "an earlier small-domain CPU fallback");
-      require(
-          gpu::requested_backend() == gpu::backend_mode::automatic,
-          "automatic CUDA re-probe changed the process-level request");
-      require(automatic_forced.statistics.cuda_curl_calls > 0 &&
-                  automatic_forced.statistics.cpu_curl_calls == 0,
-              "zero automatic CUDA threshold did not dispatch CUDA");
-
-      if (count_processors() == 1) {
-        // Distributed fields::step deliberately aborts MPI on any escaping
-        // rank-local exception so a peer can never hang in a later boundary
-        // collective. Catch-and-inspect validation belongs to the singleton
-        // regression; a separate expected-failure launcher covers MPI aborts.
-        setenv("MEEP_GPU_AUTO_MIN_CELLS", "-1", 1);
-        bool invalid_auto_policy_rejected = false;
-        try {
-          (void)run_case(
-              gpu::backend_mode::automatic, one_dimensional_case);
-        }
-        catch (const std::exception &) {
-          invalid_auto_policy_rejected = true;
-        }
-        require(invalid_auto_policy_rejected,
-                "invalid automatic CUDA threshold was not rejected");
+      bool automatic_backend_rejected = false;
+      try {
+        gpu::set_backend(static_cast<gpu::backend_mode>(1));
       }
-      if (had_saved_auto_minimum)
-        setenv(
-            "MEEP_GPU_AUTO_MIN_CELLS",
-            saved_auto_minimum_value.c_str(), 1);
-      else
-        unsetenv("MEEP_GPU_AUTO_MIN_CELLS");
+      catch (const std::invalid_argument &) {
+        automatic_backend_rejected = true;
+      }
+      require(automatic_backend_rejected &&
+                  gpu::requested_backend() == gpu::backend_mode::cuda &&
+                  gpu::active_backend() == gpu::backend_mode::cuda,
+              "gpmeep v1.1.0 automatic-backend rejection was not "
+              "transactional");
 
       if (std::getenv("MEEP_GPU_TEST_DFT_NORM_ONLY")) {
         require_dft_norm_reduction();
@@ -21462,18 +24376,7 @@ int main(int argc, char **argv) {
       require(cpu.statistics.cuda_curl_calls == 0,
               "CPU reference unexpectedly dispatched CUDA");
 
-      if (!cuda_available) {
-        if (automatic_fallback_expected) {
-          const run_result automatic =
-              run_case(gpu::backend_mode::automatic, which);
-          compare_results(cpu, automatic, which);
-          require(automatic.statistics.cpu_curl_calls > 0,
-                  "automatic fallback dispatched no CPU curl updates");
-          require(automatic.statistics.cuda_curl_calls == 0,
-                  "automatic fallback unexpectedly dispatched CUDA");
-        }
-        continue;
-      }
+      if (!cuda_available) continue;
 
       const run_result cuda = run_case(gpu::backend_mode::cuda, which);
       compare_results(cpu, cuda, which);
@@ -21674,33 +24577,7 @@ int main(int argc, char **argv) {
     for (bool complex_bloch : material_complex_cases) {
       const run_result cpu_material =
           run_material_case(gpu::backend_mode::cpu, complex_bloch);
-      if (!cuda_available) {
-        if (automatic_fallback_expected) {
-          const run_result automatic_material =
-              run_material_case(gpu::backend_mode::automatic, complex_bloch);
-          compare_results(cpu_material, automatic_material,
-                          two_dimensional_case);
-          require(automatic_material.statistics.cpu_curl_calls > 0 &&
-                      automatic_material.statistics.cuda_curl_calls == 0,
-                  "automatic material fallback did not use CPU curls");
-          require(automatic_material.field_updates.cpu_update_eh_calls > 0 &&
-                      automatic_material.field_updates.cuda_update_eh_calls == 0,
-                  "automatic material fallback did not use CPU E/H updates");
-          require(automatic_material.polarizations.cpu_update_calls > 0 &&
-                      automatic_material.polarizations.cuda_update_calls == 0,
-                  "automatic material fallback did not use CPU polarizations");
-          require(automatic_material.sources.cpu_update_calls > 0 &&
-                      automatic_material.sources.cuda_update_calls == 0,
-                  "automatic material fallback did not use CPU sources");
-          require(automatic_material.boundaries.cpu_update_calls > 0 &&
-                      automatic_material.boundaries.cuda_update_calls == 0,
-                  "automatic material fallback did not use CPU boundaries");
-          require(automatic_material.dfts.cpu_update_calls > 0 &&
-                      automatic_material.dfts.cuda_update_calls == 0,
-                  "automatic material fallback did not use CPU DFT updates");
-        }
-      }
-      else {
+      if (cuda_available) {
         const run_result cuda_material =
             run_material_case(gpu::backend_mode::cuda, complex_bloch);
         compare_results(cpu_material, cuda_material, two_dimensional_case);
@@ -21727,12 +24604,41 @@ int main(int argc, char **argv) {
         require(cuda_material.resident.device_buffer_allocations > 0 &&
                     cuda_material.resident.device_buffer_reuses > 0,
                 "CUDA material phase did not use resident mirrors");
+
+        // Exercise the globally enabled experiment through the full
+        // production real/complex material path.  This fixture is
+        // anisotropic, so launches are honestly reported as enabled but not
+        // inspectable and must remain numerically identical to the CPU.
+        scoped_environment_override enable_elision(
+            "MEEP_GPU_ENABLE_ZERO_STATE_LORENTZIAN_ELISION", "1");
+        scoped_environment_override disable_elision(
+            "MEEP_GPU_DISABLE_ZERO_STATE_LORENTZIAN_ELISION", nullptr);
+        const run_result enabled_material =
+            run_material_case(gpu::backend_mode::cuda, complex_bloch);
+        compare_results(cpu_material, enabled_material,
+                        two_dimensional_case);
+        require(
+            enabled_material.polarizations
+                    .cuda_zero_state_elision_enabled_calls ==
+                enabled_material.polarizations.cuda_update_calls &&
+                enabled_material.polarizations
+                    .cuda_zero_state_elision_enabled_points ==
+                enabled_material.polarizations.cuda_update_points &&
+                enabled_material.polarizations
+                        .cuda_zero_state_elision_inspectable_calls ==
+                    0 &&
+                enabled_material.polarizations
+                        .cuda_zero_state_elision_inspectable_points ==
+                    0,
+            "enabled anisotropic real/complex material path reported "
+            "incorrect zero-state elision causality");
       }
     }
     if (cuda_available) {
       require_phase_batched_launch_equivalence();
       require_curl_replay_direct_transition_contract();
       require_curl_replay_invalidation_and_failure_contract();
+      require_structured_curl_graph_invalidation_and_failure_contract();
       require_phase_batched_source_split_and_replay_contract();
       require_resident_ldos_reduction_contract();
       require_cuda_tile_coalescing_equivalence();
@@ -21776,17 +24682,15 @@ int main(int argc, char **argv) {
         gpu::backend_mode::cpu, true, false, 0, MEEP_SINGLE != 0);
 
     if (!cuda_available) {
-      if (automatic_fallback_expected) {
-        bool required_cuda_failed = false;
-        try {
-          gpu::set_backend(gpu::backend_mode::cuda);
-        }
-        catch (const std::runtime_error &) {
-          required_cuda_failed = true;
-        }
-        require(required_cuda_failed,
-                "required CUDA mode did not reject an unavailable runtime");
+      bool required_cuda_failed = false;
+      try {
+        gpu::set_backend(gpu::backend_mode::cuda);
       }
+      catch (const std::runtime_error &) {
+        required_cuda_failed = true;
+      }
+      require(required_cuda_failed,
+              "required CUDA mode did not reject an unavailable runtime");
       std::cout << "SKIP: CPU reference passed; uniform MPI CUDA unavailable: "
                 << diagnostic << '\n';
       gpu::set_backend(gpu::backend_mode::cpu);
@@ -21798,18 +24702,16 @@ int main(int argc, char **argv) {
     // collectives. These catch-and-inspect atomicity tests are therefore
     // meaningful only for a single rank.
     if (count_processors() == 1) {
-      require_interleaved_automatic_owner_decisions();
       require_resident_scalar_query(false);
       require_resident_scalar_query(true);
       require_finite_check_plan_lifecycle();
       require_boundary_descriptor_fast_replay_contract();
       require_boundary_event_record_failure_fallback();
+      require_prepared_span_cache_lifecycle();
       require_resident_host_write_transaction();
+      require_material_phasing_mirror_reuse();
       require_unsupported_cylindrical_bfast_is_atomic();
       require_unsupported_polarization_is_atomic();
-      require_automatic_polarization_owner_fallback_is_atomic();
-      require_automatic_owner_revalidates_environment();
-      require_automatic_feature_fallback_recovers();
       require_resized_dft_preflight_is_atomic();
       require_mutated_susceptibility_preflight_is_atomic();
       require_dense_long_field_agreement();

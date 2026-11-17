@@ -20,15 +20,74 @@ def release_manifest(commit="a" * 40):
 
 
 class PackageProvenanceTests(unittest.TestCase):
-    def test_conda_record_requires_exact_v103_build_identity(self):
+    def _v110_installed_gate_files(
+        self, prefix: pathlib.Path
+    ) -> dict[str, pathlib.Path]:
+        share = prefix / "share/gpmeep"
+        paths = {
+            "contract": share / "packaging/v110-development-contract.json",
+            "equal_work_plan": share / "packaging/v110-m4-equal-work-plan.json",
+            "schema": share / "packaging/v110-performance-inversion-record.schema.json",
+            "inventory": share / "packaging/v110-performance-inversion-inventory.json",
+            "receipt": share / "v110-candidate-build-receipt.json",
+            "validator": share / "libexec/validate-v110-development-contract.py",
+            "receipt_tool": share / "libexec/v110-release-gate-receipt.py",
+            "final_receipt_tool": share / "libexec/v110-final-release-receipt.py",
+            "closure_tool": share / "libexec/close-v110-inversion-registry.py",
+        }
+        for path in paths.values():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("fixture\n", encoding="utf-8")
+        return paths
+
+    def test_installed_v110_verifier_does_not_run_source_tree_preflight(self):
+        with tempfile.TemporaryDirectory() as directory:
+            prefix = pathlib.Path(directory)
+            paths = self._v110_installed_gate_files(prefix)
+            with mock.patch.object(
+                MODULE, "_SCRIPT_DIRECTORY", prefix / "share/gpmeep/libexec"
+            ), mock.patch.object(MODULE, "_run_v110_validator") as validator:
+                result = MODULE._validate_v110_development_contract(prefix)
+            validator.assert_called_once_with(
+                paths["contract"], paths["validator"], "--installed-package"
+            )
+            self.assertEqual(result["equal_work_plan"], paths["equal_work_plan"])
+
+    def test_source_v110_verifier_runs_source_and_installed_preflights(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            source = root / "source"
+            prefix = root / "prefix"
+            source_contract = source / "packaging/v110-development-contract.json"
+            source_validator = source / "scripts/validate-v110-development-contract.py"
+            source_contract.parent.mkdir(parents=True)
+            source_validator.parent.mkdir(parents=True)
+            source_contract.write_text("fixture\n", encoding="utf-8")
+            source_validator.write_text("fixture\n", encoding="utf-8")
+            paths = self._v110_installed_gate_files(prefix)
+            with mock.patch.object(
+                MODULE, "_SCRIPT_DIRECTORY", source / "scripts"
+            ), mock.patch.object(MODULE, "_run_v110_validator") as validator:
+                MODULE._validate_v110_development_contract(prefix)
+            self.assertEqual(
+                validator.call_args_list,
+                [
+                    mock.call(source_contract, source_validator, "--contract-only"),
+                    mock.call(
+                        paths["contract"], paths["validator"], "--installed-package"
+                    ),
+                ],
+            )
+
+    def test_conda_record_requires_exact_current_build_identity(self):
         with tempfile.TemporaryDirectory() as directory:
             prefix = pathlib.Path(directory)
             metadata = prefix / "conda-meta"
             metadata.mkdir()
-            path = metadata / "gpmeep-1.0.3-cuda124_mpi_openmpi_py311_0.json"
+            path = metadata / "gpmeep-1.1.0-cuda124_mpi_openmpi_py311_0.json"
             valid = {
                 "name": "gpmeep",
-                "version": "1.0.3",
+                "version": "1.1.0",
                 "build_number": 0,
                 "build": "cuda124_mpi_openmpi_py311_0",
                 "subdir": "linux-64",
@@ -37,6 +96,15 @@ class PackageProvenanceTests(unittest.TestCase):
             selected, record = MODULE._one_conda_record(prefix)
             self.assertEqual(selected, path)
             self.assertEqual(record, valid)
+
+            development = {
+                **valid,
+                "build": "cuda124_mpi_openmpi_py311_0_development",
+            }
+            path.write_text(json.dumps(development), encoding="utf-8")
+            selected, record = MODULE._one_conda_record(prefix)
+            self.assertEqual(selected, path)
+            self.assertEqual(record, development)
 
             mutations = {
                 "stale_build_number": {"build_number": 1},
@@ -53,6 +121,14 @@ class PackageProvenanceTests(unittest.TestCase):
                         MODULE.VerificationError, "conda build identity"
                     ):
                         MODULE._one_conda_record(prefix)
+
+            path.unlink()
+            stale = metadata / "gpmeep-1.0.3-cuda124_mpi_openmpi_py311_0.json"
+            stale.write_text(json.dumps({**valid, "version": "1.0.3"}))
+            with self.assertRaisesRegex(
+                MODULE.VerificationError, "expected one gpmeep 1.1.0 conda record"
+            ):
+                MODULE._one_conda_record(prefix)
 
     def test_package_record_sha_is_valid_and_expected(self):
         digest = "a" * 64

@@ -60,7 +60,9 @@ MAXIMUM_ABS = {
 }
 
 
-def build_oracle_argv(example: pathlib.Path) -> list[str]:
+def build_oracle_argv(
+    example: pathlib.Path, acknowledgement_reason: str | None = None
+) -> list[str]:
     """Returns the complete generic-oracle contract for this profile."""
     arguments = [
         "--expected-run-count",
@@ -72,6 +74,11 @@ def build_oracle_argv(example: pathlib.Path) -> list[str]:
         "--min-each-dft-norm",
         "1e-10",
     ]
+    if acknowledgement_reason is not None:
+        arguments[:0] = [
+            "--acknowledge-backend-mismatch-reason",
+            acknowledgement_reason,
+        ]
     for timestep_delta in EXPECTED_TIMESTEP_DELTAS:
         arguments.extend(
             [
@@ -97,7 +104,11 @@ def build_oracle_argv(example: pathlib.Path) -> list[str]:
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(allow_abbrev=False)
+    parser.add_argument(
+        "--acknowledge-backend-mismatch-reason",
+        type=run_example_oracle.acknowledgement_reason,
+    )
     parser.add_argument("example", type=pathlib.Path)
     args = parser.parse_args(argv)
     if not args.example.is_file() or args.example.name != "point_dipole_cyl.py":
@@ -107,7 +118,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
-    return run_example_oracle.main(build_oracle_argv(args.example))
+    return run_example_oracle.main(
+        build_oracle_argv(
+            args.example,
+            acknowledgement_reason=args.acknowledge_backend_mismatch_reason,
+        )
+    )
 
 
 if __name__ == "__main__":

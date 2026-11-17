@@ -924,12 +924,22 @@ class MpiAdjointRunnerTests(unittest.TestCase):
         worker_entry = source.index(
             'if [[ "${BUILD_STAGE}" != "audited-worker" || "$#" -ne 0 ]]'
         )
-        force_reinstall = source.index("--force-reinstall", worker_entry)
-        no_pyc = source.index("--no-pyc", force_reinstall)
-        normalize_bytecode = source.index(
-            '"${SCRIPT_DIR}/normalize-conda-generated-bytecode.py"', no_pyc
+        package_set = source.index('"${MAMBA}" --no-rc list', worker_entry)
+        explicit_hashes = source.index("--explicit --sha256", package_set)
+        package_set_compare = source.index(
+            '"${LOCK_PACKAGE_SET_TEMP}" "${PREFIX_PACKAGE_SET_TEMP}"',
+            explicit_hashes,
         )
-        byte_audit = source.index('"${SCRIPT_DIR}/audit-conda-prefix.py"', force_reinstall)
+        archive_staging = source.index(
+            '"${SCRIPT_DIR}/stage-conda-lock-archives.py"', package_set_compare
+        )
+        normalize_bytecode = source.index(
+            '"${SCRIPT_DIR}/normalize-conda-generated-bytecode.py"',
+            archive_staging,
+        )
+        byte_audit = source.index(
+            '"${SCRIPT_DIR}/audit-conda-prefix.py"', archive_staging
+        )
         issue_attestation = source.index(
             '"${FRESH_ATTESTATION_SCRIPT}" create', byte_audit
         )
@@ -939,6 +949,7 @@ class MpiAdjointRunnerTests(unittest.TestCase):
         worker_prefix = source[worker_entry:canonical_capture]
         self.assertIn('if [[ "${PWD}" != "${REPO_ROOT}" ]]', worker_prefix)
         self.assertNotIn('cd "${REPO_ROOT}"', worker_prefix)
+        self.assertNotIn("--force-reinstall", worker_prefix)
         actual_capture = source.index(
             '"${SCRIPT_DIR}/capture-build-environment.py"', canonical_capture + 1
         )
@@ -956,9 +967,9 @@ class MpiAdjointRunnerTests(unittest.TestCase):
         first_qualification = source.index(
             'in-place-singleton-import.log', fontconfig_export
         )
-        self.assertLess(force_reinstall, byte_audit)
-        self.assertLess(no_pyc, byte_audit)
-        self.assertLess(no_pyc, normalize_bytecode)
+        self.assertLess(package_set, package_set_compare)
+        self.assertLess(package_set_compare, archive_staging)
+        self.assertLess(archive_staging, byte_audit)
         self.assertLess(normalize_bytecode, byte_audit)
         self.assertLess(byte_audit, issue_attestation)
         self.assertLess(issue_attestation, canonical_capture)
@@ -970,7 +981,12 @@ class MpiAdjointRunnerTests(unittest.TestCase):
         self.assertLess(build, cuda_cache_disable)
         self.assertLess(cuda_cache_disable, fontconfig_export)
         self.assertLess(fontconfig_export, first_qualification)
-        self.assertIn("--safety-checks enabled --extra-safety-checks", source)
+        environment_creator = (SCRIPTS / "create-env.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("--no-pyc", environment_creator)
+        self.assertIn("--safety-checks enabled", environment_creator)
+        self.assertIn("--extra-safety-checks", environment_creator)
         self.assertIn(
             '/usr/bin/grep -aFq -- "${required_diagnostic}" "${log}"', source
         )
@@ -4298,9 +4314,14 @@ class MpiAdjointRunnerTests(unittest.TestCase):
             terminated = False
             for _ in range(20):
                 status = pathlib.Path(f"/proc/{child_pid}/status")
-                if not status.exists() or "State:\tZ" in status.read_text(
-                    encoding="utf-8", errors="replace"
-                ):
+                try:
+                    process_status = status.read_text(
+                        encoding="utf-8", errors="replace"
+                    )
+                except (FileNotFoundError, ProcessLookupError):
+                    terminated = True
+                    break
+                if "State:\tZ" in process_status:
                     terminated = True
                     break
                 time.sleep(0.05)

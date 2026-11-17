@@ -35,6 +35,7 @@ from common import (  # noqa: E402
     WorkloadError,
     absolute_file_record,
     atomic_write_json,
+    durable_publish_terminal,
     file_record,
 )
 
@@ -1002,7 +1003,7 @@ def publish_terminal(output: pathlib.Path, report: dict[str, Any]) -> None:
         output / "PENDING_PERFORMANCE_COMPLETE", _terminal_payload(output, report)
     )
     verify_complete(output, "PENDING_PERFORMANCE_COMPLETE")
-    os.replace(
+    durable_publish_terminal(
         output / "PENDING_PERFORMANCE_COMPLETE", output / "PERFORMANCE_COMPLETE"
     )
 
@@ -1265,7 +1266,7 @@ def main(argv: list[str] | None = None) -> int:
         }
         if (output / "JOURNAL.json").is_file():
             failure["journal"] = file_record(output / "JOURNAL.json", output)
-        atomic_write_json(output / "FAILED.json", failure)
+        matrix.publish_failure_record(output, failure)
         raise
     finally:
         for stable in code_stables.values():

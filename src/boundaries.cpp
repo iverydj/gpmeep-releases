@@ -79,6 +79,7 @@ comms_sequence optimize_comms_operations(const std::vector<comms_operation> &ope
 
 void fields::set_boundary(boundary_side b, direction d, boundary_condition cond) {
   if (boundaries[b][d] != cond) {
+    gpmeep_note_state_mutation();
     boundaries[b][d] = cond;
     // If it's periodic, the boundary condition on the opposite side must be the same.
     if (cond == Periodic || boundaries[1 - b][d] == Periodic) boundaries[1 - b][d] = cond;
@@ -89,6 +90,7 @@ void fields::set_boundary(boundary_side b, direction d, boundary_condition cond)
 }
 
 void fields::use_bloch(direction d, complex<double> kk) {
+  gpmeep_note_state_mutation();
   k[d] = kk;
   for (int b = 0; b < 2; b++)
     set_boundary(boundary_side(b), d, Periodic);

@@ -96,6 +96,9 @@ if [[ "${STAGE}" == "bootstrap" ]]; then
     --no-rc create --yes --safety-checks enabled \
     --extra-safety-checks --root-prefix "${MAMBA_ROOT}" \
     --prefix "${ENV_PREFIX}" --file "${LOCK}"
+  "${CLEAN_BOOTSTRAP_ENV[@]}" /usr/bin/python3 -S -P -B \
+    "${SCRIPT_DIR}/stage-conda-lock-archives.py" \
+    --lock "${LOCK}" --package-cache "${PACKAGE_CACHE}"
 
   exec "${CLEAN_BOOTSTRAP_ENV[@]}" \
     "GPMEEP_MICROMAMBA=${MAMBA}" \
@@ -180,6 +183,48 @@ if ! /usr/bin/diff -u "${EXPECTED_LOCK}" "${INSTALLED_LOCK}"; then
 fi
 cleanup_lock_audit
 trap - EXIT
+
+# Materialize one deterministic source-derived bytecode state before any
+# package import is allowed to participate in an authoritative CPU receipt.
+# The archive audit first proves which bytecode paths are package-declared;
+# the normalizer then derives every cache entry from the installed source and
+# a pinned prefix interpreter. The receipt verifier reproduces the terminal
+# audit, so an import-time rewrite cannot be sealed unnoticed.
+PREFIX_GENERATED_BYTECODE_NORMALIZATION=""
+PREFIX_PRE_NORMALIZATION_AUDIT=""
+PREFIX_PREPARATION_PASSED=0
+for prefix_preparation_attempt in 1 2 3; do
+  PREFIX_GENERATED_BYTECODE_NORMALIZATION="${MAMBA_ROOT}/cache/cpu-mpi-generated-bytecode-normalization.$$.${prefix_preparation_attempt}.json"
+  PREFIX_PRE_NORMALIZATION_AUDIT="${MAMBA_ROOT}/cache/cpu-mpi-prefix-pre-normalization-audit.$$.${prefix_preparation_attempt}.json"
+  if /usr/bin/python3 -S -P -B \
+      "${SCRIPT_DIR}/normalize-conda-generated-bytecode.py" \
+      --prefix "${ENV_PREFIX}" \
+      --output "${PREFIX_GENERATED_BYTECODE_NORMALIZATION}" && \
+    /usr/bin/python3 -S -P -B "${SCRIPT_DIR}/audit-conda-prefix.py" \
+      --prefix "${ENV_PREFIX}" --lock "${LOCK}" \
+      --package-cache "${PACKAGE_CACHE}" \
+      --output "${PREFIX_PRE_NORMALIZATION_AUDIT}"; then
+    PREFIX_PREPARATION_PASSED=1
+    break
+  fi
+  echo "warning: CPU prefix bytecode preparation attempt ${prefix_preparation_attempt}/3 did not stabilize" >&2
+done
+if [[ "${PREFIX_PREPARATION_PASSED}" -ne 1 ]]; then
+  echo "error: CPU prefix bytecode preparation did not stabilize" >&2
+  exit 1
+fi
+PREFIX_SOURCE_BYTECODE_NORMALIZATION="${MAMBA_ROOT}/cache/cpu-mpi-source-bytecode-normalization.$$.json"
+/usr/bin/python3 -S -P -B \
+  "${SCRIPT_DIR}/normalize-conda-relocated-bytecode.py" \
+  --prefix "${ENV_PREFIX}" \
+  --pre-audit "${PREFIX_PRE_NORMALIZATION_AUDIT}" \
+  --compiler "${SCRIPT_DIR}/compile-conda-relocated-bytecode.py" \
+  --output "${PREFIX_SOURCE_BYTECODE_NORMALIZATION}"
+PREFIX_NORMALIZED_CONTENT_AUDIT="${MAMBA_ROOT}/cache/cpu-mpi-prefix-normalized-content-audit.$$.json"
+/usr/bin/python3 -S -P -B "${SCRIPT_DIR}/audit-conda-prefix.py" \
+  --prefix "${ENV_PREFIX}" --lock "${LOCK}" \
+  --package-cache "${PACKAGE_CACHE}" \
+  --output "${PREFIX_NORMALIZED_CONTENT_AUDIT}"
 
 HDF5_CONFIGURATION="$(h5pcc -showconfig)"
 if [[ "${HDF5_CONFIGURATION}" != *"Parallel HDF5: yes"* ]]; then

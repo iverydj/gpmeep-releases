@@ -150,6 +150,7 @@ void fields_chunk::average_with_backup(component c) {
 }
 
 void fields::synchronize_magnetic_fields() {
+  gpmeep_note_state_mutation();
   if (synchronized_magnetic_fields++) return; // already synched
   for (int i = 0; i < num_chunks; i++)
     if (chunks[i]->is_mine()) {
@@ -173,6 +174,7 @@ void fields::synchronize_magnetic_fields() {
 }
 
 void fields::restore_magnetic_fields() {
+  gpmeep_note_state_mutation();
   if (!synchronized_magnetic_fields      // already restored
       || --synchronized_magnetic_fields) // not ready to restore yet
     return;
@@ -231,6 +233,7 @@ flux_vol *fields::add_flux_vol(direction d, const volume &where) {
   if (where.dim != gv.dim) meep::abort("invalid dimensionality in add_flux_vol");
   if (d == NO_DIRECTION || coordinate_mismatch(gv.dim, d))
     meep::abort("invalid direction in add_flux_vol");
+  gpmeep_note_state_mutation();
   return new flux_vol(this, d, where);
 }
 

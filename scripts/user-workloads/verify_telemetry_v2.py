@@ -10,6 +10,7 @@ import math
 import os
 import pathlib
 import statistics
+import stat
 import sys
 from typing import Any
 
@@ -18,7 +19,8 @@ HOST_SAMPLE_SCHEMA = "gpmeep-host-process-telemetry-sample-v2"
 HOST_COMPLETE_SCHEMA = "gpmeep-host-process-telemetry-complete-v2"
 GPU_SAMPLE_SCHEMA = "gpmeep-gpu-telemetry-sample-v3"
 GPU_COMPLETE_SCHEMA = "gpmeep-gpu-telemetry-complete-v3"
-REPORT_SCHEMA = "gpmeep-telemetry-replay-v3"
+REPORT_SCHEMA = "gpmeep-telemetry-replay-v4"
+HOST_REPLAY_SCHEMA = "gpmeep-host-telemetry-replay-v3"
 UNSUPPORTED_VALUES = {"n/a", "not available", "not supported", "unsupported"}
 GPU_REQUIRED_METRICS = {
     "temperature_celsius": "float",
@@ -135,9 +137,98 @@ def atomic_report(path: pathlib.Path, value: dict[str, Any]) -> pathlib.Path:
     return output
 
 
-def read_jsonl(path: pathlib.Path) -> tuple[pathlib.Path, bytes, list[dict[str, Any]]]:
-    resolved = path.resolve(strict=True)
-    payload = resolved.read_bytes()
+def _stable_read_bytes(
+    path: pathlib.Path, name: str
+) -> tuple[pathlib.Path, bytes, tuple[int, ...]]:
+    """Read one non-symlink file and seal its inode and parent name."""
+
+    absolute = pathlib.Path(os.path.abspath(os.fspath(path)))
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        descriptor = os.open(absolute, flags)
+    except OSError as exc:
+        fail(f"could not stably open {name}: {absolute}: {exc}")
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            fail(f"{name} is not a regular file")
+        parent_before = absolute.parent.stat()
+        chunks = []
+        offset = 0
+        while True:
+            block = os.pread(descriptor, 1024 * 1024, offset)
+            if not block:
+                break
+            chunks.append(block)
+            offset += len(block)
+        payload = b"".join(chunks)
+        after = os.fstat(descriptor)
+        try:
+            named = absolute.lstat()
+        except OSError as exc:
+            fail(f"{name} pathname changed while read: {exc}")
+        parent_after = absolute.parent.stat()
+        identity = (
+            before.st_mode,
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+            parent_before.st_dev,
+            parent_before.st_ino,
+            parent_before.st_mtime_ns,
+            parent_before.st_ctime_ns,
+        )
+        after_identity = (
+            after.st_mode,
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+            parent_after.st_dev,
+            parent_after.st_ino,
+            parent_after.st_mtime_ns,
+            parent_after.st_ctime_ns,
+        )
+        if (
+            stat.S_ISLNK(named.st_mode)
+            or (named.st_dev, named.st_ino) != (before.st_dev, before.st_ino)
+            or after_identity != identity
+            or len(payload) != before.st_size
+        ):
+            fail(f"{name} changed while read")
+        return absolute, payload, identity
+    finally:
+        os.close(descriptor)
+
+
+def _verify_stable_snapshot(
+    path: pathlib.Path,
+    payload: bytes,
+    identity: tuple[int, ...],
+    name: str,
+) -> None:
+    current_path, current_payload, current_identity = _stable_read_bytes(
+        path, name
+    )
+    if (
+        current_path != path
+        or current_identity != identity
+        or current_payload != payload
+    ):
+        fail(f"{name} changed during replay")
+
+
+def read_jsonl(
+    path: pathlib.Path, name: str
+) -> tuple[pathlib.Path, bytes, list[dict[str, Any]], tuple[int, ...]]:
+    resolved, payload, identity = _stable_read_bytes(path, name)
     if not payload or not payload.endswith(b"\n"):
         fail(f"final telemetry is empty or lacks a final newline: {resolved}")
     records = []
@@ -149,32 +240,39 @@ def read_jsonl(path: pathlib.Path) -> tuple[pathlib.Path, bytes, list[dict[str, 
         if not isinstance(value, dict):
             fail(f"JSONL record {number} is not an object")
         records.append(value)
-    return resolved, payload, records
+    return resolved, payload, records, identity
 
 
-def load_json(path: pathlib.Path, name: str) -> tuple[pathlib.Path, dict[str, Any]]:
-    resolved = path.resolve(strict=True)
+def load_json(
+    path: pathlib.Path, name: str
+) -> tuple[pathlib.Path, dict[str, Any], bytes, tuple[int, ...]]:
+    resolved, payload, identity = _stable_read_bytes(path, name)
     try:
-        value = json.loads(resolved.read_text(encoding="utf-8"))
+        value = json.loads(payload)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         fail(f"invalid {name} JSON: {exc}")
     if not isinstance(value, dict):
         fail(f"{name} is not an object")
-    return resolved, value
+    return resolved, value, payload, identity
 
 
 def check_file_record(
-    record: Any, path: pathlib.Path, payload: bytes, name: str
+    record: Any,
+    path: pathlib.Path,
+    payload: bytes,
+    identity: tuple[int, ...],
+    name: str,
 ) -> None:
     if not isinstance(record, dict):
         fail(f"{name} file record is not an object")
     recorded_path = nonempty_string(record.get("path"), f"{name}.path")
-    if pathlib.Path(recorded_path).resolve(strict=True) != path.resolve(strict=True):
+    if recorded_path != str(path):
         fail(f"{name} path does not match")
     if exact_int(record.get("size_bytes"), f"{name}.size_bytes") != len(payload):
         fail(f"{name} size does not match")
     if record.get("sha256") != sha256_bytes(payload):
         fail(f"{name} SHA-256 does not match")
+    _verify_stable_snapshot(path, payload, identity, name)
 
 
 def check_bound_file(
@@ -188,12 +286,22 @@ def check_bound_file(
     if not isinstance(before, dict) or not isinstance(after, dict) or before != after:
         fail(f"{name} before/after identity differs")
     path = pathlib.Path(nonempty_string(before.get("path"), f"{name}.path"))
-    resolved = path.resolve(strict=True)
-    payload = resolved.read_bytes()
-    check_file_record(before, resolved, payload, name)
+    resolved, payload, identity = _stable_read_bytes(path, name)
+    check_file_record(before, resolved, payload, identity, name)
     if before.get("sha256") != expected_sha256:
         fail(f"{name} differs from its externally sealed SHA-256")
     return before
+
+
+def _snapshot_recorded_file(
+    record: dict[str, Any], name: str
+) -> tuple[pathlib.Path, bytes, tuple[int, ...], str]:
+    """Capture a validated dependency for the final pair-wide check."""
+
+    path = pathlib.Path(nonempty_string(record.get("path"), f"{name}.path"))
+    stable_path, payload, identity = _stable_read_bytes(path, name)
+    check_file_record(record, stable_path, payload, identity, name)
+    return stable_path, payload, identity, name
 
 
 def gap_summary(times: list[float], name: str) -> dict[str, float | None]:
@@ -220,6 +328,44 @@ def verify_terminal_timing(
     return interval
 
 
+def terminal_root_zombie(
+    processes: list[dict[str, Any]],
+    *,
+    expected_root_pid: int,
+    expected_root_start: int,
+) -> bool:
+    """Recognize only the kernel's final, unreaped root-zombie boundary."""
+
+    if len(processes) != 1:
+        return False
+    root = processes[0]
+    return bool(
+        set(root)
+        == {
+            "pid",
+            "ppid",
+            "pgrp",
+            "state",
+            "start_time_ticks",
+            "processor",
+            "rss_bytes",
+            "comm",
+        }
+        and root.get("pid") == expected_root_pid
+        and type(root.get("ppid")) is int
+        and root["ppid"] > 0
+        and root["ppid"] != expected_root_pid
+        and root.get("pgrp") == expected_root_pid
+        and root.get("start_time_ticks") == expected_root_start
+        and root.get("state") == "Z"
+        and type(root.get("processor")) is int
+        and root["processor"] >= 0
+        and root.get("rss_bytes") == 0
+        and isinstance(root.get("comm"), str)
+        and bool(root["comm"])
+    )
+
+
 def verify_host(
     stream_path: pathlib.Path,
     terminal_path: pathlib.Path,
@@ -231,8 +377,12 @@ def verify_host(
     minimum_cgroup_free_bytes: int,
     maximum_temperature_millidegrees: int,
 ) -> dict[str, Any]:
-    stream, payload, records = read_jsonl(stream_path)
-    _terminal_file, terminal = load_json(terminal_path, "host terminal")
+    stream, payload, records, stream_identity = read_jsonl(
+        stream_path, "host telemetry"
+    )
+    terminal_file, terminal, terminal_payload, terminal_identity = load_json(
+        terminal_path, "host terminal"
+    )
     if expected_root_pid <= 1 or not expected_label:
         fail("host replay external process identity is invalid")
     if minimum_available_bytes < 0 or minimum_cgroup_free_bytes < 0:
@@ -255,6 +405,7 @@ def verify_host(
     cgroup_path: str | None = None
     host_capacity: tuple[int, int] | None = None
     cgroup_capacity: tuple[int | None, int | None] | None = None
+    terminal_root_zombie_observed = False
 
     for sequence, record in enumerate(records):
         prefix = f"host[{sequence}]"
@@ -280,6 +431,8 @@ def verify_host(
             fail(f"{prefix}.root_alive is not Boolean")
         if seen_dead and alive:
             fail("host root became alive after a terminal sample")
+        if not alive and sequence != len(records) - 1:
+            fail("host root exited before the final sample")
         seen_dead = seen_dead or not alive
         alive_samples += int(alive)
 
@@ -331,7 +484,17 @@ def verify_host(
         ):
             fail(f"{prefix} root process identity differs from the stream")
         if not alive and processes:
-            fail(f"{prefix} retains processes after the root exited")
+            exact_terminal_zombie = bool(
+                sequence == len(records) - 1
+                and terminal_root_zombie(
+                    processes,
+                    expected_root_pid=expected_root_pid,
+                    expected_root_start=root_start,
+                )
+            )
+            if not exact_terminal_zombie:
+                fail(f"{prefix} retains processes after the root exited")
+            terminal_root_zombie_observed = True
         if alive:
             for pid in pids:
                 if pid == expected_root_pid:
@@ -487,15 +650,21 @@ def verify_host(
     ):
         fail("host terminal sample count differs from the stream")
     verify_terminal_timing(terminal, times, "host terminal")
-    check_file_record(terminal.get("telemetry"), stream, payload, "host telemetry")
+    check_file_record(
+        terminal.get("telemetry"),
+        stream,
+        payload,
+        stream_identity,
+        "host telemetry",
+    )
     monitor = check_bound_file(
         terminal.get("monitor_source_before"),
         terminal.get("monitor_source_after"),
         expected_monitor_sha256,
         "host monitor",
     )
-    return {
-        "schema": "gpmeep-host-telemetry-replay-v2",
+    result = {
+        "schema": HOST_REPLAY_SCHEMA,
         "status": "PASS",
         "path": str(stream),
         "sha256": sha256_bytes(payload),
@@ -517,8 +686,19 @@ def verify_host(
             {"pid": pid, "start_time_ticks": start}
             for pid, start in sorted(process_identities)
         ],
+        "terminal_root_zombie_observed": terminal_root_zombie_observed,
         "monitor_source": monitor,
     }
+    _verify_stable_snapshot(
+        terminal_file,
+        terminal_payload,
+        terminal_identity,
+        "host terminal",
+    )
+    _verify_stable_snapshot(
+        stream, payload, stream_identity, "host telemetry"
+    )
+    return result
 
 
 def metric_value(metric: Any, kind: str, name: str, *, required: bool) -> Any:
@@ -592,9 +772,14 @@ def verify_gpu(
     expected_process_started_unix_seconds: float | None,
     expected_process_ended_unix_seconds: float | None,
     reject_active_clock_event_reasons: bool,
+    expected_workload_gpu_idle: bool,
 ) -> dict[str, Any]:
-    stream, payload, records = read_jsonl(stream_path)
-    _terminal_file, terminal = load_json(terminal_path, "GPU terminal")
+    stream, payload, records, stream_identity = read_jsonl(
+        stream_path, "GPU telemetry"
+    )
+    terminal_file, terminal, terminal_payload, terminal_identity = load_json(
+        terminal_path, "GPU terminal"
+    )
     if (
         expected_root_pid <= 1
         or expected_root_start_time_ticks <= 0
@@ -611,7 +796,9 @@ def verify_gpu(
         or maximum_temperature_celsius <= 0
     ):
         fail("GPU replay memory or temperature gate is invalid")
-    if not isinstance(reject_active_clock_event_reasons, bool):
+    if not isinstance(reject_active_clock_event_reasons, bool) or not isinstance(
+        expected_workload_gpu_idle, bool
+    ):
         fail("GPU clock-event policy is not Boolean")
     if reject_active_clock_event_reasons and (
         expected_interval_seconds is None
@@ -835,9 +1022,13 @@ def verify_gpu(
         fail("final GPU stream does not end with root_alive=false")
     if alive_samples == 0:
         fail("GPU monitor never observed the workload alive")
-    missing_apps = set(expected_uuids) - observed_workload_uuids
-    if missing_apps:
-        fail(f"GPU workload process was never observed on: {sorted(missing_apps)}")
+    if expected_workload_gpu_idle:
+        if observed_apps or observed_workload_uuids:
+            fail("GPU-idle workload created a compute application")
+    else:
+        missing_apps = set(expected_uuids) - observed_workload_uuids
+        if missing_apps:
+            fail(f"GPU workload process was never observed on: {sorted(missing_apps)}")
     gap_summary(times, "GPU wall-clock capture")
     gap = gap_summary(monotonic_times, "GPU monotonic capture")
     if terminal.get("schema") != GPU_COMPLETE_SCHEMA:
@@ -898,7 +1089,13 @@ def verify_gpu(
             fail("GPU process coverage bounds are reversed")
         if times[0] > process_started + maximum_gap:
             fail("GPU telemetry has a start-coverage gap")
-        if times[-1] < process_ended:
+        # The monitor observes root_alive=false before the controller can finish
+        # draining the workload pipe and timestamp its wait result.  Therefore
+        # the final dead-root sample may legitimately precede the controller's
+        # bookkeeping timestamp by a fraction of a sampling interval.  Keep the
+        # check fail-closed, but apply the same cadence-derived bound used for
+        # start coverage instead of requiring an impossible zero-lag ordering.
+        if times[-1] + maximum_gap < process_ended:
             fail("GPU telemetry has an end-coverage gap")
         coverage = {
             "process_started_unix_seconds": process_started,
@@ -908,7 +1105,13 @@ def verify_gpu(
             "end_tail_seconds": times[-1] - process_ended,
             "outcome": "PASS",
         }
-    check_file_record(terminal.get("telemetry"), stream, payload, "GPU telemetry")
+    check_file_record(
+        terminal.get("telemetry"),
+        stream,
+        payload,
+        stream_identity,
+        "GPU telemetry",
+    )
     monitor = check_bound_file(
         terminal.get("monitor_source_before"),
         terminal.get("monitor_source_after"),
@@ -921,13 +1124,14 @@ def verify_gpu(
         expected_nvidia_smi_sha256,
         "nvidia-smi",
     )
-    return {
+    result = {
         "schema": "gpmeep-gpu-telemetry-replay-v3",
         "status": "PASS",
         "path": str(stream),
         "sha256": sha256_bytes(payload),
         "sample_count": len(records),
         "alive_sample_count": alive_samples,
+        "expected_workload_gpu_idle": expected_workload_gpu_idle,
         "root_pid": expected_root_pid,
         "root_start_time_ticks": expected_root_start_time_ticks,
         "label": expected_label,
@@ -950,6 +1154,16 @@ def verify_gpu(
         "monitor_source": monitor,
         "nvidia_smi": nvidia_smi,
     }
+    _verify_stable_snapshot(
+        terminal_file,
+        terminal_payload,
+        terminal_identity,
+        "GPU terminal",
+    )
+    _verify_stable_snapshot(
+        stream, payload, stream_identity, "GPU telemetry"
+    )
+    return result
 
 
 def verify_pair(
@@ -973,7 +1187,51 @@ def verify_pair(
     expected_process_started_unix_seconds: float | None = None,
     expected_process_ended_unix_seconds: float | None = None,
     reject_active_clock_event_reasons: bool = False,
+    expected_workload_gpu_idle: bool = False,
 ) -> dict[str, Any]:
+    if not isinstance(expected_workload_gpu_idle, bool):
+        fail("GPU-idle expectation is not Boolean")
+    if (gpu_stream is None) != (gpu_terminal is None):
+        fail("GPU stream and terminal must be supplied together")
+    if expected_workload_gpu_idle and gpu_stream is None:
+        fail("GPU-idle proof requires GPU telemetry")
+    if gpu_stream is None and (
+        expected_gpu_uuids
+        or expected_gpu_monitor_sha256
+        or expected_nvidia_smi_sha256
+    ):
+        fail("GPU external seals were supplied without GPU telemetry")
+
+    verifier_path = pathlib.Path(__file__).resolve(strict=True)
+    (
+        verifier_path,
+        verifier_payload,
+        verifier_identity,
+    ) = _stable_read_bytes(verifier_path, "pair verifier source")
+    primary_snapshots = [
+        (
+            *_stable_read_bytes(host_stream, "pair host telemetry"),
+            "pair host telemetry",
+        ),
+        (
+            *_stable_read_bytes(host_terminal, "pair host terminal"),
+            "pair host terminal",
+        ),
+    ]
+    if gpu_stream is not None and gpu_terminal is not None:
+        primary_snapshots.extend(
+            [
+                (
+                    *_stable_read_bytes(gpu_stream, "pair GPU telemetry"),
+                    "pair GPU telemetry",
+                ),
+                (
+                    *_stable_read_bytes(gpu_terminal, "pair GPU terminal"),
+                    "pair GPU terminal",
+                ),
+            ]
+        )
+
     host = verify_host(
         host_stream,
         host_terminal,
@@ -984,11 +1242,10 @@ def verify_pair(
         minimum_cgroup_free_bytes=minimum_cgroup_free_bytes,
         maximum_temperature_millidegrees=maximum_host_temperature_millidegrees,
     )
-    if (gpu_stream is None) != (gpu_terminal is None):
-        fail("GPU stream and terminal must be supplied together")
+    dependency_snapshots = [
+        _snapshot_recorded_file(host["monitor_source"], "pair host monitor")
+    ]
     if gpu_stream is None:
-        if expected_gpu_uuids or expected_gpu_monitor_sha256 or expected_nvidia_smi_sha256:
-            fail("GPU external seals were supplied without GPU telemetry")
         gpu = None
     else:
         if expected_gpu_monitor_sha256 is None or expected_nvidia_smi_sha256 is None:
@@ -1011,14 +1268,21 @@ def verify_pair(
             ),
             expected_process_ended_unix_seconds=expected_process_ended_unix_seconds,
             reject_active_clock_event_reasons=reject_active_clock_event_reasons,
+            expected_workload_gpu_idle=expected_workload_gpu_idle,
         )
         if max(
             host["first_capture_unix_seconds"], gpu["first_capture_unix_seconds"]
         ) > min(host["last_capture_unix_seconds"], gpu["last_capture_unix_seconds"]):
             fail("host and GPU telemetry capture intervals do not overlap")
-    verifier_path = pathlib.Path(__file__).resolve(strict=True)
-    verifier_payload = verifier_path.read_bytes()
-    return {
+        dependency_snapshots.extend(
+            [
+                _snapshot_recorded_file(
+                    gpu["monitor_source"], "pair GPU monitor"
+                ),
+                _snapshot_recorded_file(gpu["nvidia_smi"], "pair nvidia-smi"),
+            ]
+        )
+    result = {
         "schema": REPORT_SCHEMA,
         "status": "PASS",
         "host": host,
@@ -1029,6 +1293,17 @@ def verify_pair(
             "sha256": sha256_bytes(verifier_payload),
         },
     }
+    for path, payload, identity, name in (
+        primary_snapshots + dependency_snapshots
+    ):
+        _verify_stable_snapshot(path, payload, identity, name)
+    _verify_stable_snapshot(
+        verifier_path,
+        verifier_payload,
+        verifier_identity,
+        "pair verifier source",
+    )
+    return result
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -1062,6 +1337,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--expected-process-started-unix-seconds", type=float)
     parser.add_argument("--expected-process-ended-unix-seconds", type=float)
     parser.add_argument("--reject-active-clock-event-reasons", action="store_true")
+    parser.add_argument("--expect-workload-gpu-idle", action="store_true")
     parser.add_argument("--output", type=pathlib.Path)
     return parser.parse_args(argv)
 
@@ -1094,6 +1370,7 @@ def main(argv: list[str] | None = None) -> int:
         reject_active_clock_event_reasons=(
             args.reject_active_clock_event_reasons
         ),
+        expected_workload_gpu_idle=args.expect_workload_gpu_idle,
     )
     if args.output is None:
         print(json.dumps(report, allow_nan=False, indent=2, sort_keys=True))

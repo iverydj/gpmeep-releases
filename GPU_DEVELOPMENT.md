@@ -1928,7 +1928,7 @@ A separate production-scale `--benchmark` mode supplies the performance gate.
 It uses the same nine-point phase-map-to-lens workflow and one 801-cell lens,
 with identical resolution, simulation duration, and physical outputs on an
 i9-11900K's eight physical cores and one RTX 3090 Ti (GPU ordinal 0, UUID
-`GPU-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee`). The eight-rank CPU run is bound
+`GPU-00000000-0000-0000-0000-000000009001`). The eight-rank CPU run is bound
 one rank per core with one thread per rank. Meep's reported in-process elapsed
 intervals are 100.5220 seconds for CPU and 25.7925 seconds for CUDA, or a
 3.8973x speedup. The focus location is identical; the relative differences in
@@ -2169,7 +2169,7 @@ not release evidence.
 ## M16 phase-batch production policy
 
 This section records the historical M16 decision. It is superseded for curl
-and constitutive E/H work by the M25 automatic policy below. Indexed source
+and constitutive E/H work by the M25 production-safe policy below. Indexed source
 batching remains under the M16 opt-in rule.
 
 At M16, the cross-operation curl and constitutive E/H phase kernels remained
@@ -2608,19 +2608,20 @@ dispatch and correctness only; performance acceptance remains a separate
 production-scale benchmark milestone. The reproducible receipt is preserved
 under `artifacts/near2far/m23-cyl-cartesian-qualification-20260814`.
 
-### M25 automatic curl/E/H phase batching
+### M25 production-safe curl/E/H phase batching
 
-Unset curl and constitutive E/H phase controls now select an automatic,
-topology-aware policy. The exact value `1` for
-`MEEP_GPU_ENABLE_PHASE_BATCHED_CURL` or
+Unset curl controls now fail closed to the ordinary structured CUDA kernels.
+Unset constitutive E/H controls retain the topology-aware automatic policy.
+The exact value `1` for `MEEP_GPU_ENABLE_PHASE_BATCHED_CURL` or
 `MEEP_GPU_ENABLE_PHASE_BATCHED_UPDATE_EH` still forces the corresponding
-cross-operation kernel. Any other present enable value disables that path,
-and the matching `MEEP_GPU_DISABLE_*` variable takes precedence whenever it
-is present. Indexed source batching is deliberately unchanged and remains
-exact-opt-in only.
+cross-operation kernel for qualification and expert diagnostics. Any other
+present enable value disables that path, and the matching
+`MEEP_GPU_DISABLE_*` variable takes precedence whenever it is present.
+Indexed source batching is deliberately unchanged and remains exact-opt-in
+only.
 
-The automatic decision is made independently for every collected phase from
-the work that will actually launch. It requires at least four operations,
+The E/H automatic decision is made independently for every collected phase
+from the work that will actually launch. It requires at least four operations,
 sums `ceil(point_count / 256)` over those operations, and batches when that
 logical-block count is no greater than
 `operation_count * multiprocessor_count * 24`. The selected CUDA device's SM
@@ -2641,8 +2642,11 @@ reduces the same 12 counters into the exact
 which policy executed instead of inferring it from a launch-count reduction.
 
 The dedicated `scripts/benchmark-phase-batch-policy.py` controller compares
-automatic, disabled, and forced modes at 128-cubed and 256-cubed on one and
-two GPUs. It rotates condition order across six repeats so every condition
+the production default (historically named `automatic` in the evidence
+schema), fully disabled, and forced modes at 128-cubed and 256-cubed on one
+and two GPUs. The production lane requires all curl phase-policy counters to
+remain zero and validates the E/H automatic accounting. It rotates condition
+order across six repeats so every condition
 occupies each execution position exactly twice, holds indexed source
 batching and every other worker setting fixed, requires exact equality of all
 recorded physical observables, rejects any CPU field dispatch, binds each MPI
@@ -2656,18 +2660,24 @@ the fixed library image was preloaded. Rank/PID markers bind continuous GPU
 process-monitor rows to the exact workers and reject even an unrelated
 same-name process. The recursive SHA-256 manifest excludes terminal markers,
 and `COMPLETE.json` is published last while binding the manifest, summary,
-and report hashes, so COMPLETE and FAILED cannot coexist. Its predeclared performance gates
-require at least a `1.15x` median paired disabled/automatic time ratio at
-128-cubed and no more than a `1.02x` median paired automatic/disabled or
-automatic/forced time ratio at 256-cubed.
+and report hashes, so COMPLETE and FAILED cannot coexist. Its predeclared
+performance gates require the production-default lane to be no more than
+`1.02x` slower than either fully disabled or forced mode at every grid size
+and GPU count. This no-regression gate deliberately does not require an
+arbitrary minimum speedup.
 
-A preliminary three-repeat RTX 3090 Ti development run, before final receipt
-sealing, measured disabled/automatic median ratios of `1.43783x` on one GPU
-and `1.31588x` on two GPUs at 128-cubed. The corresponding 256-cubed ratios
-were `1.00307x` and `1.00111x`; automatic mode avoided the one-GPU forced-mode
-time increase of `1.01799x`. Every compared checksum and DFT norm was exactly
-identical. These values are implementation-development evidence only until
-the receipt-bound controller completes and its evidence anchor is committed.
+The earlier unsealed development result that appeared to favor automatic curl
+collection was invalidated by the clean receipt-bound M2 run. On receipt
+`9b21a593506b90628c0f380ebd9129a2b222cce9fc7dc07db4608f0086c9cd90`,
+the 128³ one-GPU measured-step times were `0.151118 s` with both paths
+disabled, `0.754692 s` with curl automatic and E/H disabled, `0.146437 s`
+with curl disabled and E/H automatic, and `0.699423 s` with both forced.
+Curl replay disabled remained slow at `0.712658 s`, proving that global curl
+phase collection rather than replay caused the regression. At 256³, E/H
+automatic rejected every phase and measured `0.563795 s` versus `0.566077 s`
+fully disabled. All recorded physical observables were exactly identical.
+This evidence is why production curl collection is fail-closed while the E/H
+adaptive policy remains enabled.
 
 ### M26 resident multi-monitor DFT batching
 

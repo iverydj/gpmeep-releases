@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""Sealed A/B/C benchmark for automatic CUDA curl/E/H phase batching.
+"""Sealed A/B/C benchmark for production-safe CUDA phase batching.
 
-The three conditions differ only in the curl and update-E/H phase policy:
-automatic leaves both controls unset, disabled uses both opt-outs, and forced
-uses both exact opt-ins.  Source batching is held forced in every condition.
+The production condition (historically named ``automatic`` in the evidence
+schema) leaves both controls unset: curl uses a conservative whole-phase
+topology policy while E/H uses its per-operation topology policy. The two
+controls hold E/H automatic and change curl alone: ``curl-disabled`` disables
+curl collection and ``curl-forced`` forces it. Source batching is held forced
+in every condition.
 """
 
 from __future__ import annotations
@@ -129,11 +132,11 @@ def reexec_immutable_source() -> None:
     )
 POLICY_PREFIX = "gpmeep-phase-batch-policy-v1:"
 PROCESS_PREFIX = "gpmeep-multi-process-v1:"
-CONDITIONS = ("automatic", "disabled", "forced")
+CONDITIONS = ("automatic", "curl-disabled", "curl-forced")
 CONDITION_ORDERS = (
-    ("automatic", "disabled", "forced"),
-    ("disabled", "forced", "automatic"),
-    ("forced", "automatic", "disabled"),
+    ("automatic", "curl-disabled", "curl-forced"),
+    ("curl-disabled", "curl-forced", "automatic"),
+    ("curl-forced", "automatic", "curl-disabled"),
 )
 POLICY_KEYS = {
     "curl_automatic_checks",
@@ -150,9 +153,8 @@ POLICY_KEYS = {
     "update_eh_unbatched_operations",
 }
 OBSERVABLES = BASE.OBSERVABLES
-SMALL_MINIMUM_DISABLED_OVER_AUTOMATIC = 1.15
-LARGE_MAXIMUM_AUTOMATIC_OVER_DISABLED = 1.02
-LARGE_MAXIMUM_AUTOMATIC_OVER_FORCED = 1.02
+MAXIMUM_AUTOMATIC_OVER_CURL_DISABLED = 1.02
+MAXIMUM_AUTOMATIC_OVER_CURL_FORCED = 1.02
 MANIFEST_NAME = "evidence-manifest.json"
 TERMINAL_NAMES = frozenset({"COMPLETE.json", "FAILED.json"})
 
@@ -434,8 +436,13 @@ def print_summary_best_effort(summary: dict[str, Any]) -> None:
 
 def workloads(repeats: int) -> list[dict[str, int]]:
     return [
-        {"pixels": pixels, "warmup_steps": 12, "steps": 80, "repeats": repeats}
-        for pixels in (128, 256)
+        {
+            "pixels": pixels,
+            "warmup_steps": 120 if pixels == 32 else 12,
+            "steps": 800 if pixels == 32 else 80,
+            "repeats": repeats,
+        }
+        for pixels in (32, 128, 256)
     ]
 
 
@@ -476,12 +483,10 @@ def condition_environment(
     }
     for name in controls:
         environment.pop(name, None)
-    if condition == "disabled":
+    if condition == "curl-disabled":
         environment["MEEP_GPU_DISABLE_PHASE_BATCHED_CURL"] = "1"
-        environment["MEEP_GPU_DISABLE_PHASE_BATCHED_UPDATE_EH"] = "1"
-    elif condition == "forced":
+    elif condition == "curl-forced":
         environment["MEEP_GPU_ENABLE_PHASE_BATCHED_CURL"] = "1"
-        environment["MEEP_GPU_ENABLE_PHASE_BATCHED_UPDATE_EH"] = "1"
     return environment
 
 
@@ -504,7 +509,12 @@ def validate_policy(
         forced = policy[f"{prefix}_forced_batches"]
         batched = policy[f"{prefix}_batched_operations"]
         unbatched = policy[f"{prefix}_unbatched_operations"]
-        if condition == "automatic":
+        mode = (
+            "automatic"
+            if prefix == "update_eh" or condition == "automatic"
+            else condition.removeprefix("curl-")
+        )
+        if mode == "automatic":
             if (
                 checks <= 0
                 or selected + rejected != checks
@@ -514,11 +524,37 @@ def validate_policy(
                 raise RuntimeError(
                     f"automatic {prefix} policy accounting is inconsistent"
                 )
-            if pixels == 128 and (selected <= 0 or batched <= 0):
+            if (selected > 0) != (batched > 0):
                 raise RuntimeError(
-                    f"automatic {prefix} policy selected no small-grid batches"
+                    f"automatic {prefix} selected/batched accounting is "
+                    "inconsistent"
                 )
-        elif condition == "disabled":
+            if rejected > 0 and unbatched == 0:
+                raise RuntimeError(
+                    f"automatic {prefix} rejected phases reported no "
+                    "unbatched operations"
+                )
+            if prefix == "curl":
+                if pixels == 32 and (selected <= 0 or batched <= 0):
+                    raise RuntimeError(
+                        "representative launch-bound curl policy selected no batches"
+                    )
+                if pixels in {128, 256} and (
+                    selected != 0
+                    or batched != 0
+                    or rejected <= 0
+                    or unbatched <= 0
+                ):
+                    raise RuntimeError(
+                        "large-grid curl policy did not reject the fused phase"
+                    )
+            if prefix == "update_eh" and pixels == 128 and (
+                selected <= 0 or batched <= 0
+            ):
+                raise RuntimeError(
+                    "automatic update_eh policy selected no small-grid batches"
+                )
+        elif mode == "disabled":
             if any((checks, selected, rejected, forced, batched, unbatched)):
                 raise RuntimeError(
                     f"disabled {prefix} policy reported collected phase work"
@@ -532,14 +568,13 @@ def validate_policy(
             or unbatched != 0
         ):
             raise RuntimeError(f"forced {prefix} policy accounting is inconsistent")
-    if condition == "automatic" and pixels == 256 and ranks == 1:
+    if pixels == 256 and ranks == 1:
         if (
-            policy["curl_automatic_rejected"]
-            + policy["update_eh_automatic_rejected"]
-            <= 0
+            policy["update_eh_automatic_rejected"] <= 0
+            or policy["update_eh_unbatched_operations"] <= 0
         ):
             raise RuntimeError(
-                "one-GPU large-grid automatic policy proved no crossover rejection"
+                "one-GPU large-grid E/H policy proved no crossover rejection"
             )
 
 
@@ -937,20 +972,20 @@ def summarize_configuration(
         for condition, values in seconds.items()
     }
     paired_ratios = {
-        "disabled_over_automatic": [
-            seconds["disabled"][index] / seconds["automatic"][index]
+        "curl_disabled_over_automatic": [
+            seconds["curl-disabled"][index] / seconds["automatic"][index]
             for index in range(configuration["repeats"])
         ],
-        "forced_over_automatic": [
-            seconds["forced"][index] / seconds["automatic"][index]
+        "curl_forced_over_automatic": [
+            seconds["curl-forced"][index] / seconds["automatic"][index]
             for index in range(configuration["repeats"])
         ],
-        "automatic_over_disabled": [
-            seconds["automatic"][index] / seconds["disabled"][index]
+        "automatic_over_curl_disabled": [
+            seconds["automatic"][index] / seconds["curl-disabled"][index]
             for index in range(configuration["repeats"])
         ],
-        "automatic_over_forced": [
-            seconds["automatic"][index] / seconds["forced"][index]
+        "automatic_over_curl_forced": [
+            seconds["automatic"][index] / seconds["curl-forced"][index]
             for index in range(configuration["repeats"])
         ],
     }
@@ -959,38 +994,31 @@ def summarize_configuration(
         for name, values in paired_ratios.items()
     }
     ratio_of_medians = {
-        "disabled_over_automatic": medians["disabled"] / medians["automatic"],
-        "forced_over_automatic": medians["forced"] / medians["automatic"],
-        "automatic_over_disabled": medians["automatic"] / medians["disabled"],
-        "automatic_over_forced": medians["automatic"] / medians["forced"],
+        "curl_disabled_over_automatic": medians["curl-disabled"]
+        / medians["automatic"],
+        "curl_forced_over_automatic": medians["curl-forced"]
+        / medians["automatic"],
+        "automatic_over_curl_disabled": medians["automatic"]
+        / medians["curl-disabled"],
+        "automatic_over_curl_forced": medians["automatic"]
+        / medians["curl-forced"],
     }
-    if configuration["pixels"] == 128:
-        gates = [
-            {
-                "name": "minimum_median_paired_disabled_over_automatic_time_ratio",
-                "threshold": SMALL_MINIMUM_DISABLED_OVER_AUTOMATIC,
-                "observed": ratios["disabled_over_automatic"],
-                "pass": ratios["disabled_over_automatic"]
-                >= SMALL_MINIMUM_DISABLED_OVER_AUTOMATIC,
-            }
-        ]
-    else:
-        gates = [
-            {
-                "name": "maximum_median_paired_automatic_over_disabled_time_ratio",
-                "threshold": LARGE_MAXIMUM_AUTOMATIC_OVER_DISABLED,
-                "observed": ratios["automatic_over_disabled"],
-                "pass": ratios["automatic_over_disabled"]
-                <= LARGE_MAXIMUM_AUTOMATIC_OVER_DISABLED,
-            },
-            {
-                "name": "maximum_median_paired_automatic_over_forced_time_ratio",
-                "threshold": LARGE_MAXIMUM_AUTOMATIC_OVER_FORCED,
-                "observed": ratios["automatic_over_forced"],
-                "pass": ratios["automatic_over_forced"]
-                <= LARGE_MAXIMUM_AUTOMATIC_OVER_FORCED,
-            },
-        ]
+    gates = [
+        {
+            "name": "maximum_median_paired_automatic_over_curl_disabled_time_ratio",
+            "threshold": MAXIMUM_AUTOMATIC_OVER_CURL_DISABLED,
+            "observed": ratios["automatic_over_curl_disabled"],
+            "pass": ratios["automatic_over_curl_disabled"]
+            <= MAXIMUM_AUTOMATIC_OVER_CURL_DISABLED,
+        },
+        {
+            "name": "maximum_median_paired_automatic_over_curl_forced_time_ratio",
+            "threshold": MAXIMUM_AUTOMATIC_OVER_CURL_FORCED,
+            "observed": ratios["automatic_over_curl_forced"],
+            "pass": ratios["automatic_over_curl_forced"]
+            <= MAXIMUM_AUTOMATIC_OVER_CURL_FORCED,
+        },
+    ]
     return {
         "pixels": configuration["pixels"],
         "ranks": configuration["ranks"],
@@ -1009,14 +1037,14 @@ def summarize_configuration(
 
 def render_markdown(summary: dict[str, Any]) -> str:
     lines = [
-        "# M25 automatic CUDA phase-batch benchmark",
+        "# M25 production-safe CUDA phase-batch benchmark",
         "",
         f"- Result: **{'PASS' if summary['pass'] else 'FAIL'}**",
         f"- Samples: `{summary['sample_count']}`",
         f"- Build receipt: `{summary['receipt_id']}`",
         "- Numerical gate: every recorded observable is exactly identical within each configuration.",
         "",
-        "| Grid | GPUs | automatic (s) | disabled (s) | forced (s) | disabled/auto | forced/auto | Result |",
+        "| Grid | GPUs | automatic (s) | curl disabled (s) | curl forced (s) | curl-disabled/auto | curl-forced/auto | Result |",
         "|---:|---:|---:|---:|---:|---:|---:|:---:|",
     ]
     for item in summary["configurations"]:
@@ -1024,16 +1052,16 @@ def render_markdown(summary: dict[str, Any]) -> str:
         ratios = item["median_paired_time_ratios"]
         lines.append(
             f"| {item['pixels']}³ | {item['ranks']} | "
-            f"{median['automatic']:.9f} | {median['disabled']:.9f} | "
-            f"{median['forced']:.9f} | "
-            f"{ratios['disabled_over_automatic']:.4f}× | "
-            f"{ratios['forced_over_automatic']:.4f}× | "
+            f"{median['automatic']:.9f} | {median['curl-disabled']:.9f} | "
+            f"{median['curl-forced']:.9f} | "
+            f"{ratios['curl_disabled_over_automatic']:.4f}× | "
+            f"{ratios['curl_forced_over_automatic']:.4f}× | "
             f"{'PASS' if item['pass'] else 'FAIL'} |"
         )
     lines.extend(
         [
             "",
-            "`disabled/auto > 1` means the automatic policy is faster than per-operation launches. All timings are the worker's synchronized maximum rank time.",
+            "The production-default lane applies separate topology-aware policies to curl and E/H. E/H remains automatic in all three lanes, so automatic versus curl-disabled isolates only the new curl policy. These 128³/256³ stress grids must reject fused curl while still measuring its collection overhead; smaller launch-bound production phases may select it. `curl-disabled/auto > 1` means that production curl selection is faster than ordinary per-operation curl launches. All timings are the worker's synchronized maximum rank time.",
             "",
         ]
     )
@@ -1054,19 +1082,22 @@ def parse_process_monitor(
         if not line.strip() or line.lstrip().startswith("#"):
             continue
         columns = line.split()
-        if len(columns) < 3 or columns[1] == "-":
+        if len(columns) < 3:
+            unrelated_rows.append(line)
             continue
-        command = columns[-1]
+        if columns[1] == "-":
+            continue
         try:
             gpu_index = int(columns[0])
             pid = int(columns[1])
         except ValueError:
             unrelated_rows.append(line)
             continue
-        if (
-            "gpu-mpi-per" in command
-            and expected_pid_to_gpu.get(pid) == gpu_index
-        ):
+        # Recent NVIDIA drivers can omit or corrupt the final command-name
+        # column in `nvidia-smi pmon` output.  The worker reports collected
+        # after every sample provide the authoritative PID/GPU binding, so
+        # classify rows by that exact binding instead of a display-only name.
+        if expected_pid_to_gpu.get(pid) == gpu_index:
             benchmark_rows.append(line)
             previous = observed_pid_to_gpu.setdefault(pid, gpu_index)
             if previous != gpu_index:
@@ -1098,9 +1129,10 @@ def parse_process_monitor(
         alive_before_stop
         and monitor_returncode in {0, -15}
         and not unrelated_rows
-        and observed_gpus == {0, 1}
+        and bool(expected_pid_to_gpu)
+        and observed_gpus == set(expected_pid_to_gpu.values())
         and bool(benchmark_rows)
-        and set(observed_pid_to_gpu).issubset(expected_pid_to_gpu)
+        and observed_pid_to_gpu == expected_pid_to_gpu
     )
     return record
 
@@ -1301,7 +1333,7 @@ def run_authoritative(args: argparse.Namespace) -> int:
     )
     protocol = {
         "schema_version": 1,
-        "protocol_id": "m25-automatic-phase-batch-authoritative-v1",
+        "protocol_id": "m25-production-safe-phase-batch-authoritative-v3",
         "created_at_utc": BASE.utc_now(),
         "receipt_id": receipt["receipt_id"],
         "artifact_set_id": receipt.get("artifact_set_id"),
@@ -1310,9 +1342,15 @@ def run_authoritative(args: argparse.Namespace) -> int:
         "condition_orders": [list(item) for item in CONDITION_ORDERS],
         "source_batching": "forced-identically-in-all-conditions",
         "gates": {
-            "p128_minimum_median_paired_disabled_over_automatic": SMALL_MINIMUM_DISABLED_OVER_AUTOMATIC,
-            "p256_maximum_median_paired_automatic_over_disabled": LARGE_MAXIMUM_AUTOMATIC_OVER_DISABLED,
-            "p256_maximum_median_paired_automatic_over_forced": LARGE_MAXIMUM_AUTOMATIC_OVER_FORCED,
+            "all_sizes_maximum_median_paired_automatic_over_curl_disabled": MAXIMUM_AUTOMATIC_OVER_CURL_DISABLED,
+            "all_sizes_maximum_median_paired_automatic_over_curl_forced": MAXIMUM_AUTOMATIC_OVER_CURL_FORCED,
+            "production_curl_batching": {
+                "mode": "topology-aware-automatic",
+                "minimum_operations": 4,
+                "maximum_phase_blocks_per_sm": 24,
+                "maximum_operation_blocks_per_sm": 12,
+            },
+            "production_update_eh_batching": "topology-aware-automatic",
             "physical_observables": "exact-within-configuration",
             "cpu_field_calls": 0,
             "rank_to_gpu_mapping": "one-distinct-compatible-device-per-rank",

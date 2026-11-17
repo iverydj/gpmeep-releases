@@ -50,7 +50,7 @@ def manifest_value(specification="AUTO", commit="a" * 40):
 class V103FieldFixTests(unittest.TestCase):
     def test_release_identity_and_default_auto_policy(self):
         value = manifest_value()
-        self.assertEqual(MANIFEST.DISTRIBUTION_VERSION, "1.0.3")
+        self.assertEqual(MANIFEST.DISTRIBUTION_VERSION, "1.1.0")
         self.assertEqual(MANIFEST.RELEASE_MANIFEST_SCHEMA_VERSION, 3)
         self.assertEqual(value["glibc_minimum"], "2.17")
         self.assertEqual(value["runtime_validated_architectures"], ["sm86"])
@@ -411,11 +411,11 @@ case "${output}" in
   *fail-rc*) exit 37 ;;
   *broken*)
     /usr/bin/mkdir -p "${output}/broken"
-    printf fixture >"${output}/broken/gpmeep-1.0.3-fixture.conda"
+    printf fixture >"${output}/broken/gpmeep-1.1.0-fixture.conda"
     ;;
   *)
     /usr/bin/mkdir -p "${output}/linux-64"
-    printf fixture >"${output}/linux-64/gpmeep-1.0.3-fixture.conda"
+    printf fixture >"${output}/linux-64/gpmeep-1.1.0-fixture.conda"
     ;;
 esac
 """,
@@ -471,7 +471,7 @@ esac
             passed = run("relative-success")
             self.assertEqual(passed.returncode, 0, passed.stderr)
             expected = (
-                caller / "relative-success/linux-64/gpmeep-1.0.3-fixture.conda"
+                caller / "relative-success/linux-64/gpmeep-1.1.0-fixture.conda"
             ).resolve()
             self.assertTrue(expected.is_file())
             self.assertIn(f"gpmeep-package={expected}", passed.stdout)
@@ -484,8 +484,8 @@ esac
         self.assertIn("{{ stdlib('c') }}", recipe)
         self.assertIn("binary_relocation: false", recipe)
         self.assertIn('c_stdlib_version:\n  - "2.17"', variants)
-        self.assertNotIn("--package dist/linux-64/gpmeep-1.0.3", readme)
-        self.assertIn("downloads/gpmeep-1.0.3", readme)
+        self.assertNotIn("--package dist/linux-64/gpmeep-1.1.0", readme)
+        self.assertIn("downloads/gpmeep-1.1.0", readme)
         self.assertIn("Ubuntu 22.04/glibc 2.35", install_doc)
         self.assertIn(
             "at least one native `-real` target", install_doc.replace("\n", " ")
@@ -496,8 +496,8 @@ esac
                 "-C",
                 str(ROOT),
                 "check-ignore",
-                "downloads/gpmeep-1.0.3-fixture.conda",
-                "downloads/gpmeep-1.0.3-fixture.conda.sha256",
+                "downloads/gpmeep-1.1.0-fixture.conda",
+                "downloads/gpmeep-1.1.0-fixture.conda.sha256",
             ],
             check=False,
             capture_output=True,

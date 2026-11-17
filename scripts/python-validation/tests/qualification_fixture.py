@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import importlib.util
 import os
@@ -11,6 +12,7 @@ from typing import Any
 
 from gpmeep_provenance import file_record
 from gpmeep_qualification_contract import (
+    ACKNOWLEDGEMENT_BINDING_KEYS,
     INSTALLED_CUDA_QUALIFICATION_NAME,
     INSTALLED_CUDA_QUALIFICATION_SPECS,
     INSTALLED_LAZY_API_LOG_NAME,
@@ -19,6 +21,7 @@ from gpmeep_qualification_contract import (
     INSTALLED_MPB_LOG_NAME,
     INSTALLED_MPB_QUALIFICATION_NAME,
     MATERIALIZATION_LOGS,
+    _canonical_sha256,
     marker_for,
 )
 
@@ -219,14 +222,67 @@ def write_synthetic_auxiliary_logs(
     )
     for log_name, spec in INSTALLED_CUDA_QUALIFICATION_SPECS.items():
         suite_file = file_record(repo / str(spec["test_file"]), repo)
+        world_size = int(spec["world_size"])
+        topology = [
+            {
+                "rank": rank,
+                "global_rank": rank,
+                "active_size": world_size,
+                "node_rank": rank,
+                "node_size": world_size,
+                "device_identifier": f"GPU-fixture-{rank}",
+                "device_ordinal": rank,
+            }
+            for rank in range(world_size)
+        ]
+        recommendation = {
+            "schema": "gpmeep-v110-backend-recommendation-v3",
+            "selected_backend": "cuda",
+            "recommended_backend": "cpu",
+            "reason_class": "hardware_crossover",
+            "recommendation_confidence": "high",
+            "acknowledgement": True,
+            "acknowledgement_allowed": True,
+            "acknowledgement_reused": False,
+            "acknowledgement_scope": "simulation",
+            "acknowledgement_origin_cohort_digest": "",
+            "acknowledgement_scope_cache_enabled": True,
+            "acknowledgement_scope_digest": "f" * 64,
+            "workload_fingerprint_evaluated": True,
+            "acknowledgement_reason": (
+                "qualification deliberately exercises CUDA"
+            ),
+            "recommendation_policy_version": (
+                "gpmeep-v110-explicit-backend-guard-v24"
+            ),
+            "workload_fingerprint": "b" * 64,
+            "mpi_gpu_topology": topology,
+            "mpi_topology_digest": _canonical_sha256(topology),
+            "native_state_digest": "e" * 64,
+            "process_nonce": "c" * 64,
+            "run_nonce": "d" * 64,
+            "rank_local_cells": [100] * world_size,
+        }
+        challenge = _canonical_sha256(
+            {
+                "schema": "gpmeep-v110-backend-ack-v1",
+                **{
+                    key: recommendation[key]
+                    for key in ACKNOWLEDGEMENT_BINDING_KEYS
+                },
+            }
+        )
+        recommendation["acknowledgement_digest"] = challenge
+        recommendation["acknowledgement_origin_cohort_digest"] = challenge
         rank_records = []
-        for rank in range(int(spec["world_size"])):
+        for rank in range(world_size):
             rank_records.append(
                 {
                     "world_rank": rank,
                     "world_size": spec["world_size"],
                     "suite": {
                         "tests_run": spec["tests_run"],
+                        "test_identities": list(spec["test_identities"]),
                         "failures": 0,
                         "errors": 0,
                         "skipped": 0,
@@ -243,6 +299,8 @@ def write_synthetic_auxiliary_logs(
                         "selected_device_identifier": f"GPU-fixture-{rank}",
                         "cuda_execution_selected": True,
                         "execution_diagnostic": "fixture selected CUDA",
+                        "guarded_challenge": challenge,
+                        "recommendation": copy.deepcopy(recommendation),
                         "statistics": {
                             "dispatch": {
                                 "cuda_curl_calls": 2,

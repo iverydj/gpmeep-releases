@@ -5,11 +5,13 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
 import importlib.util
 import json
 import math
 import os
 import pathlib
+import re
 import selectors
 import shutil
 import signal
@@ -17,6 +19,7 @@ import statistics
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -31,6 +34,7 @@ if str(REPO / "scripts") not in sys.path:
 
 from common import (  # noqa: E402
     AUNP_ARCHIVE_SHA256,
+    AUNP_BACKEND_ACKNOWLEDGEMENT_REASON,
     StableFile,
     TERS_SHA256,
     WorkloadError,
@@ -814,7 +818,7 @@ def run_bounded(
 def lane_command(lane: Lane, workload: str, source: pathlib.Path, output: pathlib.Path) -> list[str]:
     wrapper = SCRIPT_DIR / f"run_{workload}_workload.py"
     input_option = "--source" if workload == "ters" else "--archive"
-    return [
+    command = [
         str(lane.build.mpiexec),
         "--bind-to",
         "core",
@@ -835,6 +839,14 @@ def lane_command(lane: Lane, workload: str, source: pathlib.Path, output: pathli
         "--expected-backend",
         lane.backend,
     ]
+    if workload == "aunp":
+        command.extend(
+            [
+                "--acknowledge-backend-mismatch-reason",
+                AUNP_BACKEND_ACKNOWLEDGEMENT_REASON,
+            ]
+        )
+    return command
 
 
 def validate_lane_output(lane: Lane, output: pathlib.Path, workload: str) -> dict[str, Any]:
@@ -1136,7 +1148,8 @@ def _verify_process_record(
     if not isinstance(process, dict) or set(process) != expected_keys:
         raise WorkloadError(f"{label} process record schema is not exact")
     if (
-        process["returncode"] != 0
+        type(process["returncode"]) is not int
+        or process["returncode"] != 0
         or process["timed_out"] is not False
         or process["output_limited"] is not False
         or type(process["command_pid"]) is not int
@@ -1147,17 +1160,34 @@ def _verify_process_record(
         or process["peak_process_group_rss_bytes"] < 0
         or not isinstance(process["command"], list)
         or not process["command"]
+        or not all(isinstance(argument, str) and argument for argument in process["command"])
     ):
         raise WorkloadError(f"{label} process did not complete cleanly")
-    started = float(process["started_unix_seconds"])
-    ended = float(process["ended_unix_seconds"])
-    wall = float(process["wall_seconds"])
+    raw_times = (
+        process["started_unix_seconds"],
+        process["ended_unix_seconds"],
+        process["wall_seconds"],
+    )
+    if any(
+        isinstance(value, bool) or not isinstance(value, (int, float))
+        for value in raw_times
+    ):
+        raise WorkloadError(f"{label} process timing is invalid")
+    started, ended, wall = (float(value) for value in raw_times)
     if not all(math.isfinite(value) for value in (started, ended, wall)) or (
         ended < started or wall <= 0
     ):
         raise WorkloadError(f"{label} process timing is invalid")
     log_record = process["log"]
-    if log_record.get("path") != expected_log:
+    if (
+        not isinstance(log_record, dict)
+        or set(log_record) != {"path", "size_bytes", "sha256"}
+        or log_record.get("path") != expected_log
+        or type(log_record.get("size_bytes")) is not int
+        or log_record["size_bytes"] < 0
+        or not isinstance(log_record.get("sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", log_record["sha256"]) is None
+    ):
         raise WorkloadError(f"{label} process log path is not canonical")
     if log_record.get("size_bytes") != process["output_bytes"]:
         raise WorkloadError(f"{label} process output count differs from its log")
@@ -1213,7 +1243,7 @@ def verify_matrix_complete(output: pathlib.Path) -> dict[str, Any]:
         raise WorkloadError("matrix resume-history inventory differs")
     for record in actual_resume_history:
         archive = load_stable_json_record(output, record, "matrix resume archive")
-        if archive.get("schema") != "gpmeep-user-workload-resume-archive-v1":
+        if archive.get("schema") != "gpmeep-user-workload-resume-archive-v2":
             raise WorkloadError("matrix resume archive schema differs")
     evidence_code = report.get("evidence_code")
     if not isinstance(evidence_code, dict) or set(evidence_code) != {
@@ -1884,19 +1914,114 @@ def validate_resume_journal_prefix(
     return expected_events
 
 
-def archive_interrupted_attempt(
-    output: pathlib.Path, partial_paths: list[pathlib.PurePosixPath]
-) -> pathlib.Path:
-    history = output / "resume-history"
-    history.mkdir(exist_ok=True)
-    attempt_index = 0
-    while (history / f"attempt-{attempt_index:04d}").exists():
-        attempt_index += 1
-    attempt = history / f"attempt-{attempt_index:04d}"
-    attempt.mkdir()
-    shutil.copy2(output / "JOURNAL.json", attempt / "JOURNAL.json")
-    if (output / "CHECKPOINT.json").is_file():
-        shutil.copy2(output / "CHECKPOINT.json", attempt / "CHECKPOINT.json")
+def _fsync_directory(path: pathlib.Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _copy_resume_record(source: pathlib.Path, destination: pathlib.Path) -> None:
+    source_parent_descriptor = _open_directory_path_no_symlinks(source.parent)
+    source_parent_identity = _resume_stat_identity(
+        os.fstat(source_parent_descriptor)
+    )
+    try:
+        named_before = os.stat(
+            source.name,
+            dir_fd=source_parent_descriptor,
+            follow_symlinks=False,
+        )
+        source_descriptor = os.open(
+            source.name,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=source_parent_descriptor,
+        )
+    except OSError as exc:
+        os.close(source_parent_descriptor)
+        raise WorkloadError(f"resume record cannot be opened safely: {exc}") from exc
+    try:
+        opened = os.fstat(source_descriptor)
+        if (
+            not stat.S_ISREG(named_before.st_mode)
+            or _resume_stat_identity(opened) != _resume_stat_identity(named_before)
+        ):
+            raise WorkloadError("resume record changed while it was opened")
+        digest = hashlib.sha256()
+        offset = 0
+        while True:
+            block = os.pread(source_descriptor, 1024 * 1024, offset)
+            if not block:
+                break
+            digest.update(block)
+            offset += len(block)
+        source_identity = (opened.st_size, digest.hexdigest())
+        if destination.exists() or destination.is_symlink():
+            if destination.is_symlink():
+                raise WorkloadError("staged resume record differs")
+            with StableFile(destination, "staged resume record") as retained:
+                if (
+                    (retained.initial_stat.st_size, retained.sha256)
+                    != source_identity
+                    or stat.S_IMODE(retained.initial_stat.st_mode)
+                    != stat.S_IMODE(opened.st_mode)
+                ):
+                    raise WorkloadError("staged resume record differs")
+        else:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            descriptor, temporary_name = tempfile.mkstemp(
+                prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent
+            )
+            temporary = pathlib.Path(temporary_name)
+            try:
+                with os.fdopen(os.dup(source_descriptor), "rb") as source_handle, os.fdopen(
+                    descriptor, "wb"
+                ) as destination_handle:
+                    shutil.copyfileobj(source_handle, destination_handle)
+                    destination_handle.flush()
+                    os.fchmod(
+                        destination_handle.fileno(), stat.S_IMODE(opened.st_mode)
+                    )
+                    os.fsync(destination_handle.fileno())
+                with StableFile(temporary, "temporary resume record") as retained:
+                    if (
+                        retained.initial_stat.st_size,
+                        retained.sha256,
+                    ) != source_identity:
+                        raise WorkloadError("copied resume record differs")
+                os.replace(temporary, destination)
+                _fsync_directory(destination.parent)
+            finally:
+                if temporary.exists():
+                    temporary.unlink()
+        named_after = os.stat(
+            source.name,
+            dir_fd=source_parent_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            _resume_stat_identity(os.fstat(source_descriptor))
+            != _resume_stat_identity(opened)
+            or _resume_stat_identity(named_after) != _resume_stat_identity(opened)
+        ):
+            raise WorkloadError("resume record changed while it was copied")
+        named_parent = _open_directory_path_no_symlinks(source.parent)
+        try:
+            if _resume_stat_identity(os.fstat(named_parent)) != source_parent_identity:
+                raise WorkloadError(
+                    "resume record parent changed while it was copied"
+                )
+        finally:
+            os.close(named_parent)
+    finally:
+        os.close(source_descriptor)
+        os.close(source_parent_descriptor)
+
+
+def _resume_archive_candidates(
+    partial_paths: list[pathlib.PurePosixPath],
+) -> list[pathlib.PurePosixPath]:
     candidates = [
         pathlib.PurePosixPath(name)
         for name in (
@@ -1908,28 +2033,567 @@ def archive_interrupted_attempt(
         )
     ]
     candidates.extend(partial_paths)
+    result = []
     seen: set[pathlib.PurePosixPath] = set()
     for relative in candidates:
         if relative in seen:
             continue
+        if (
+            relative.is_absolute()
+            or ".." in relative.parts
+            or relative == pathlib.PurePosixPath(".")
+        ):
+            raise WorkloadError("resume archive candidate path is unsafe")
         seen.add(relative)
+        result.append(relative)
+    return result
+
+
+def _resume_stat_identity(metadata: os.stat_result) -> tuple[Any, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_nlink,
+        metadata.st_uid,
+        metadata.st_gid,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _resume_move_identity(metadata: os.stat_result) -> tuple[Any, ...]:
+    """Identity fields preserved by rename (which legitimately updates ctime)."""
+
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_nlink,
+        metadata.st_uid,
+        metadata.st_gid,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+    )
+
+
+def _parse_resume_archive_marker(data: bytes) -> dict[str, Any]:
+    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        value: dict[str, Any] = {}
+        for key, item in pairs:
+            if key in value:
+                raise WorkloadError(f"resume archive marker repeats key: {key}")
+            value[key] = item
+        return value
+
+    try:
+        value = json.loads(
+            data.decode("utf-8"),
+            object_pairs_hook=unique_object,
+            parse_constant=lambda item: (_ for _ in ()).throw(
+                WorkloadError(f"resume archive marker has non-finite value: {item}")
+            ),
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise WorkloadError("resume archive marker is invalid JSON") from exc
+    if not isinstance(value, dict):
+        raise WorkloadError("resume archive marker is not an object")
+    return value
+
+
+def _open_directory_path_no_symlinks(path: pathlib.Path) -> int:
+    """Open an absolute directory by walking every component without links."""
+
+    lexical = path.absolute()
+    if not lexical.is_absolute():
+        raise WorkloadError("resume archive path is not absolute")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    try:
+        descriptor = os.open("/", flags)
+        try:
+            for part in lexical.parts[1:]:
+                child = os.open(part, flags, dir_fd=descriptor)
+                os.close(descriptor)
+                descriptor = child
+        except BaseException:
+            os.close(descriptor)
+            raise
+    except OSError as exc:
+        raise WorkloadError(
+            f"resume archive path contains a symlink or cannot be opened: {exc}"
+        ) from exc
+    return descriptor
+
+
+def _move_resume_candidate(source: pathlib.Path, destination: pathlib.Path) -> None:
+    """Rename one archive member through stable no-follow parent handles."""
+
+    source_parent = _open_directory_path_no_symlinks(source.parent)
+    destination_parent = _open_directory_path_no_symlinks(destination.parent)
+    try:
+        before = os.stat(source.name, dir_fd=source_parent, follow_symlinks=False)
+        if stat.S_ISLNK(before.st_mode) or not (
+            stat.S_ISREG(before.st_mode) or stat.S_ISDIR(before.st_mode)
+        ):
+            raise WorkloadError("resume candidate has an unsupported path type")
+        try:
+            os.stat(
+                destination.name,
+                dir_fd=destination_parent,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            pass
+        else:
+            raise WorkloadError("resume archive destination already exists")
+        os.replace(
+            source.name,
+            destination.name,
+            src_dir_fd=source_parent,
+            dst_dir_fd=destination_parent,
+        )
+        after = os.stat(
+            destination.name,
+            dir_fd=destination_parent,
+            follow_symlinks=False,
+        )
+        if _resume_move_identity(after) != _resume_move_identity(before):
+            raise WorkloadError("resume candidate changed while it was moved")
+        try:
+            os.stat(source.name, dir_fd=source_parent, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise WorkloadError("resume candidate source reappeared after its move")
+    except OSError as exc:
+        raise WorkloadError(f"resume candidate move failed safely: {exc}") from exc
+    finally:
+        os.close(destination_parent)
+        os.close(source_parent)
+
+
+def _resume_archive_snapshot(
+    archive: pathlib.Path, *, require_marker: bool
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    """Read a resume archive through one descriptor-rooted, no-follow walk."""
+
+    lexical = archive.absolute()
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    root_descriptor = _open_directory_path_no_symlinks(lexical)
+    try:
+        root_before = os.fstat(root_descriptor)
+        if not stat.S_ISDIR(root_before.st_mode):
+            raise WorkloadError("resume archive is not a direct directory")
+        if stat.S_IMODE(root_before.st_mode) != 0o700:
+            raise WorkloadError("resume archive directory mode differs")
+
+        def open_file(
+            directory: int, name: str, label: str, *, retain_bytes: bool
+        ) -> tuple[bytes | None, os.stat_result, str]:
+            before = os.stat(name, dir_fd=directory, follow_symlinks=False)
+            if not stat.S_ISREG(before.st_mode):
+                raise WorkloadError(f"{label} is not a regular file")
+            try:
+                descriptor = os.open(
+                    name,
+                    os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                    dir_fd=directory,
+                )
+            except OSError as exc:
+                raise WorkloadError(f"{label} cannot be opened safely: {exc}") from exc
+            try:
+                opened = os.fstat(descriptor)
+                if _resume_stat_identity(opened) != _resume_stat_identity(before):
+                    raise WorkloadError(f"{label} changed while it was opened")
+                digest = hashlib.sha256()
+                retained = bytearray() if retain_bytes else None
+                while True:
+                    chunk = os.read(descriptor, 1024 * 1024)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+                    if retained is not None:
+                        if len(retained) + len(chunk) > 16 * 1024**2:
+                            raise WorkloadError(f"{label} exceeds its parse bound")
+                        retained.extend(chunk)
+                after = os.fstat(descriptor)
+                if _resume_stat_identity(after) != _resume_stat_identity(opened):
+                    raise WorkloadError(f"{label} changed while it was read")
+                return (
+                    bytes(retained) if retained is not None else None,
+                    opened,
+                    digest.hexdigest(),
+                )
+            finally:
+                os.close(descriptor)
+
+        marker: dict[str, Any] | None = None
+        marker_identity: tuple[Any, ...] | None = None
+        root_names = sorted(os.listdir(root_descriptor))
+        if require_marker:
+            if "ARCHIVED.json" not in root_names:
+                raise WorkloadError("resume archive marker is absent")
+            marker_bytes, marker_status, _marker_digest = open_file(
+                root_descriptor,
+                "ARCHIVED.json",
+                "resume archive marker",
+                retain_bytes=True,
+            )
+            if stat.S_IMODE(marker_status.st_mode) != 0o600:
+                raise WorkloadError("resume archive marker mode differs")
+            marker_identity = _resume_stat_identity(marker_status)
+            assert marker_bytes is not None
+            marker = _parse_resume_archive_marker(marker_bytes)
+
+        members: list[dict[str, Any]] = []
+
+        def walk(directory: int, prefix: pathlib.PurePosixPath) -> None:
+            directory_before = os.fstat(directory)
+            for name in sorted(os.listdir(directory)):
+                if prefix == pathlib.PurePosixPath() and name == "ARCHIVED.json":
+                    continue
+                relative = prefix / name
+                relative_text = relative.as_posix()
+                metadata = os.stat(name, dir_fd=directory, follow_symlinks=False)
+                mode = stat.S_IMODE(metadata.st_mode)
+                if stat.S_ISLNK(metadata.st_mode):
+                    raise WorkloadError("resume archive member is a symlink")
+                if stat.S_ISDIR(metadata.st_mode):
+                    members.append(
+                        {
+                            "path": relative_text,
+                            "type": "directory",
+                            "mode": mode,
+                            "size_bytes": None,
+                            "sha256": None,
+                        }
+                    )
+                    child = os.open(name, flags, dir_fd=directory)
+                    try:
+                        if _resume_stat_identity(os.fstat(child)) != _resume_stat_identity(
+                            metadata
+                        ):
+                            raise WorkloadError(
+                                "resume archive directory changed while it was opened"
+                            )
+                        walk(child, relative)
+                    finally:
+                        os.close(child)
+                    continue
+                _data, opened, digest = open_file(
+                    directory,
+                    name,
+                    f"resume archive member {relative_text}",
+                    retain_bytes=False,
+                )
+                members.append(
+                    {
+                        "path": relative_text,
+                        "type": "file",
+                        "mode": mode,
+                        "size_bytes": opened.st_size,
+                        "sha256": digest,
+                    }
+                )
+            if _resume_stat_identity(os.fstat(directory)) != _resume_stat_identity(
+                directory_before
+            ):
+                raise WorkloadError("resume archive directory changed while it was read")
+
+        walk(root_descriptor, pathlib.PurePosixPath())
+        if marker_identity is not None:
+            marker_after = os.stat(
+                "ARCHIVED.json", dir_fd=root_descriptor, follow_symlinks=False
+            )
+            if _resume_stat_identity(marker_after) != marker_identity:
+                raise WorkloadError("resume archive marker changed while it was read")
+        if _resume_stat_identity(os.fstat(root_descriptor)) != _resume_stat_identity(
+            root_before
+        ):
+            raise WorkloadError("resume archive changed while it was read")
+        named_descriptor = _open_directory_path_no_symlinks(lexical)
+        try:
+            if _resume_stat_identity(os.fstat(named_descriptor)) != _resume_stat_identity(
+                root_before
+            ):
+                raise WorkloadError("resume archive name changed while it was read")
+        finally:
+            os.close(named_descriptor)
+        return marker, sorted(members, key=lambda item: item["path"])
+    finally:
+        os.close(root_descriptor)
+
+
+def _resume_archive_members(archive: pathlib.Path) -> list[dict[str, Any]]:
+    """Return the exact inventory, excluding the self-authenticating marker."""
+
+    _marker, members = _resume_archive_snapshot(archive, require_marker=False)
+    return members
+
+
+def _validate_resume_archive(
+    archive: pathlib.Path,
+    expected_partial_paths: list[pathlib.PurePosixPath] | None = None,
+) -> dict[str, Any]:
+    marker, actual_members = _resume_archive_snapshot(archive, require_marker=True)
+    assert marker is not None
+    expected_keys = {
+        "schema",
+        "archived_unix_seconds",
+        "partial_paths",
+        "member_count",
+        "members",
+    }
+    if (
+        set(marker) != expected_keys
+        or marker.get("schema") != "gpmeep-user-workload-resume-archive-v2"
+        or isinstance(marker.get("archived_unix_seconds"), bool)
+        or not isinstance(marker.get("archived_unix_seconds"), (int, float))
+        or not math.isfinite(float(marker["archived_unix_seconds"]))
+        or marker["archived_unix_seconds"] <= 0
+    ):
+        raise WorkloadError("resume archive marker schema differs")
+    raw_partial = marker.get("partial_paths")
+    if not isinstance(raw_partial, list) or not all(
+        isinstance(item, str) for item in raw_partial
+    ):
+        raise WorkloadError("resume archive partial-path inventory differs")
+    parsed_partial: list[pathlib.PurePosixPath] = []
+    for raw in raw_partial:
+        relative = pathlib.PurePosixPath(raw)
+        if (
+            not raw
+            or relative.is_absolute()
+            or relative == pathlib.PurePosixPath(".")
+            or "." in relative.parts
+            or ".." in relative.parts
+            or "\\" in raw
+        ):
+            raise WorkloadError("resume archive partial path is unsafe")
+        parsed_partial.append(relative)
+    if len(set(parsed_partial)) != len(parsed_partial):
+        raise WorkloadError("resume archive partial path repeats")
+    if expected_partial_paths is not None and parsed_partial != expected_partial_paths:
+        raise WorkloadError("resume archive partial paths disagree with checkpoint")
+    retained_members = marker.get("members")
+    if (
+        not isinstance(retained_members, list)
+        or type(marker.get("member_count")) is not int
+        or marker["member_count"] != len(retained_members)
+    ):
+        raise WorkloadError("resume archive member census differs")
+    paths: list[str] = []
+    for member in retained_members:
+        if not isinstance(member, dict) or set(member) != {
+            "path", "type", "mode", "size_bytes", "sha256"
+        }:
+            raise WorkloadError("resume archive member record differs")
+        raw = member["path"]
+        relative = pathlib.PurePosixPath(raw) if isinstance(raw, str) else None
+        if (
+            relative is None
+            or not raw
+            or relative.is_absolute()
+            or "." in relative.parts
+            or ".." in relative.parts
+            or "\\" in raw
+            or raw == "ARCHIVED.json"
+            or member["type"] not in {"file", "directory"}
+            or type(member["mode"]) is not int
+            or not 0 <= member["mode"] <= 0o7777
+        ):
+            raise WorkloadError("resume archive member identity is invalid")
+        if member["type"] == "file":
+            if (
+                type(member["size_bytes"]) is not int
+                or member["size_bytes"] < 0
+                or not isinstance(member["sha256"], str)
+                or re.fullmatch(r"[0-9a-f]{64}", member["sha256"]) is None
+            ):
+                raise WorkloadError("resume archive file record is invalid")
+        elif member["size_bytes"] is not None or member["sha256"] is not None:
+            raise WorkloadError("resume archive directory record is invalid")
+        paths.append(raw)
+    if paths != sorted(set(paths)):
+        raise WorkloadError("resume archive member paths are not unique and sorted")
+    if (
+        not retained_members
+        or not any(
+            member["path"] == "JOURNAL.json" and member["type"] == "file"
+            for member in retained_members
+        )
+    ):
+        raise WorkloadError("resume archive canonical journal is absent")
+    if retained_members != actual_members:
+        raise WorkloadError("resume archive member inventory changed")
+    return marker
+
+
+def _complete_resume_archive(
+    output: pathlib.Path,
+    staging: pathlib.Path,
+    attempt: pathlib.Path,
+    partial_paths: list[pathlib.PurePosixPath],
+) -> pathlib.Path:
+    if attempt.exists() or attempt.is_symlink():
+        if (
+            attempt.is_symlink()
+            or not attempt.is_dir()
+            or not (attempt / "ARCHIVED.json").is_file()
+        ):
+            raise WorkloadError("completed resume archive differs")
+        _validate_resume_archive(attempt, partial_paths)
+        return attempt
+    if staging.is_symlink():
+        raise WorkloadError("resume staging archive is a symlink")
+    staging.mkdir(mode=0o700, exist_ok=True)
+    if stat.S_IMODE(staging.stat().st_mode) != 0o700:
+        raise WorkloadError("resume staging archive mode differs")
+    _fsync_directory(staging.parent)
+    _copy_resume_record(output / "JOURNAL.json", staging / "JOURNAL.json")
+    if (output / "CHECKPOINT.json").is_file():
+        _copy_resume_record(output / "CHECKPOINT.json", staging / "CHECKPOINT.json")
+    for relative in _resume_archive_candidates(partial_paths):
         source = output.joinpath(*relative.parts)
-        if not source.exists():
+        destination = staging.joinpath(*relative.parts)
+        source_present = source.exists() or source.is_symlink()
+        destination_present = destination.exists() or destination.is_symlink()
+        if source_present and destination_present:
+            raise WorkloadError("resume archive contains duplicate staged state")
+        if destination_present:
+            if destination.is_symlink():
+                raise WorkloadError("resume destination traverses a symlink")
             continue
         if source.is_symlink():
             raise WorkloadError("resume candidate traverses a symlink")
-        destination = attempt.joinpath(*relative.parts)
+        if not source_present:
+            continue
         destination.parent.mkdir(parents=True, exist_ok=True)
-        os.replace(source, destination)
+        _fsync_directory(destination.parent)
+        _move_resume_candidate(source, destination)
+        _fsync_directory(source.parent)
+        _fsync_directory(destination.parent)
+    members = _resume_archive_members(staging)
     atomic_write_json(
-        attempt / "ARCHIVED.json",
+        staging / "ARCHIVED.json",
         {
-            "schema": "gpmeep-user-workload-resume-archive-v1",
+            "schema": "gpmeep-user-workload-resume-archive-v2",
             "archived_unix_seconds": time.time(),
+            "partial_paths": [value.as_posix() for value in partial_paths],
+            "member_count": len(members),
+            "members": members,
+        },
+    )
+    _validate_resume_archive(staging, partial_paths)
+    _fsync_directory(staging)
+    _move_resume_candidate(staging, attempt)
+    _fsync_directory(attempt.parent)
+    return attempt
+
+
+def archive_interrupted_attempt(
+    output: pathlib.Path, partial_paths: list[pathlib.PurePosixPath]
+) -> pathlib.Path:
+    history = output / "resume-history"
+    history.mkdir(exist_ok=True)
+    if history.is_symlink() or not history.is_dir():
+        raise WorkloadError("matrix resume history is not a directory")
+    _fsync_directory(output)
+
+    temporary_pattern = re.compile(
+        r"\.\.attempt-[0-9]{4,}\.intent\.json\.[a-z0-9_]+\.tmp"
+    )
+    removed_temporary = False
+    for candidate in history.iterdir():
+        if temporary_pattern.fullmatch(candidate.name) is None:
+            continue
+        if candidate.is_symlink() or not candidate.is_file():
+            raise WorkloadError("resume intent temporary is not a regular file")
+        candidate.unlink()
+        removed_temporary = True
+    if removed_temporary:
+        _fsync_directory(history)
+
+    intents = sorted(history.glob(".attempt-*.intent.json"))
+    if len(intents) > 1:
+        raise WorkloadError("multiple interrupted resume archives exist")
+    if intents:
+        intent_path = intents[0]
+        if intent_path.is_symlink() or not intent_path.is_file():
+            raise WorkloadError("resume archive intent is not a regular file")
+        intent = json.loads(intent_path.read_text(encoding="utf-8"))
+        expected_keys = {"schema", "attempt", "partial_paths"}
+        if not isinstance(intent, dict) or set(intent) != expected_keys:
+            raise WorkloadError("resume archive intent differs")
+        attempt_name = intent["attempt"]
+        expected_partial = [value.as_posix() for value in partial_paths]
+        if (
+            intent["schema"] != "gpmeep-user-workload-resume-intent-v1"
+            or not isinstance(attempt_name, str)
+            or not attempt_name.startswith("attempt-")
+            or not attempt_name.removeprefix("attempt-").isdigit()
+            or intent["partial_paths"] != expected_partial
+            or intent_path.name != f".{attempt_name}.intent.json"
+        ):
+            raise WorkloadError("resume archive intent disagrees with checkpoint")
+        attempt = history / attempt_name
+        staging = history / f".{attempt_name}.in-progress"
+        completed = _complete_resume_archive(
+            output, staging, attempt, partial_paths
+        )
+        intent_path.unlink()
+        _fsync_directory(history)
+        return completed
+
+    orphaned_staging = list(history.glob(".attempt-*.in-progress"))
+    if orphaned_staging:
+        raise WorkloadError("resume staging archive lacks its durable intent")
+    attempt_index = 0
+    while (history / f"attempt-{attempt_index:04d}").exists():
+        attempt_index += 1
+    attempt_name = f"attempt-{attempt_index:04d}"
+    attempt = history / attempt_name
+    staging = history / f".{attempt_name}.in-progress"
+    intent_path = history / f".{attempt_name}.intent.json"
+    atomic_write_json(
+        intent_path,
+        {
+            "schema": "gpmeep-user-workload-resume-intent-v1",
+            "attempt": attempt_name,
             "partial_paths": [value.as_posix() for value in partial_paths],
         },
     )
-    return attempt
+    completed = _complete_resume_archive(output, staging, attempt, partial_paths)
+    intent_path.unlink()
+    _fsync_directory(history)
+    return completed
+
+
+def resume_archive_transaction_active(output: pathlib.Path) -> bool:
+    history = output / "resume-history"
+    if not history.exists() and not history.is_symlink():
+        return False
+    if history.is_symlink() or not history.is_dir():
+        raise WorkloadError("matrix resume history is not a directory")
+    intents = list(history.glob(".attempt-*.intent.json"))
+    if len(intents) > 1:
+        raise WorkloadError("multiple interrupted resume archives exist")
+    if not intents:
+        return False
+    intent = intents[0]
+    if intent.is_symlink() or not intent.is_file():
+        raise WorkloadError("resume archive intent is not a regular file")
+    return True
+
+
+def publish_failure_record(output: pathlib.Path, failure: dict[str, Any]) -> bool:
+    """Publish a live failure unless an archive transaction owns that state."""
+
+    if resume_archive_transaction_active(output):
+        return False
+    atomic_write_json(output / "FAILED.json", failure)
+    return True
 
 
 def resume_history_records(output: pathlib.Path) -> list[dict[str, Any]]:
@@ -1947,6 +2611,7 @@ def resume_history_records(output: pathlib.Path) -> list[dict[str, Any]]:
             or not attempt.name.removeprefix("attempt-").isdigit()
         ):
             raise WorkloadError("matrix resume history contains a noncanonical entry")
+        before = _validate_resume_archive(attempt)
         records.append(
             stable_file_record(
                 attempt / "ARCHIVED.json",
@@ -1954,6 +2619,8 @@ def resume_history_records(output: pathlib.Path) -> list[dict[str, Any]]:
                 f"matrix resume archive {attempt.name}",
             )
         )
+        if before != _validate_resume_archive(attempt):
+            raise WorkloadError("matrix resume archive changed while it was read")
     return records
 
 
@@ -2543,10 +3210,7 @@ def main(argv: list[str] | None = None) -> int:
         }
         if (output / "JOURNAL.json").is_file():
             failure["journal"] = file_record(output / "JOURNAL.json", output)
-        atomic_write_json(
-            output / "FAILED.json",
-            failure,
-        )
+        publish_failure_record(output, failure)
         raise
     finally:
         for stable in code_stables.values():

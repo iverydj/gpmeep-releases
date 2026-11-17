@@ -187,7 +187,7 @@ class PackagingContractTests(unittest.TestCase):
         build = (ROOT / "packaging/conda/build.sh").read_text()
         for expected in (
             "name: gpmeep",
-            'distribution_version = "1.0.3"',
+            'distribution_version = "1.1.0"',
             "build_number = 0",
             "cuda-cudart =12.4",
             "cuda-cuobjdump =12.4",
@@ -213,7 +213,7 @@ class PackagingContractTests(unittest.TestCase):
     def test_release_manifest_has_portability_disclosure(self):
         manifest = (ROOT / "packaging/conda/release.json.in").read_text()
         self.assertIn('"schema_version": 3', manifest)
-        self.assertIn('"distribution_version": "1.0.3"', manifest)
+        self.assertIn('"distribution_version": "1.1.0"', manifest)
         self.assertIn(
             '"runtime_validated_architectures": [@RUNTIME_VALIDATED_ARCHITECTURES@]',
             manifest,

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib.util
+import copy
 import json
 import pathlib
 import pwd
@@ -22,8 +23,8 @@ sys.modules[SPEC.name] = CASE
 SPEC.loader.exec_module(CASE)
 
 
-GPU0 = "GPU-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
-GPU1 = "GPU-11111111-2222-3333-4444-555555555555"
+GPU0 = "GPU-00000000-0000-0000-0000-000000009001"
+GPU1 = "GPU-00000000-0000-0000-0000-000000009002"
 
 
 class M3MpiExampleCaseTests(unittest.TestCase):
@@ -67,12 +68,175 @@ class M3MpiExampleCaseTests(unittest.TestCase):
                     "installed_environment": str(parent / "environment"),
                 },
                 run_nonce="nonce",
+                site_guard_expected=True,
+                producer_safe_ambient={
+                    "PATH": "/producer/bin",
+                    "TMPDIR": str(parent / "producer-tmp"),
+                    "LC_ALL": "C",
+                    "LANG": "C",
+                },
             )
         self.assertEqual(
             environment["HOME"],
             str(pathlib.Path(pwd.getpwuid(CASE.os.getuid()).pw_dir).resolve()),
         )
         self.assertEqual(environment["MEEP_GPU_BACKEND"], "cpu")
+        self.assertEqual(environment["OMPI_MCA_osc"], "^ucx")
+        self.assertEqual(environment["TMPDIR"], str(parent / "producer-tmp"))
+        self.assertEqual(
+            environment[
+                "GPMEEP_VALIDATION_BACKEND_ACKNOWLEDGEMENT_REASON"
+            ],
+            CASE.BACKEND_ACKNOWLEDGEMENT_REASON,
+        )
+
+    def test_producer_safe_ambient_is_explicit_and_fail_closed(self) -> None:
+        ambient = {
+            "PATH": "/producer/bin",
+            "TMPDIR": "/producer/tmp",
+            "LC_ALL": "C",
+            "LANG": "C",
+        }
+        self.assertEqual(CASE.validate_producer_safe_ambient(ambient), ambient)
+        self.assertIsNot(CASE.validate_producer_safe_ambient(ambient), ambient)
+        with self.assertRaisesRegex(Exception, "safe ambient"):
+            CASE.validate_producer_safe_ambient({"CUDA_VISIBLE_DEVICES": "0"})
+        with self.assertRaisesRegex(Exception, "safe ambient"):
+            CASE.validate_producer_safe_ambient({"LANG": 1})
+        with self.assertRaisesRegex(Exception, "safe ambient"):
+            CASE.validate_producer_safe_ambient({"LANG": "C\x00hostile"})
+        with self.assertRaisesRegex(Exception, "safe ambient"):
+            CASE.validate_producer_safe_ambient({**ambient, "TERM": "xterm"})
+        missing = dict(ambient)
+        missing.pop("TMPDIR")
+        with self.assertRaisesRegex(Exception, "safe ambient"):
+            CASE.validate_producer_safe_ambient(missing)
+
+    def test_producer_safe_ambient_record_is_path_bound_and_hashed(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = pathlib.Path(raw).resolve()
+            task = "17-python-example"
+            output = root / "raw" / task
+            runtime_tmp = root / "runtime" / task / "tmp"
+            output.mkdir(parents=True)
+            runtime_tmp.mkdir(parents=True)
+            python = root / "environment" / "bin" / "python3.11"
+            values = {
+                "PATH": f"{python.parent}:/usr/bin:/bin",
+                "TMPDIR": str(runtime_tmp),
+                "LC_ALL": "C",
+                "LANG": "C",
+            }
+            record = CASE.producer_safe_ambient_record(values, output, python)
+            self.assertEqual(
+                CASE.validate_producer_safe_ambient_record(
+                    record, output, python
+                ),
+                values,
+            )
+
+            for label, mutate in {
+                "record hash": lambda item: item.update(sha256="0" * 64),
+                "path": lambda item: item["values"].update(PATH="/wrong"),
+                "tmp": lambda item: item["values"].update(TMPDIR="/wrong"),
+                "locale": lambda item: item["values"].update(LANG="en_US"),
+                "extra": lambda item: item["values"].update(TERM="xterm"),
+            }.items():
+                with self.subTest(label=label):
+                    changed = copy.deepcopy(record)
+                    mutate(changed)
+                    if label != "record hash":
+                        changed["sha256"] = CASE.validation.environment_sha256(
+                            changed["values"]
+                        )
+                    with self.assertRaises(Exception):
+                        CASE.validate_producer_safe_ambient_record(
+                            changed, output, python
+                        )
+
+    def test_producer_safe_ambient_rejects_symlinked_runtime_layout(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = pathlib.Path(raw).resolve()
+            task = "17-python-example"
+            output = root / "raw" / task
+            output.mkdir(parents=True)
+            target = root / "actual-tmp"
+            target.mkdir()
+            runtime_parent = root / "runtime" / task
+            runtime_parent.mkdir(parents=True)
+            (runtime_parent / "tmp").symlink_to(target, target_is_directory=True)
+            with self.assertRaisesRegex(Exception, "symbolic link"):
+                CASE.expected_producer_safe_ambient(
+                    output, root / "environment/bin/python3.11"
+                )
+
+    def test_performance_safe_ambient_is_path_derived_and_ambient_free(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = pathlib.Path(raw).resolve()
+            task = "001-performance-case"
+            output = root / "samples" / task
+            runtime_tmp = root / "runtime" / task / "tmp"
+            output.mkdir(parents=True)
+            runtime_tmp.mkdir(parents=True)
+            python = pathlib.Path(sys.executable).resolve(strict=True)
+            expected = {
+                "PATH": f"{python.parent}:/usr/bin:/bin",
+                "TMPDIR": str(runtime_tmp),
+                "LC_ALL": "C",
+                "LANG": "C",
+            }
+            hostile = {
+                "PATH": "/hostile",
+                "TMPDIR": "/hostile/tmp",
+                "LANG": "xx_YY",
+                "LC_ALL": "xx_YY",
+                "LC_CTYPE": "xx_YY",
+                "TERM": "hostile",
+                "TZ": "Etc/Hostile",
+            }
+            with mock.patch.dict(CASE.os.environ, hostile, clear=True):
+                first = CASE.expected_performance_producer_safe_ambient(
+                    output, python
+                )
+            with mock.patch.dict(CASE.os.environ, {}, clear=True):
+                second = CASE.expected_performance_producer_safe_ambient(
+                    output, python
+                )
+            self.assertEqual(first, expected)
+            self.assertEqual(second, expected)
+            self.assertEqual(
+                CASE.validation.environment_sha256(first),
+                CASE.validation.environment_sha256(second),
+            )
+
+    def test_performance_safe_ambient_rejects_uncontrolled_layouts(self) -> None:
+        python = pathlib.Path(sys.executable).resolve(strict=True)
+        with tempfile.TemporaryDirectory() as raw:
+            root = pathlib.Path(raw).resolve()
+            wrong = root / "raw" / "task"
+            (root / "runtime" / "task" / "tmp").mkdir(parents=True)
+            wrong.mkdir(parents=True)
+            with self.assertRaisesRegex(Exception, "controlled layout"):
+                CASE.expected_performance_producer_safe_ambient(wrong, python)
+
+            missing = root / "samples" / "missing-runtime"
+            missing.mkdir(parents=True)
+            with self.assertRaisesRegex(Exception, "directory layout"):
+                CASE.expected_performance_producer_safe_ambient(missing, python)
+
+            target = root / "actual-tmp"
+            target.mkdir()
+            linked = root / "samples" / "linked-runtime"
+            linked.mkdir()
+            runtime_parent = root / "runtime" / "linked-runtime"
+            runtime_parent.mkdir(parents=True)
+            (runtime_parent / "tmp").symlink_to(target, target_is_directory=True)
+            with self.assertRaisesRegex(Exception, "symbolic link"):
+                CASE.expected_performance_producer_safe_ambient(linked, python)
+
+            relative = pathlib.Path("samples/task")
+            with self.assertRaisesRegex(Exception, "must be absolute"):
+                CASE.expected_performance_producer_safe_ambient(relative, python)
 
     def test_manifest_selection_accepts_pinned_zero_skip_mpi_unittest(self) -> None:
         case = CASE._case_from_manifest(

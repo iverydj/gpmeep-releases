@@ -14,14 +14,6 @@
 *.native
 *.pyc
 *.env
-# Public release privacy: never commit raw local execution evidence.
-/artifacts/
-/evidence-anchors/
-/RESUME_CHECKPOINT.md
-/monkeytype.sqlite3
-*.log
-*.stdout.log
-*.stderr.log
 _build
 .vscode
 .idea

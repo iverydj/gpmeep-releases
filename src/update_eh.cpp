@@ -51,6 +51,7 @@ size_t update_point_count(const ivec &is, const ivec &ie) {
 } // namespace
 
 void fields::update_eh(field_type ft, bool skip_w_components) {
+  gpmeep_note_state_mutation();
   if (ft != E_stuff && ft != H_stuff) meep::abort("update_eh only works with E/H");
 
   // split the chunks' volume into subdomains for tiled execution of update_eh loop
@@ -216,8 +217,8 @@ bool fields_chunk::update_eh(field_type ft, bool skip_w_components) {
   if (cuda_backend_active && !cuda_phase_eligible)
     throw std::runtime_error(
         "preflighted CUDA E/H update requires FP32 fields");
-  gpu::detail::resident_curl_session cuda_session(this,
-                                                   cuda_phase_eligible);
+  gpu::detail::conditional_resident_curl_session cuda_session(
+      this, cuda_phase_eligible);
   const auto allocate_copy = [&](realnum *source) {
     std::unique_ptr<realnum[]> destination(new realnum[gv.ntot()]);
 #if MEEP_HAVE_CUDA

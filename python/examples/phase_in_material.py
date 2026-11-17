@@ -3,6 +3,9 @@
 """Continuously phase one nondispersive material layout into another."""
 
 import argparse
+import importlib.util
+import os
+from pathlib import Path
 
 import numpy as np
 
@@ -17,16 +20,63 @@ parser.add_argument(
 )
 parser.add_argument("--resolution", type=int, default=None)
 parser.add_argument("--phase-time", type=float, default=None)
+parser.add_argument("--gpmeep-sweep-size", type=float, default=1.0)
+parser.add_argument("--gpmeep-sweep-run-length", type=float, default=1.0)
 args = parser.parse_args()
 
-resolution = args.resolution if args.resolution is not None else (10 if args.validation else 20)
-phase_time = args.phase_time if args.phase_time is not None else (2.0 if args.validation else 10.0)
+performance_fixed_work_value = os.environ.get(
+    "GPMEEP_PHASE_IN_MATERIAL_FIXED_WORK"
+)
+if performance_fixed_work_value not in (None, "1"):
+    raise RuntimeError(
+        "GPMEEP_PHASE_IN_MATERIAL_FIXED_WORK must be absent or exactly '1'"
+    )
+performance_fixed_work = performance_fixed_work_value == "1"
+if performance_fixed_work and not args.validation:
+    raise RuntimeError(
+        "GPMEEP_PHASE_IN_MATERIAL_FIXED_WORK requires --validation"
+    )
+
+resolution = (
+    args.resolution
+    if args.resolution is not None
+    else (10 if args.validation else 20)
+)
+validation_phase_time = 200.0 if performance_fixed_work else 2.0
+phase_time = (
+    args.phase_time
+    if args.phase_time is not None
+    else (validation_phase_time if args.validation else 10.0)
+)
 if resolution <= 0 or phase_time <= 0:
     raise RuntimeError("resolution and phase time must be positive")
-if args.validation and (resolution != 10 or abs(phase_time - 2.0) > 1e-12):
+if args.validation and (
+    resolution != 10 or abs(phase_time - validation_phase_time) > 1e-12
+):
     raise RuntimeError(
-        "--validation has a fixed resolution=10 and phase-time=2 physical contract"
+        "--validation differs from its sealed resolution/phase-time contract"
     )
+
+phase_contract_helper = None
+phase_sweep_contract = None
+phase_run_observations = None
+if args.validation:
+    helper_path = (Path(__file__).resolve().parents[2] / "scripts" /
+                   "python-validation" / "phase_material_contract.py")
+    helper_spec = importlib.util.spec_from_file_location(
+        "gpmeep_phase_material_contract", helper_path
+    )
+    phase_contract_helper = importlib.util.module_from_spec(helper_spec)
+    helper_spec.loader.exec_module(phase_contract_helper)
+    phase_sweep_contract = phase_contract_helper.work_contract(
+        args.gpmeep_sweep_size, args.gpmeep_sweep_run_length,
+        fixed_work=performance_fixed_work,
+    )
+    resolution = phase_sweep_contract["resolution"]
+    phase_time = phase_sweep_contract["phase_time"]
+    phase_run_observations = {"dynamic": {}, "static": {}}
+elif args.gpmeep_sweep_size != 1.0 or args.gpmeep_sweep_run_length != 1.0:
+    raise RuntimeError("phase sweeps require the full fixed-work validation contract")
 
 cell_size = mp.Vector3(6, 6, 0)
 medium = mp.Medium(index=3.5)
@@ -90,15 +140,24 @@ def capture_epsilon(sim):
         phase_snapshot_dz_list.append(dz)
 
 
+if args.validation:
+    phase_run_observations["dynamic"]["before"] = (
+        phase_contract_helper.observe_simulation(sim1)
+    )
+    phase_run_observations["target"] = phase_contract_helper.observe_simulation(sim2)
+
 sim1.fields.phase_in_material(sim2.structure, phase_time)
 
 if args.validation:
     sim1.run(
         mp.at_beginning(capture_epsilon),
-        mp.at_every(0.5, capture_epsilon),
+        mp.at_every(phase_time / 4.0, capture_epsilon),
         until=phase_time,
     )
     capture_epsilon(sim1)
+    phase_run_observations["dynamic"]["after"] = (
+        phase_contract_helper.observe_simulation(sim1)
+    )
 else:
     sim1.run(
         mp.at_beginning(mp.output_epsilon),
@@ -115,7 +174,7 @@ phase_final_epsilon = epsilon_array(sim1)
 if args.validation:
     if phase_snapshot_times.shape != (5,):
         raise RuntimeError(
-            "phase_in_material validation expected snapshots at 0, 0.5, 1, 1.5, 2"
+            "phase_in_material validation expected five quarter-time snapshots"
         )
     expected_times = np.linspace(0.0, phase_time, 5)
     if not np.allclose(phase_snapshot_times, expected_times, rtol=0.0, atol=1e-6):
@@ -157,7 +216,8 @@ if args.validation:
         raise RuntimeError("phase_in_material did not reach the target material")
     if np.any(np.diff(phase_progress) < -1e-7) or phase_progress[-1] <= 0:
         raise RuntimeError("phase_in_material did not progress monotonically")
-    if phase_snapshot_ez.shape != (5, 60, 60) or phase_snapshot_dz.shape != (5, 60, 60):
+    expected_field_shape = (5, *phase_sweep_contract["grid_shape"])
+    if phase_snapshot_ez.shape != expected_field_shape or phase_snapshot_dz.shape != expected_field_shape:
         raise RuntimeError("phase_in_material field snapshot topology changed")
     if phase_changed_region_ez_l2[-1] <= 1e-3:
         raise RuntimeError(
@@ -181,7 +241,13 @@ if args.validation:
         ],
         resolution=resolution,
     )
+    phase_run_observations["static"]["before"] = (
+        phase_contract_helper.observe_simulation(static_sim)
+    )
     static_sim.run(until=phase_time)
+    phase_run_observations["static"]["after"] = (
+        phase_contract_helper.observe_simulation(static_sim)
+    )
     phase_static_initial_ez = np.asarray(
         static_sim.get_array(component=mp.Ez), dtype=float
     ).copy()
@@ -201,6 +267,9 @@ if args.validation:
         raise RuntimeError(
             "phase_in_material fields are indistinguishable from the static-material control"
         )
+    phase_contract_helper.validate_observations(
+        phase_run_observations, phase_sweep_contract
+    )
 else:
     phase_reciprocal_relative_error = np.asarray([], dtype=float)
     phase_endpoint_relative_error = np.asarray([], dtype=float)

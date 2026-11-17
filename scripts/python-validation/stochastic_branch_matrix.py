@@ -83,9 +83,10 @@ def run_branch_matrix(
     branch_source_callback_counts = []
     branch_active_callback_counts = []
     branch_validation_seeds = []
-    previous_argv = sys.argv
-    try:
-        for branch_index, (method, textured) in enumerate(BRANCHES):
+    for branch_index, (method, textured) in enumerate(BRANCHES):
+        previous_argv = sys.argv
+        previous_argv_contents = list(previous_argv)
+        try:
             branch_seed = args.seed + branch_index * 100_000
             target_argv = [
                 str(args.example),
@@ -105,67 +106,69 @@ def run_branch_matrix(
             ]
             if textured:
                 target_argv.append("-textured")
-            sys.argv = target_argv
+            previous_argv[:] = target_argv
             namespace = run_path(str(args.example), run_name="__main__")
+        finally:
+            if sys.argv is not previous_argv:
+                sys.argv = previous_argv
+            previous_argv[:] = previous_argv_contents
 
-            sample_count = args.trials if method == 1 else args.dipoles
-            frequencies = _require_array(
-                namespace, "freqs", (args.frequencies,)
-            ).astype(float, copy=False)
-            fluxes = _require_array(
-                namespace, "fluxes", (args.frequencies, sample_count)
-            ).astype(float, copy=False)
-            mean_flux = _require_array(
-                namespace, "mean_flux", (args.frequencies,)
-            ).astype(float, copy=False)
-            standard_deviation_flux = _require_array(
-                namespace,
-                "standard_deviation_flux",
-                (args.frequencies,),
-            ).astype(float, copy=False)
-            trial_flux_l2 = _require_array(
-                namespace, "trial_flux_l2", (sample_count,)
-            ).astype(float, copy=False)
-            callback_counts = _require_array(
-                namespace,
-                "source_callback_counts",
-                (args.trials * args.dipoles if method == 1 else 0,),
-            ).astype(np.int64, copy=False)
-            validation_seed = int(namespace.get("validation_seed", -1))
+        sample_count = args.trials if method == 1 else args.dipoles
+        frequencies = _require_array(
+            namespace, "freqs", (args.frequencies,)
+        ).astype(float, copy=False)
+        fluxes = _require_array(
+            namespace, "fluxes", (args.frequencies, sample_count)
+        ).astype(float, copy=False)
+        mean_flux = _require_array(
+            namespace, "mean_flux", (args.frequencies,)
+        ).astype(float, copy=False)
+        standard_deviation_flux = _require_array(
+            namespace,
+            "standard_deviation_flux",
+            (args.frequencies,),
+        ).astype(float, copy=False)
+        trial_flux_l2 = _require_array(
+            namespace, "trial_flux_l2", (sample_count,)
+        ).astype(float, copy=False)
+        callback_counts = _require_array(
+            namespace,
+            "source_callback_counts",
+            (args.trials * args.dipoles if method == 1 else 0,),
+        ).astype(np.int64, copy=False)
+        validation_seed = int(namespace.get("validation_seed", -1))
 
-            if not np.all(np.diff(frequencies) > 0):
-                raise RuntimeError("stochastic-emitter frequencies are not increasing")
-            if not np.any(np.abs(fluxes) > 0) or np.any(trial_flux_l2 <= 1e-10):
-                raise RuntimeError("stochastic-emitter branch produced no spectrum")
-            if not np.allclose(mean_flux, np.mean(fluxes, axis=1)):
-                raise RuntimeError("stochastic-emitter mean does not close")
-            if not np.allclose(
-                standard_deviation_flux, np.std(fluxes, axis=1)
-            ):
-                raise RuntimeError("stochastic-emitter deviation does not close")
-            if not np.allclose(trial_flux_l2, np.linalg.norm(fluxes, axis=0)):
-                raise RuntimeError("stochastic-emitter trial norm does not close")
-            if validation_seed != branch_seed:
-                raise RuntimeError(
-                    f"stochastic-emitter seed {validation_seed} != {branch_seed}"
-                )
-            if method == 1 and np.any(callback_counts <= 0):
-                raise RuntimeError("CustomSource callbacks did not execute")
-            if method == 2 and callback_counts.size:
-                raise RuntimeError("GaussianSource branch unexpectedly used callbacks")
+        if not np.all(np.diff(frequencies) > 0):
+            raise RuntimeError("stochastic-emitter frequencies are not increasing")
+        if not np.any(np.abs(fluxes) > 0) or np.any(trial_flux_l2 <= 1e-10):
+            raise RuntimeError("stochastic-emitter branch produced no spectrum")
+        if not np.allclose(mean_flux, np.mean(fluxes, axis=1)):
+            raise RuntimeError("stochastic-emitter mean does not close")
+        if not np.allclose(
+            standard_deviation_flux, np.std(fluxes, axis=1)
+        ):
+            raise RuntimeError("stochastic-emitter deviation does not close")
+        if not np.allclose(trial_flux_l2, np.linalg.norm(fluxes, axis=0)):
+            raise RuntimeError("stochastic-emitter trial norm does not close")
+        if validation_seed != branch_seed:
+            raise RuntimeError(
+                f"stochastic-emitter seed {validation_seed} != {branch_seed}"
+            )
+        if method == 1 and np.any(callback_counts <= 0):
+            raise RuntimeError("CustomSource callbacks did not execute")
+        if method == 2 and callback_counts.size:
+            raise RuntimeError("GaussianSource branch unexpectedly used callbacks")
 
-            padded_callbacks = np.zeros(args.trials * args.dipoles, dtype=np.int64)
-            padded_callbacks[: callback_counts.size] = callback_counts
-            branch_frequencies.append(frequencies)
-            branch_fluxes.append(fluxes)
-            branch_mean_fluxes.append(mean_flux)
-            branch_standard_deviation_fluxes.append(standard_deviation_flux)
-            branch_trial_flux_l2.append(trial_flux_l2)
-            branch_source_callback_counts.append(padded_callbacks)
-            branch_active_callback_counts.append(callback_counts.size)
-            branch_validation_seeds.append(validation_seed)
-    finally:
-        sys.argv = previous_argv
+        padded_callbacks = np.zeros(args.trials * args.dipoles, dtype=np.int64)
+        padded_callbacks[: callback_counts.size] = callback_counts
+        branch_frequencies.append(frequencies)
+        branch_fluxes.append(fluxes)
+        branch_mean_fluxes.append(mean_flux)
+        branch_standard_deviation_fluxes.append(standard_deviation_flux)
+        branch_trial_flux_l2.append(trial_flux_l2)
+        branch_source_callback_counts.append(padded_callbacks)
+        branch_active_callback_counts.append(callback_counts.size)
+        branch_validation_seeds.append(validation_seed)
 
     frequency_matrix = np.stack(branch_frequencies)
     if not np.allclose(frequency_matrix, frequency_matrix[0]):

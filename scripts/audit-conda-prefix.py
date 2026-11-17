@@ -507,7 +507,10 @@ def _selected_package_payload(
             )
             if raw_digest != record["sha256"] or size != record["size_in_bytes"]:
                 raise RuntimeError(
-                    f"exact-lock package payload differs from path metadata: {relative}"
+                    "exact-lock package payload differs from path metadata: "
+                    f"{relative}; observed_sha256={raw_digest}; "
+                    f"expected_sha256={record['sha256']}; "
+                    f"observed_size={size}; expected_size={record['size_in_bytes']}"
                 )
             result[relative] = {
                 "raw_sha256": raw_digest,

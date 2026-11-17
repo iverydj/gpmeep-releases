@@ -779,27 +779,37 @@ bool run_phase_batched_curl_case() {
   std::vector<float> reference_b = initial_b;
   std::vector<float> candidate_a = initial_a;
   std::vector<float> candidate_b = initial_b;
+  std::vector<float> graph_a = initial_a;
+  std::vector<float> graph_b = initial_b;
   std::vector<float> reference_u = initial_u;
   std::vector<float> candidate_u = initial_u;
+  std::vector<float> graph_u = initial_u;
   std::vector<float> reference_conductivity_field =
       initial_conductivity_field;
   std::vector<float> candidate_conductivity_field =
+      initial_conductivity_field;
+  std::vector<float> graph_conductivity_field =
       initial_conductivity_field;
 
   auto device_reference_a = copy_vector_to_device(reference_a);
   auto device_reference_b = copy_vector_to_device(reference_b);
   auto device_candidate_a = copy_vector_to_device(candidate_a);
   auto device_candidate_b = copy_vector_to_device(candidate_b);
+  auto device_graph_a = copy_vector_to_device(graph_a);
+  auto device_graph_b = copy_vector_to_device(graph_b);
   auto device_g1_a = copy_vector_to_device(g1_a);
   auto device_g2_a = copy_vector_to_device(g2_a);
   auto device_g1_b = copy_vector_to_device(g1_b);
   auto device_g2_b = copy_vector_to_device(g2_b);
   auto device_reference_u = copy_vector_to_device(reference_u);
   auto device_candidate_u = copy_vector_to_device(candidate_u);
+  auto device_graph_u = copy_vector_to_device(graph_u);
   auto device_reference_conductivity_field =
       copy_vector_to_device(reference_conductivity_field);
   auto device_candidate_conductivity_field =
       copy_vector_to_device(candidate_conductivity_field);
+  auto device_graph_conductivity_field =
+      copy_vector_to_device(graph_conductivity_field);
   auto device_conductivity = copy_vector_to_device(conductivity);
   auto device_conductivity_inverse =
       copy_vector_to_device(conductivity_inverse);
@@ -837,18 +847,25 @@ bool run_phase_batched_curl_case() {
       make_full_material(
           static_cast<float *>(device_candidate_u.get()),
           static_cast<float *>(device_candidate_conductivity_field.get()));
+  const meep_cuda::curl_material_fp32 graph_full_material =
+      make_full_material(
+          static_cast<float *>(device_graph_u.get()),
+          static_cast<float *>(device_graph_conductivity_field.get()));
 
-  meep_cuda::step_curl_material_structured_fp32(
-      static_cast<float *>(device_reference_a.get()),
-      static_cast<const float *>(device_g1_a.get()),
-      static_cast<const float *>(device_g2_a.get()), bare_space,
-      point_count(bare_space), stride1, stride2, dtdx, bare_material);
-  meep_cuda::step_curl_material_structured_fp32(
-      static_cast<float *>(device_reference_b.get()),
-      static_cast<const float *>(device_g1_b.get()),
-      static_cast<const float *>(device_g2_b.get()), full_space,
-      point_count(full_space), stride1, stride2, dtdx,
-      reference_full_material);
+  constexpr std::size_t graph_replays = 2;
+  for (std::size_t replay = 0; replay < graph_replays; ++replay) {
+    meep_cuda::step_curl_material_structured_fp32(
+        static_cast<float *>(device_reference_a.get()),
+        static_cast<const float *>(device_g1_a.get()),
+        static_cast<const float *>(device_g2_a.get()), bare_space,
+        point_count(bare_space), stride1, stride2, dtdx, bare_material);
+    meep_cuda::step_curl_material_structured_fp32(
+        static_cast<float *>(device_reference_b.get()),
+        static_cast<const float *>(device_g1_b.get()),
+        static_cast<const float *>(device_g2_b.get()), full_space,
+        point_count(full_space), stride1, stride2, dtdx,
+        reference_full_material);
+  }
 
   constexpr std::size_t threads = 256;
   const std::size_t first_blocks =
@@ -873,13 +890,43 @@ bool run_phase_batched_curl_case() {
   auto device_operations = copy_vector_to_device(operations);
   auto device_block_operation_indices =
       copy_vector_to_device(block_operation_indices);
-  meep_cuda::step_curl_material_phase_batched_fp32(
-      static_cast<const meep_cuda::curl_phase_operation_fp32 *>(
-          device_operations.get()),
-      static_cast<const std::uint32_t *>(
-          device_block_operation_indices.get()),
-      operations.size(), first_blocks + second_blocks);
-  meep_cuda::synchronize();
+  for (std::size_t replay = 0; replay < graph_replays; ++replay)
+    meep_cuda::step_curl_material_phase_batched_fp32(
+        static_cast<const meep_cuda::curl_phase_operation_fp32 *>(
+            device_operations.get()),
+        static_cast<const std::uint32_t *>(
+            device_block_operation_indices.get()),
+        operations.size(), first_blocks + second_blocks);
+
+  const std::vector<meep_cuda::curl_phase_operation_fp32>
+      graph_operations = {
+          {static_cast<float *>(device_graph_a.get()),
+           static_cast<const float *>(device_g1_a.get()),
+           static_cast<const float *>(device_g2_a.get()), bare_space,
+           point_count(bare_space), 0, stride1, stride2, dtdx,
+           bare_material},
+          {static_cast<float *>(device_graph_b.get()),
+           static_cast<const float *>(device_g1_b.get()),
+           static_cast<const float *>(device_g2_b.get()), full_space,
+           point_count(full_space), first_blocks, stride1, stride2, dtdx,
+           graph_full_material}};
+  meep_cuda::structured_curl_graph_fp32 *graph =
+      meep_cuda::create_structured_curl_graph_fp32(
+          graph_operations.data(), graph_operations.size());
+  for (std::size_t replay = 0; replay < graph_replays; ++replay)
+    meep_cuda::launch_structured_curl_graph_fp32(graph);
+  // Deliberately destroy immediately after asynchronous submissions.  A true
+  // return is the lifetime fence which permits the captured device buffers to
+  // be copied or reclaimed below; no incidental copy synchronization may be
+  // relied upon by graph teardown.
+  const bool graph_destroyed =
+      meep_cuda::destroy_structured_curl_graph_fp32(graph);
+  if (!graph_destroyed) {
+    std::cerr
+        << "structured-curl Graph destroy could not prove quiescence; "
+           "terminating without unwinding captured device allocations\n";
+    std::abort();
+  }
 
   meep_cuda::copy_to_host(reference_a.data(), device_reference_a.get(),
                           reference_a.size() * sizeof(float));
@@ -889,10 +936,16 @@ bool run_phase_batched_curl_case() {
                           candidate_a.size() * sizeof(float));
   meep_cuda::copy_to_host(candidate_b.data(), device_candidate_b.get(),
                           candidate_b.size() * sizeof(float));
+  meep_cuda::copy_to_host(graph_a.data(), device_graph_a.get(),
+                          graph_a.size() * sizeof(float));
+  meep_cuda::copy_to_host(graph_b.data(), device_graph_b.get(),
+                          graph_b.size() * sizeof(float));
   meep_cuda::copy_to_host(reference_u.data(), device_reference_u.get(),
                           reference_u.size() * sizeof(float));
   meep_cuda::copy_to_host(candidate_u.data(), device_candidate_u.get(),
                           candidate_u.size() * sizeof(float));
+  meep_cuda::copy_to_host(graph_u.data(), device_graph_u.get(),
+                          graph_u.size() * sizeof(float));
   meep_cuda::copy_to_host(
       reference_conductivity_field.data(),
       device_reference_conductivity_field.get(),
@@ -901,6 +954,10 @@ bool run_phase_batched_curl_case() {
       candidate_conductivity_field.data(),
       device_candidate_conductivity_field.get(),
       candidate_conductivity_field.size() * sizeof(float));
+  meep_cuda::copy_to_host(
+      graph_conductivity_field.data(),
+      device_graph_conductivity_field.get(),
+      graph_conductivity_field.size() * sizeof(float));
 
   float error = maximum_error(candidate_a, reference_a);
   error = std::max(error, maximum_error(candidate_b, reference_b));
@@ -908,13 +965,26 @@ bool run_phase_batched_curl_case() {
   error = std::max(
       error, maximum_error(candidate_conductivity_field,
                            reference_conductivity_field));
-  const bool changed = maximum_change(candidate_a, initial_a) > 1.0e-7f &&
-                       maximum_change(candidate_b, initial_b) > 1.0e-7f &&
-                       maximum_change(candidate_u, initial_u) > 1.0e-7f &&
-                       maximum_change(candidate_conductivity_field,
-                                      initial_conductivity_field) > 1.0e-7f;
+  error = std::max(error, maximum_error(graph_a, reference_a));
+  error = std::max(error, maximum_error(graph_b, reference_b));
+  error = std::max(error, maximum_error(graph_u, reference_u));
+  error = std::max(
+      error, maximum_error(graph_conductivity_field,
+                           reference_conductivity_field));
+  const bool changed =
+      maximum_change(candidate_a, initial_a) > 1.0e-7f &&
+      maximum_change(candidate_b, initial_b) > 1.0e-7f &&
+      maximum_change(candidate_u, initial_u) > 1.0e-7f &&
+      maximum_change(candidate_conductivity_field,
+                     initial_conductivity_field) > 1.0e-7f &&
+      maximum_change(graph_a, initial_a) > 1.0e-7f &&
+      maximum_change(graph_b, initial_b) > 1.0e-7f &&
+      maximum_change(graph_u, initial_u) > 1.0e-7f &&
+      maximum_change(graph_conductivity_field,
+                     initial_conductivity_field) > 1.0e-7f;
   std::cout << "phase_batched_curl operations=" << operations.size()
             << " blocks=" << first_blocks + second_blocks
+            << " graph_replays=" << graph_replays
             << " max_abs_error=" << error << '\n';
   return error <= 5.0e-6f && changed;
 }
@@ -1078,7 +1148,9 @@ bool run_phase_batched_update_eh_case() {
 
 bool run_lorentzian_case(int offdiagonal_count, bool drude,
                          bool negative_strides, bool increment_state,
-                         bool structured) {
+                         bool structured,
+                         bool zero_state_elision = false,
+                         int coefficient_edge = 0) {
   constexpr std::size_t array_size = 4096;
   constexpr std::size_t count = 2048;
   const std::ptrdiff_t field_stride = negative_strides ? -1 : 1;
@@ -1114,6 +1186,25 @@ bool run_lorentzian_case(int offdiagonal_count, bool drude,
   indices.reserve(count);
   for (std::size_t j = 0; j < count; ++j)
     indices.push_back(static_cast<std::ptrdiff_t>(4 + j));
+  if (zero_state_elision)
+    for (const std::ptrdiff_t i : indices) {
+      polarization[i] = 0.0f;
+      previous[i] = 0.0f;
+      sigma[i] = 0.0f;
+    }
+  if (zero_state_elision) {
+    // Every route compares the opt-in kernel against a second legacy kernel
+    // on the same device.  This makes signed-zero and NaN payload checks
+    // independent of host/device floating-point representation differences.
+    polarization[indices[0]] = -0.0f;
+    previous[indices[1]] = -0.0f;
+    sigma[indices[2]] = -0.0f;
+    field[indices[3]] = std::numeric_limits<float>::infinity();
+    field[indices[4]] = std::numeric_limits<float>::quiet_NaN();
+    polarization[indices[5]] = 0.125f;
+    previous[indices[6]] = -0.125f;
+    sigma[indices[7]] = 0.2f;
+  }
   meep_cuda::index_space_fp32 index_space = {};
   index_space.field_start = 4;
   index_space.extent1 = count;
@@ -1123,8 +1214,16 @@ bool run_lorentzian_case(int offdiagonal_count, bool drude,
   index_space.coefficient_start = -1;
   index_space.coefficient2_start = -1;
 
-  const meep_cuda::detail::lorentzian_coefficients_fp32 coefficients = {
+  meep_cuda::detail::lorentzian_coefficients_fp32 coefficients = {
       0.93f, 0.89f, 0.08f, drude ? 0.0f : 0.08f};
+  if (coefficient_edge == 1)
+    coefficients.gamma_inverse =
+        std::numeric_limits<float>::infinity();
+  else if (coefficient_edge == 2)
+    coefficients.omega_dt_squared =
+        std::numeric_limits<float>::quiet_NaN();
+  else if (coefficient_edge == 3)
+    coefficients.gamma_inverse = -1.0f;
   std::vector<float> reference_polarization = polarization;
   std::vector<float> reference_previous = previous;
   for (const std::ptrdiff_t i : indices) {
@@ -1159,6 +1258,12 @@ bool run_lorentzian_case(int offdiagonal_count, bool drude,
   auto device_sigma1 = copy_vector_to_device(sigma1);
   auto device_sigma2 = copy_vector_to_device(sigma2);
   auto device_indices = copy_vector_to_device(indices);
+  device_pointer device_legacy_polarization(nullptr);
+  device_pointer device_legacy_previous(nullptr);
+  if (zero_state_elision) {
+    device_legacy_polarization = copy_vector_to_device(polarization);
+    device_legacy_previous = copy_vector_to_device(previous);
+  }
   const meep_cuda::lorentzian_material_fp32 material = {
       static_cast<const float *>(device_sigma.get()),
       offdiagonal_count >= 1
@@ -1170,7 +1275,10 @@ bool run_lorentzian_case(int offdiagonal_count, bool drude,
       coefficients.gamma_inverse,
       coefficients.gamma_previous,
       coefficients.omega_dt_squared,
-      coefficients.omega_dt_squared_denominator};
+      coefficients.omega_dt_squared_denominator,
+      zero_state_elision
+          ? meep_cuda::lorentzian_elide_bit_identical_positive_zero_fp32
+          : 0U};
   float *device_p = static_cast<float *>(device_polarization.get());
   float *device_state = static_cast<float *>(device_previous.get());
   const float *device_w = static_cast<const float *>(device_field.get());
@@ -1200,14 +1308,55 @@ bool run_lorentzian_case(int offdiagonal_count, bool drude,
         device_p, device_state, device_w, device_w1, device_w2,
         static_cast<const std::ptrdiff_t *>(device_indices.get()), count,
         field_stride, stride1, stride2, material);
+  if (zero_state_elision) {
+    meep_cuda::lorentzian_material_fp32 legacy_material = material;
+    legacy_material.options = 0;
+    float *legacy_p =
+        static_cast<float *>(device_legacy_polarization.get());
+    float *legacy_state =
+        static_cast<float *>(device_legacy_previous.get());
+    if (increment_state && structured)
+      meep_cuda::update_lorentzian_increment_structured_fp32(
+          legacy_p, legacy_state, device_w, device_w1, device_w2,
+          index_space, count, field_stride, stride1, stride2,
+          legacy_material);
+    else if (increment_state)
+      meep_cuda::update_lorentzian_increment_fp32(
+          legacy_p, legacy_state, device_w, device_w1, device_w2,
+          static_cast<const std::ptrdiff_t *>(device_indices.get()), count,
+          field_stride, stride1, stride2, legacy_material);
+    else if (structured)
+      meep_cuda::update_lorentzian_structured_fp32(
+          legacy_p, legacy_state, device_w, device_w1, device_w2,
+          index_space, count, field_stride, stride1, stride2,
+          legacy_material);
+    else
+      meep_cuda::update_lorentzian_fp32(
+          legacy_p, legacy_state, device_w, device_w1, device_w2,
+          static_cast<const std::ptrdiff_t *>(device_indices.get()), count,
+          field_stride, stride1, stride2, legacy_material);
+  }
   meep_cuda::synchronize();
   meep_cuda::copy_to_host(
       polarization.data(), device_polarization.get(),
       polarization.size() * sizeof(float));
   meep_cuda::copy_to_host(previous.data(), device_previous.get(),
                           previous.size() * sizeof(float));
+  std::vector<float> legacy_polarization;
+  std::vector<float> legacy_previous;
+  if (zero_state_elision) {
+    legacy_polarization.resize(array_size);
+    legacy_previous.resize(array_size);
+    meep_cuda::copy_to_host(
+        legacy_polarization.data(), device_legacy_polarization.get(),
+        legacy_polarization.size() * sizeof(float));
+    meep_cuda::copy_to_host(
+        legacy_previous.data(), device_legacy_previous.get(),
+        legacy_previous.size() * sizeof(float));
+  }
 
   float max_absolute_error = 0.0f;
+  bool selected_points_bitwise_equal = true;
   for (std::size_t i = 0; i < array_size; ++i) {
     max_absolute_error =
         std::max(max_absolute_error,
@@ -1216,13 +1365,23 @@ bool run_lorentzian_case(int offdiagonal_count, bool drude,
         std::max(max_absolute_error,
                  std::abs(previous[i] - reference_previous[i]));
   }
+  if (zero_state_elision)
+    for (const std::ptrdiff_t i : indices)
+      selected_points_bitwise_equal =
+          selected_points_bitwise_equal &&
+          std::memcmp(&polarization[i], &legacy_polarization[i],
+                      sizeof(float)) == 0 &&
+          std::memcmp(&previous[i], &legacy_previous[i], sizeof(float)) ==
+              0;
   std::cout << "lorentzian_case offdiagonal=" << offdiagonal_count
             << " drude=" << drude
             << " negative_strides=" << negative_strides
             << " increment_state=" << increment_state
             << " structured=" << structured
+            << " zero_state_elision=" << zero_state_elision
+            << " coefficient_edge=" << coefficient_edge
             << " max_abs_error=" << max_absolute_error << '\n';
-  return max_absolute_error <= 8.0e-6f;
+  return max_absolute_error <= 8.0e-6f && selected_points_bitwise_equal;
 }
 
 bool run_gyrotropic_case(int model, int transverse_count,
@@ -4914,6 +5073,19 @@ int main() {
                      "CPU reference\n";
               return 1;
             }
+
+  for (int increment_state = 0; increment_state < 2; ++increment_state)
+    for (int structured = 0; structured < 2; ++structured)
+      for (int coefficient_edge = 0; coefficient_edge < 4;
+           ++coefficient_edge)
+        if (!run_lorentzian_case(0, false, false, increment_state != 0,
+                                 structured != 0, true,
+                                 coefficient_edge)) {
+          std::cerr << "FAIL: bit-identical CUDA FP32 zero-state Lorentzian "
+                       "elision differs from the same-device legacy "
+                       "reference for an edge input\n";
+          return 1;
+        }
 
   for (int model = meep_cuda::detail::gyrotropic_lorentzian_fp32;
        model <= meep_cuda::detail::gyrotropic_saturated_fp32; ++model)

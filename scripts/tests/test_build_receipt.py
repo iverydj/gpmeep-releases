@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import importlib.util
 import io
 import copy
@@ -40,9 +41,184 @@ GPU_STEP_DB = BUILDER.parents[1] / "tests" / "gpu-step-db.cpp"
 INSTALLED_CUDA_RUNNER = BUILDER.with_name(
     "run-installed-cuda-qualification.py"
 )
+BACKEND_POLICY = BUILDER.parents[1] / "python" / "backend_policy.py"
+V110_CONTRACT = BUILDER.parents[1] / "packaging" / (
+    "v110-development-contract.json"
+)
+V110_CONTRACT_VALIDATOR = BUILDER.with_name(
+    "validate-v110-development-contract.py"
+)
 
 
 class BuildReceiptTest(unittest.TestCase):
+    def test_backend_acknowledgement_binding_contracts_are_exact(self):
+        def literal_assignment(path: pathlib.Path, name: str):
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            matches = [
+                node.value
+                for node in tree.body
+                if isinstance(node, ast.Assign)
+                and any(
+                    isinstance(target, ast.Name) and target.id == name
+                    for target in node.targets
+                )
+            ]
+            self.assertEqual(len(matches), 1, f"{name} in {path}")
+            return ast.literal_eval(matches[0])
+
+        expected = gpmeep_qualification_contract.ACKNOWLEDGEMENT_BINDING_KEYS
+        runtime = literal_assignment(
+            BACKEND_POLICY, "_ACKNOWLEDGEMENT_BINDING_KEYS"
+        )
+        validator = literal_assignment(
+            V110_CONTRACT_VALIDATOR, "EXPECTED_ACK_BINDINGS"
+        )
+        development_contract = json.loads(
+            V110_CONTRACT.read_text(encoding="utf-8")
+        )["backend_policy"]["acknowledgement"]["required_digest_bindings"]
+        self.assertTupleEqual(tuple(runtime), expected)
+        self.assertTupleEqual(tuple(validator), expected)
+        self.assertTupleEqual(tuple(development_contract), expected)
+
+    def test_installed_cuda_contract_pins_exact_source_test_identities(self):
+        repo = BUILDER.parents[1]
+        for log_name, spec in (
+            gpmeep_qualification_contract.INSTALLED_CUDA_QUALIFICATION_SPECS.items()
+        ):
+            path = repo / str(spec["test_file"])
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            source_identities = tuple(
+                sorted(
+                    f"{class_node.name}.{method_node.name}"
+                    for class_node in tree.body
+                    if isinstance(class_node, ast.ClassDef)
+                    for method_node in class_node.body
+                    if isinstance(
+                        method_node, (ast.FunctionDef, ast.AsyncFunctionDef)
+                    )
+                    and method_node.name.startswith("test")
+                )
+            )
+            with self.subTest(log_name=log_name):
+                self.assertTupleEqual(
+                    tuple(spec["source_test_identities"]), source_identities
+                )
+                selected = tuple(spec["test_identities"])
+                excluded = (
+                    {"TestGpuBackend.test_required_cuda_boundary_replay_observations"}
+                    if log_name == "installed-python-gpu-backend-two-rank.log"
+                    else set()
+                )
+                self.assertTupleEqual(
+                    selected,
+                    tuple(name for name in source_identities if name not in excluded),
+                )
+                self.assertEqual(spec["tests_run"], len(selected))
+
+    def _installed_suite_helpers(self):
+        tree = ast.parse(INSTALLED_CUDA_RUNNER.read_text(encoding="utf-8"))
+        names = {"_suite_test_identities", "_select_suite"}
+        nodes = [
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name in names
+        ]
+        self.assertEqual({node.name for node in nodes}, names)
+        namespace = {
+            "unittest": unittest,
+            "Any": object,
+            "QualificationContractError": (
+                gpmeep_qualification_contract.QualificationContractError
+            ),
+        }
+        exec(
+            compile(ast.Module(body=nodes, type_ignores=[]), str(INSTALLED_CUDA_RUNNER), "exec"),
+            namespace,
+        )
+        return namespace
+
+    def _synthetic_installed_gpu_suite(self, identities, executed):
+        def run_case(case):
+            executed.append(f"TestGpuBackend.{case._testMethodName}")
+
+        case_type = type(
+            "TestGpuBackend", (unittest.TestCase,),
+            {identity.split(".")[-1]: run_case for identity in identities},
+        )
+        cases = list(unittest.defaultTestLoader.loadTestsFromTestCase(case_type))
+        return unittest.TestSuite([
+            unittest.TestSuite(cases[:3]), unittest.TestSuite(cases[3:]),
+        ])
+
+    def test_installed_cuda_selector_executes_exact_topology_scope(self):
+        helpers = self._installed_suite_helpers()
+        for suffix, expected_count in (("singleton", 18), ("two-rank", 17)):
+            spec = gpmeep_qualification_contract.INSTALLED_CUDA_QUALIFICATION_SPECS[
+                f"installed-python-gpu-backend-{suffix}.log"
+            ]
+            executed = []
+            full = self._synthetic_installed_gpu_suite(
+                spec["source_test_identities"], executed
+            )
+            selected = helpers["_select_suite"](full, spec)
+            self.assertEqual(selected.countTestCases(), expected_count)
+            self.assertTupleEqual(
+                helpers["_suite_test_identities"](selected), spec["test_identities"]
+            )
+            result = unittest.TestResult()
+            selected.run(result)
+            self.assertEqual(result.testsRun, expected_count)
+            self.assertTrue(result.wasSuccessful())
+            self.assertEqual(result.skipped, [])
+            self.assertTupleEqual(tuple(sorted(executed)), spec["test_identities"])
+
+    def test_installed_cuda_selector_rejects_source_inventory_drift_before_execution(self):
+        helpers = self._installed_suite_helpers()
+        spec = gpmeep_qualification_contract.INSTALLED_CUDA_QUALIFICATION_SPECS[
+            "installed-python-gpu-backend-two-rank.log"
+        ]
+        identities = spec["source_test_identities"]
+        for mutation in ("missing", "extra", "duplicate"):
+            executed = []
+            names = identities[:-1] if mutation == "missing" else identities
+            if mutation == "extra":
+                names += ("TestGpuBackend.test_uncontracted_extra",)
+            suite = self._synthetic_installed_gpu_suite(names, executed)
+            if mutation == "duplicate":
+                suite.addTests(self._synthetic_installed_gpu_suite(names[:1], executed))
+            with self.subTest(mutation=mutation), self.assertRaises(
+                gpmeep_qualification_contract.QualificationContractError
+            ):
+                helpers["_select_suite"](suite, spec)
+            self.assertEqual(executed, [])
+
+    def test_installed_cuda_selector_rejects_invalid_scope_before_execution(self):
+        helpers = self._installed_suite_helpers()
+        original = gpmeep_qualification_contract.INSTALLED_CUDA_QUALIFICATION_SPECS[
+            "installed-python-gpu-backend-two-rank.log"
+        ]
+        for mutation in ("duplicate", "unknown", "count", "empty"):
+            spec = dict(original)
+            if mutation == "duplicate":
+                spec["test_identities"] += spec["test_identities"][:1]
+            elif mutation == "unknown":
+                spec["test_identities"] = tuple(sorted((
+                    *spec["test_identities"], "TestGpuBackend.test_uncontracted_extra",
+                )))
+                spec["tests_run"] += 1
+            elif mutation == "empty":
+                spec.update(test_identities=(), tests_run=0)
+            else:
+                spec["tests_run"] += 1
+            executed = []
+            suite = self._synthetic_installed_gpu_suite(
+                spec["source_test_identities"], executed
+            )
+            with self.subTest(mutation=mutation), self.assertRaises(
+                gpmeep_qualification_contract.QualificationContractError
+            ):
+                helpers["_select_suite"](suite, spec)
+            self.assertEqual(executed, [])
+
     def test_cuda_release_kind_cannot_claim_a_generic_contract(self):
         for configuration in ({}, {"qualification_contract": "generic"}):
             receipt = {
@@ -437,6 +613,86 @@ class BuildReceiptTest(unittest.TestCase):
         self.assertIn("rank-asymmetric resident CW numerical breakdown", lane)
         self.assertIn("singleton resident CW numerical breakdown", lane)
 
+    def test_backend_pin_qualification_rejects_live_device_swap(self):
+        builder = BUILDER.read_text(encoding="utf-8")
+        name = "gpu-step-db-backend-pin-device-swap-one-rank"
+        redirect = builder.index(
+            f'>"${{TEST_LOG_DIR}}/{name}.log" 2>&1'
+        )
+        start = builder.rfind("env HOME=", 0, redirect)
+        self.assertNotEqual(start, -1)
+        invocation = builder[start:redirect]
+        self.assertIn("CUDA_VISIBLE_DEVICES=0,1", invocation)
+        self.assertIn("MEEP_GPU_BACKEND=cuda", invocation)
+        self.assertIn("MEEP_GPU_STRICT=1", invocation)
+        self.assertIn("MEEP_GPU_MPI_TRANSPORT=pinned", invocation)
+        self.assertIn("MEEP_GPU_TEST_PREFLIGHT_ONLY=1", invocation)
+        self.assertIn("MEEP_GPU_TEST_DEVICE_SWAP=1", invocation)
+        self.assertIn('"${PREFIX}/bin/mpiexec" -n 1 \\', invocation)
+        self.assertIn(
+            "gpmeep-qualification:" + name + ".log:PASS", builder
+        )
+
+        source = GPU_STEP_DB.read_text(encoding="utf-8")
+        lane = source.split(
+            'if (std::getenv("MEEP_GPU_TEST_DEVICE_SWAP"))', 1
+        )[1].split("const gpu::dispatch_statistics statistics", 1)[0]
+        self.assertIn("f.gpmeep_begin_backend_operation();", lane)
+        self.assertIn("preflighted fields operation is active", lane)
+        self.assertIn("f.gpmeep_release_backend_pin();", lane)
+        self.assertGreaterEqual(lane.count("gpu::select_device("), 2)
+
+    def test_backend_transition_qualifications_are_permanent_release_gates(self):
+        builder = BUILDER.read_text(encoding="utf-8")
+        for name, control in (
+            (
+                "gpu-step-db-backend-transition-one-rank",
+                "MEEP_GPU_TEST_BACKEND_TRANSITION_ONLY=1",
+            ),
+            (
+                "gpu-step-db-transition-rollback-one-rank",
+                "MEEP_GPU_TEST_TRANSITION_ROLLBACK_ONLY=1",
+            ),
+        ):
+            with self.subTest(name=name):
+                redirect = builder.index(
+                    f'>"${{TEST_LOG_DIR}}/{name}.log" 2>&1'
+                )
+                start = builder.rfind("env HOME=", 0, redirect)
+                self.assertNotEqual(start, -1)
+                invocation = builder[start:redirect]
+                self.assertIn("CUDA_VISIBLE_DEVICES=0", invocation)
+                self.assertIn("MEEP_GPU_BACKEND=cuda", invocation)
+                self.assertIn("MEEP_GPU_STRICT=1", invocation)
+                self.assertIn("MEEP_GPU_MPI_TRANSPORT=pinned", invocation)
+                self.assertIn(control, invocation)
+                self.assertIn(
+                    '"${PREFIX}/bin/mpiexec" -n 1 \\', invocation
+                )
+                self.assertIn(
+                    "gpmeep-qualification:" + name + ".log:PASS",
+                    builder,
+                )
+                self.assertIn(
+                    name + ".log",
+                    gpmeep_qualification_contract.REQUIRED_QUALIFICATION_LOGS,
+                )
+
+        source = GPU_STEP_DB.read_text(encoding="utf-8")
+        self.assertIn(
+            'std::getenv("MEEP_GPU_TEST_BACKEND_TRANSITION_ONLY")',
+            source,
+        )
+        self.assertIn(
+            'std::getenv("MEEP_GPU_TEST_TRANSITION_ROLLBACK_ONLY")',
+            source,
+        )
+        self.assertIn(
+            "require_active_resident_phase_transition_rollback();",
+            source,
+        )
+        self.assertIn("require_finite_check_plan_lifecycle();", source)
+
     def test_near2far2d_qualification_requires_two_rank_strict_cuda(self):
         builder = BUILDER.read_text(encoding="utf-8")
         name = "gpu-step-db-near2far2d-two-gpu"
@@ -515,15 +771,11 @@ class BuildReceiptTest(unittest.TestCase):
         builder = BUILDER.read_text(encoding="utf-8")
         cases = (
             (
-                "automatic-backend-request-mismatch-two-rank",
+                "backend-request-mismatch-two-rank",
                 "MEEP_GPU_TEST_RANK_BACKEND_MISMATCH=1",
             ),
             (
-                "automatic-threshold-mismatch-two-rank",
-                "MEEP_GPU_TEST_RANK_AUTO_THRESHOLD_MISMATCH=1",
-            ),
-            (
-                "automatic-invalid-device-two-rank",
+                "invalid-device-two-rank",
                 "MEEP_GPU_TEST_RANK_INVALID_DEVICE=1",
             ),
         )
@@ -538,6 +790,25 @@ class BuildReceiptTest(unittest.TestCase):
                 self.assertIn("MEEP_GPU_TEST_PREFLIGHT_ONLY=1", call)
                 self.assertIn(injection, call)
                 self.assertIn("MEEP_GPU_BACKEND=cuda", call)
+
+        disabled = builder[builder.index(
+            "run_expected_preflight_failure \\\n  automatic-backend-disabled-one-rank 1 \\\n"
+        ):]
+        disabled = disabled[:disabled.index("\nrun_expected_", 1)]
+        self.assertIn("MEEP_GPU_BACKEND=auto", disabled)
+        self.assertIn("automatic selection is disabled", disabled)
+        self.assertIn("MEEP_GPU_TEST_PREFLIGHT_ONLY=1", disabled)
+
+        token_disabled = builder[builder.index(
+            "run_expected_preflight_failure \\\n"
+            "  automatic-backend-token-disabled-one-rank 1 \\\n"
+        ):]
+        token_disabled = token_disabled[:token_disabled.index("\nrun_expected_", 1)]
+        self.assertIn("MEEP_GPU_BACKEND=cuda", token_disabled)
+        self.assertIn("automatic selection is disabled", token_disabled)
+        self.assertIn(
+            "MEEP_GPU_TEST_AUTOMATIC_BACKEND_TOKEN=1", token_disabled
+        )
 
     def test_qualification_log_requires_unique_exact_terminal_marker(self):
         name = "example.log"
@@ -611,12 +882,12 @@ class BuildReceiptTest(unittest.TestCase):
                     log_dir, artifacts, repo
                 )
 
-    def test_qualification_directory_requires_exact_116_log_set(self):
+    def test_qualification_directory_requires_exact_125_log_set(self):
         self.assertEqual(
             len(
                 gpmeep_qualification_contract.ALL_QUALIFICATION_DIRECTORY_LOGS
             ),
-            116,
+            125,
         )
         with tempfile.TemporaryDirectory() as temporary:
             log_dir = pathlib.Path(temporary)
@@ -661,6 +932,16 @@ class BuildReceiptTest(unittest.TestCase):
                 )
 
     def test_installed_cuda_qualification_is_same_process_rank_bound(self):
+        for log_name, expected_count in (
+            ("installed-python-gpu-backend-singleton.log", 18),
+            ("installed-python-gpu-backend-two-rank.log", 17),
+        ):
+            self.assertEqual(
+                gpmeep_qualification_contract.INSTALLED_CUDA_QUALIFICATION_SPECS[
+                    log_name
+                ]["tests_run"],
+                expected_count,
+            )
         with tempfile.TemporaryDirectory() as temporary:
             repo = pathlib.Path(temporary) / "repo"
             log_dir = pathlib.Path(temporary) / "logs"
@@ -699,6 +980,64 @@ class BuildReceiptTest(unittest.TestCase):
                     encoding="utf-8",
                 )
                 suite_record = gpmeep_provenance.file_record(suite_path, repo)
+                topology = [
+                    {
+                        "rank": rank,
+                        "global_rank": rank,
+                        "active_size": spec["world_size"],
+                        "node_rank": rank,
+                        "node_size": spec["world_size"],
+                        "device_identifier": f"GPU-{rank}",
+                        "device_ordinal": rank,
+                    }
+                    for rank in range(spec["world_size"])
+                ]
+                recommendation = {
+                    "schema": "gpmeep-v110-backend-recommendation-v3",
+                    "selected_backend": "cuda",
+                    "recommended_backend": "cpu",
+                    "reason_class": "hardware_crossover",
+                    "recommendation_confidence": "high",
+                    "acknowledgement": True,
+                    "acknowledgement_allowed": True,
+                    "acknowledgement_reused": False,
+                    "acknowledgement_scope": "simulation",
+                    "acknowledgement_origin_cohort_digest": "",
+                    "acknowledgement_scope_cache_enabled": True,
+                    "acknowledgement_scope_digest": "f" * 64,
+                    "workload_fingerprint_evaluated": True,
+                    "acknowledgement_reason": (
+                        "qualification deliberately exercises CUDA"
+                    ),
+                    "recommendation_policy_version": (
+                        "gpmeep-v110-explicit-backend-guard-v24"
+                    ),
+                    "workload_fingerprint": "b" * 64,
+                    "mpi_gpu_topology": topology,
+                    "mpi_topology_digest": (
+                        gpmeep_qualification_contract._canonical_sha256(topology)
+                    ),
+                    "native_state_digest": "e" * 64,
+                    "process_nonce": "c" * 64,
+                    "run_nonce": "d" * 64,
+                    "rank_local_cells": [100] * spec["world_size"],
+                }
+                binding_keys = (
+                    gpmeep_qualification_contract.ACKNOWLEDGEMENT_BINDING_KEYS
+                )
+                challenge = gpmeep_qualification_contract._canonical_sha256(
+                    {
+                        "schema": "gpmeep-v110-backend-ack-v1",
+                        **{
+                            key: recommendation[key]
+                            for key in binding_keys
+                        },
+                    }
+                )
+                recommendation["acknowledgement_digest"] = challenge
+                recommendation[
+                    "acknowledgement_origin_cohort_digest"
+                ] = challenge
                 rank_records = []
                 for rank in range(spec["world_size"]):
                     rank_records.append(
@@ -707,6 +1046,9 @@ class BuildReceiptTest(unittest.TestCase):
                             "world_size": spec["world_size"],
                             "suite": {
                                 "tests_run": spec["tests_run"],
+                                "test_identities": list(
+                                    spec["test_identities"]
+                                ),
                                 "failures": 0,
                                 "errors": 0,
                                 "skipped": 0,
@@ -727,6 +1069,8 @@ class BuildReceiptTest(unittest.TestCase):
                                 "selected_device_identifier": f"GPU-{rank}",
                                 "cuda_execution_selected": True,
                                 "execution_diagnostic": "selected CUDA",
+                                "guarded_challenge": challenge,
+                                "recommendation": copy.deepcopy(recommendation),
                                 "statistics": {
                                     "dispatch": {
                                         "cuda_curl_calls": 2,
@@ -824,11 +1168,66 @@ class BuildReceiptTest(unittest.TestCase):
                 "successful"
             ] = False
             mutations.append(failed_suite)
+            for field in (
+                "failures", "errors", "skipped", "expected_failures", "unexpected_successes"
+            ):
+                forbidden_outcome = copy.deepcopy(values)
+                forbidden_outcome[two_rank_name]["rank_records"][0]["suite"][field] = 1
+                mutations.append(forbidden_outcome)
+            wrong_count = copy.deepcopy(values)
+            wrong_count[two_rank_name]["rank_records"][0]["suite"]["tests_run"] += 1
+            mutations.append(wrong_count)
+            wrong_test_identity = copy.deepcopy(values)
+            wrong_test_identity[two_rank_name]["rank_records"][0]["suite"][
+                "test_identities"
+            ][0] = "TestGpuBackend.test_uncontracted_replacement"
+            mutations.append(wrong_test_identity)
             wrong_extension = copy.deepcopy(values)
             wrong_extension[two_rank_name]["rank_records"][0][
                 "python_extension"
             ]["sha256"] = "0" * 64
             mutations.append(wrong_extension)
+            missing_acknowledgement_reason = copy.deepcopy(values)
+            del missing_acknowledgement_reason[two_rank_name]["rank_records"][0][
+                "probe"
+            ]["recommendation"]["acknowledgement_reason"]
+            mutations.append(missing_acknowledgement_reason)
+            short_acknowledgement_reason = copy.deepcopy(values)
+            short_acknowledgement_reason[two_rank_name]["rank_records"][0][
+                "probe"
+            ]["recommendation"]["acknowledgement_reason"] = "short"
+            mutations.append(short_acknowledgement_reason)
+            rank_challenge_disagreement = copy.deepcopy(values)
+            rank_challenge_disagreement[two_rank_name]["rank_records"][1][
+                "probe"
+            ]["guarded_challenge"] = "e" * 64
+            mutations.append(rank_challenge_disagreement)
+            rank_recommendation_disagreement = copy.deepcopy(values)
+            rank_recommendation_disagreement[two_rank_name]["rank_records"][1][
+                "probe"
+            ]["recommendation"]["acknowledgement_reason"] = (
+                "another rank supplied a different deliberate reason"
+            )
+            mutations.append(rank_recommendation_disagreement)
+            topology_selected_device_mismatch = copy.deepcopy(values)
+            topology_selected_device_mismatch[two_rank_name]["rank_records"][0][
+                "probe"
+            ]["selected_device"] = 7
+            mutations.append(topology_selected_device_mismatch)
+            stale_challenge_binding = copy.deepcopy(values)
+            stale_challenge_binding[two_rank_name]["rank_records"][0]["probe"][
+                "recommendation"
+            ]["run_nonce"] = "e" * 64
+            stale_challenge_binding[two_rank_name]["rank_records"][1]["probe"][
+                "recommendation"
+            ]["run_nonce"] = "e" * 64
+            mutations.append(stale_challenge_binding)
+            stale_native_state_binding = copy.deepcopy(values)
+            for record in stale_native_state_binding[two_rank_name]["rank_records"]:
+                record["probe"]["recommendation"]["native_state_digest"] = (
+                    "f" * 64
+                )
+            mutations.append(stale_native_state_binding)
 
             for mutated in mutations:
                 with self.subTest(mutation=mutations.index(mutated)):
@@ -1111,6 +1510,10 @@ class BuildReceiptTest(unittest.TestCase):
             root = pathlib.Path(temporary)
             package = root / "package"
             package.mkdir(mode=0o755)
+            # pathlib.Path.mkdir applies the process umask.  Make the fixture
+            # mode explicit so this provenance test is deterministic under
+            # hardened build/test wrappers such as ``umask 077``.
+            package.chmod(0o755)
             (package / "payload").write_bytes(b"payload")
             before = tree_manifest(package, root)
             self.assertEqual(before["root_mode_octal"], "0755")
@@ -2172,6 +2575,26 @@ class BuildReceiptTest(unittest.TestCase):
 
     def test_builder_normalizes_and_replays_conda_source_bytecode(self):
         builder = BUILDER.read_text(encoding="utf-8")
+        self.assertIn("for prefix_preparation_attempt in 1 2 3; do", builder)
+        self.assertIn("PREFIX_PREPARATION_PASSED", builder)
+        preparation = builder[
+            builder.index("PREFIX_BYTECODE_NORMALIZATION_TEMP=\"\"") :
+            builder.index("PREFIX_SOURCE_BYTECODE_NORMALIZATION_TEMP=")
+        ]
+        self.assertEqual(
+            preparation.count("for prefix_preparation_attempt in 1 2 3; do"), 1
+        )
+        self.assertIn(".${prefix_preparation_attempt}.json", preparation)
+        self.assertIn("&& \\\n", preparation)
+        self.assertLess(
+            preparation.index("PREFIX_PREPARATION_PASSED=1"),
+            preparation.index("break"),
+        )
+        self.assertLess(
+            preparation.index("done"),
+            preparation.index('if [[ "${PREFIX_PREPARATION_PASSED}" -ne 1 ]]'),
+        )
+        self.assertIn("exit 1", preparation)
         pre_audit = builder.index("PREFIX_PRE_NORMALIZATION_AUDIT_TEMP=")
         normalize = builder.index(
             '"${SCRIPT_DIR}/normalize-conda-relocated-bytecode.py"'

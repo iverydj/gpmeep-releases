@@ -473,6 +473,134 @@ void check_lorentzian_increment_long_horizon() {
           "long Lorentz increment recurrence agrees with long-double oracle");
 }
 
+void check_lorentzian_zero_state_elision_safety() {
+  using meep_cuda::detail::apply_lorentzian_increment_update_fp32;
+  using meep_cuda::detail::apply_lorentzian_update_fp32;
+  using meep_cuda::detail::lorentzian_coefficients_fp32;
+
+  const auto require_same_bits = [](float actual, float expected,
+                                    const char *message) {
+    require(std::memcmp(&actual, &expected, sizeof(float)) == 0, message);
+  };
+  const auto compare_previous_state = [&](float initial_p, float initial_aux,
+                                          float field, float sigma,
+                                          bool anisotropic,
+                                          const lorentzian_coefficients_fp32 &c,
+                                          const char *message) {
+    float legacy_p = initial_p;
+    float legacy_aux = initial_aux;
+    float elided_p = initial_p;
+    float elided_aux = initial_aux;
+    apply_lorentzian_update_fp32(
+        legacy_p, legacy_aux, field, sigma, 0.0f, 0.0f, anisotropic, c,
+        false);
+    apply_lorentzian_update_fp32(
+        elided_p, elided_aux, field, sigma, 0.0f, 0.0f, anisotropic, c,
+        true);
+    require_same_bits(elided_p, legacy_p, message);
+    require_same_bits(elided_aux, legacy_aux, message);
+  };
+  const auto compare_increment_state = [&](float initial_p,
+                                           float initial_increment,
+                                           float field, float sigma,
+                                           bool anisotropic,
+                                           const lorentzian_coefficients_fp32 &c,
+                                           const char *message) {
+    float legacy_p = initial_p;
+    float legacy_increment = initial_increment;
+    float elided_p = initial_p;
+    float elided_increment = initial_increment;
+    apply_lorentzian_increment_update_fp32(
+        legacy_p, legacy_increment, field, sigma, 0.0f, 0.0f,
+        anisotropic, c, false);
+    apply_lorentzian_increment_update_fp32(
+        elided_p, elided_increment, field, sigma, 0.0f, 0.0f,
+        anisotropic, c, true);
+    require_same_bits(elided_p, legacy_p, message);
+    require_same_bits(elided_increment, legacy_increment, message);
+  };
+
+  const lorentzian_coefficients_fp32 regular = {0.91f, 0.87f, 0.12f,
+                                                 0.12f};
+  require(meep_cuda::detail::lorentzian_sparse_coefficients_safe_fp32(
+              regular, false),
+          "previous-state sparse coefficient predicate accepts regular tuple");
+  require(meep_cuda::detail::lorentzian_sparse_coefficients_safe_fp32(
+              regular, true),
+          "increment-state sparse coefficient predicate accepts regular tuple");
+  require(!meep_cuda::detail::lorentzian_sparse_point_active_fp32(
+              0.0f, 0.0f, 0.0f),
+          "positive-zero sparse state is inactive");
+  compare_previous_state(0.0f, 0.0f, 0.42f, 0.0f, false, regular,
+                         "previous-state positive-zero elision is bitwise");
+  compare_increment_state(0.0f, 0.0f, 0.42f, 0.0f, false, regular,
+                          "increment-state positive-zero elision is bitwise");
+
+  compare_previous_state(0.25f, 0.0f, 0.42f, 0.0f, false, regular,
+                         "nonzero previous-state polarization uses legacy path");
+  compare_increment_state(0.0f, 0.125f, 0.42f, 0.0f, false, regular,
+                          "nonzero increment state uses legacy path");
+
+  const float negative_zero = -0.0f;
+  compare_previous_state(negative_zero, 0.0f, 0.42f, 0.0f, false, regular,
+                         "negative-zero polarization uses legacy path");
+  compare_previous_state(0.0f, negative_zero, 0.42f, 0.0f, false, regular,
+                         "negative-zero previous state uses legacy path");
+  compare_increment_state(0.0f, negative_zero, 0.42f, 0.0f, false, regular,
+                          "negative-zero increment uses legacy path");
+  compare_previous_state(0.0f, 0.0f, 0.42f, negative_zero, false, regular,
+                         "negative-zero sigma uses legacy path");
+
+  const lorentzian_coefficients_fp32 negative_output = {-1.0f, 1.0f, 0.0f,
+                                                         0.0f};
+  require(!meep_cuda::detail::lorentzian_sparse_coefficients_safe_fp32(
+              negative_output, false),
+          "negative-zero-producing previous tuple is sparse-unsafe");
+  float signed_p = 0.0f;
+  float signed_aux = 0.0f;
+  apply_lorentzian_update_fp32(signed_p, signed_aux, 0.0f, 0.0f, 0.0f,
+                               0.0f, false, negative_output, true);
+  require(signed_p == 0.0f && std::signbit(signed_p),
+          "finite negative coefficient preserves legacy negative zero");
+
+  const float infinity = std::numeric_limits<float>::infinity();
+  const float quiet_nan = std::numeric_limits<float>::quiet_NaN();
+  compare_previous_state(0.0f, 0.0f, infinity, 0.0f, false, regular,
+                         "infinite field uses legacy path");
+  compare_increment_state(0.0f, 0.0f, quiet_nan, 0.0f, false, regular,
+                          "NaN field uses legacy path");
+  lorentzian_coefficients_fp32 nonfinite = regular;
+  nonfinite.gamma_inverse = infinity;
+  require(!meep_cuda::detail::lorentzian_sparse_coefficients_safe_fp32(
+              nonfinite, false),
+          "non-finite previous tuple is sparse-unsafe");
+  compare_previous_state(0.0f, 0.0f, 0.42f, 0.0f, false, nonfinite,
+                         "infinite coefficient uses legacy path");
+  nonfinite = regular;
+  nonfinite.omega_dt_squared = quiet_nan;
+  require(!meep_cuda::detail::lorentzian_sparse_coefficients_safe_fp32(
+              nonfinite, true),
+          "non-finite increment tuple is sparse-unsafe");
+  compare_increment_state(0.0f, 0.0f, 0.42f, 0.0f, false, nonfinite,
+                          "NaN coefficient uses legacy path");
+
+  compare_previous_state(0.0f, 0.0f, 0.42f, 0.0f, true, regular,
+                         "anisotropic previous state keeps boundary guard");
+  compare_increment_state(0.0f, 0.0f, 0.42f, 0.0f, true, regular,
+                          "anisotropic increment state keeps boundary guard");
+  require(meep_cuda::detail::lorentzian_sparse_point_active_fp32(
+              negative_zero, 0.0f, 0.0f) &&
+              meep_cuda::detail::lorentzian_sparse_point_active_fp32(
+                  0.0f, negative_zero, 0.0f) &&
+              meep_cuda::detail::lorentzian_sparse_point_active_fp32(
+                  0.0f, 0.0f, negative_zero) &&
+              meep_cuda::detail::lorentzian_sparse_point_active_fp32(
+                  quiet_nan, 0.0f, 0.0f) &&
+              meep_cuda::detail::lorentzian_sparse_point_active_fp32(
+                  0.0f, infinity, 0.0f),
+          "negative-zero and non-finite sparse states are active");
+}
+
 void check_gyrotropic_specialization(int model) {
   const float initial_p[3] = {0.31f, -0.27f, 0.19f};
   const float initial_previous[3] = {-0.11f, 0.23f, -0.17f};
@@ -720,6 +848,7 @@ int main() {
         check_lorentzian_increment_specialization(
             offdiagonal_count, drude != 0, zero_diagonal != 0);
   check_lorentzian_increment_long_horizon();
+  check_lorentzian_zero_state_elision_safety();
   for (int model = meep_cuda::detail::gyrotropic_lorentzian_fp32;
        model <= meep_cuda::detail::gyrotropic_saturated_fp32; ++model)
     check_gyrotropic_specialization(model);

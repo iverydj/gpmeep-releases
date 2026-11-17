@@ -71,10 +71,17 @@ class StochasticBranchMatrixTests(unittest.TestCase):
             example.touch()
             args = self.make_args(example)
             previous_argv = sys.argv
+            previous_contents = list(previous_argv)
+
+            def identity_run_path(path: str, *, run_name: str):
+                self.assertIs(sys.argv, previous_argv)
+                return self.fake_run_path(path, run_name=run_name)
+
             result = WRAPPER.run_branch_matrix(
-                args, run_path=self.fake_run_path
+                args, run_path=identity_run_path
             )
         self.assertIs(sys.argv, previous_argv)
+        self.assertEqual(sys.argv, previous_contents)
         np.testing.assert_array_equal(result["branch_codes"], [10, 11, 20, 21])
         self.assertEqual(result["branch_fluxes"].shape, (4, 3, 2))
         self.assertEqual(result["branch_frequencies"].shape, (4, 3))
@@ -100,9 +107,11 @@ class StochasticBranchMatrixTests(unittest.TestCase):
                 return namespace
 
             previous_argv = sys.argv
+            previous_contents = list(previous_argv)
             with self.assertRaisesRegex(RuntimeError, "non-finite"):
                 WRAPPER.run_branch_matrix(args, run_path=bad_run_path)
         self.assertIs(sys.argv, previous_argv)
+        self.assertEqual(sys.argv, previous_contents)
 
     def test_trials_and_dipoles_must_match(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -112,6 +121,49 @@ class StochasticBranchMatrixTests(unittest.TestCase):
                 WRAPPER.parse_args(
                     [str(example), "--trials", "2", "--dipoles", "3"]
                 )
+
+    def test_each_branch_restores_argv_after_nested_rebinding(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            example = pathlib.Path(directory) / "stochastic.py"
+            example.touch()
+            args = self.make_args(example)
+            previous_argv = sys.argv
+            previous_contents = list(previous_argv)
+            calls = 0
+
+            def rebinding_run_path(path: str, *, run_name: str):
+                nonlocal calls
+                self.assertIs(sys.argv, previous_argv)
+                namespace = self.fake_run_path(path, run_name=run_name)
+                calls += 1
+                sys.argv = ["nested-rebind"]
+                return namespace
+
+            result = WRAPPER.run_branch_matrix(
+                args, run_path=rebinding_run_path
+            )
+        self.assertEqual(calls, 4)
+        self.assertIs(sys.argv, previous_argv)
+        self.assertEqual(sys.argv, previous_contents)
+        np.testing.assert_array_equal(result["branch_codes"], [10, 11, 20, 21])
+
+    def test_nested_rebinding_exception_restores_argv_immediately(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            example = pathlib.Path(directory) / "stochastic.py"
+            example.touch()
+            args = self.make_args(example)
+            previous_argv = sys.argv
+            previous_contents = list(previous_argv)
+
+            def failing_run_path(_path: str, *, run_name: str):
+                self.assertEqual(run_name, "__main__")
+                sys.argv = ["nested-rebind"]
+                raise RuntimeError("nested rebind failure")
+
+            with self.assertRaisesRegex(RuntimeError, "nested rebind failure"):
+                WRAPPER.run_branch_matrix(args, run_path=failing_run_path)
+        self.assertIs(sys.argv, previous_argv)
+        self.assertEqual(sys.argv, previous_contents)
 
 
 if __name__ == "__main__":

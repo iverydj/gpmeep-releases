@@ -22,8 +22,8 @@ import common  # noqa: E402
 import run_aunp_performance_workload as performance  # noqa: E402
 
 
-SCHEMA = "gpmeep-installed-aunp-performance-matrix-v2"
-COMPLETE_SCHEMA = "gpmeep-installed-aunp-performance-matrix-complete-v2"
+SCHEMA = "gpmeep-installed-aunp-performance-matrix-v3"
+COMPLETE_SCHEMA = "gpmeep-installed-aunp-performance-matrix-complete-v3"
 PURPOSE = "installed-package replay of the already sealed M3 speed anchor"
 DISCLOSURE = (
     "thermal telemetry remains sealed in the official M3 anchor; this replay "
@@ -331,6 +331,8 @@ def _run_sample(
         package_sha256,
         "--expected-backend",
         lane["backend"],
+        "--acknowledge-backend-mismatch-reason",
+        common.AUNP_BACKEND_ACKNOWLEDGEMENT_REASON,
     ]
     started = time.perf_counter()
     with log_path.open("xb") as log:
@@ -453,12 +455,18 @@ def run(args: argparse.Namespace) -> int:
         ),
         "archive": common.absolute_file_record(archive, "installed AuNP archive"),
         "qualification_profile": common.aunp_qualification_profile(),
+        "backend_acknowledgement_reason": (
+            common.AUNP_BACKEND_ACKNOWLEDGEMENT_REASON
+        ),
         "sealed_m3_anchor": SEALED_M3_ANCHOR,
         "controller": common.file_record(pathlib.Path(__file__), repo),
         "adapter": common.file_record(
             SCRIPT_DIR / "run_aunp_performance_workload.py", repo
         ),
         "common": common.file_record(SCRIPT_DIR / "common.py", repo),
+        "backend_guard": common.file_record(
+            SCRIPT_DIR.parent / "gpmeep_backend_guard.py", repo
+        ),
         "repeats_per_topology": REPEATS,
         "task_order": [task["role"] for task in tasks],
         "tasks": tasks,
@@ -521,10 +529,12 @@ def validate(output: pathlib.Path) -> dict[str, Any]:
         "package_provenance",
         "archive",
         "qualification_profile",
+        "backend_acknowledgement_reason",
         "sealed_m3_anchor",
         "controller",
         "adapter",
         "common",
+        "backend_guard",
         "repeats_per_topology",
         "task_order",
         "tasks",
@@ -541,6 +551,8 @@ def validate(output: pathlib.Path) -> dict[str, Any]:
         or report.get("disclosure") != DISCLOSURE
         or report.get("repeats_per_topology") != REPEATS
         or report.get("qualification_profile") != common.aunp_qualification_profile()
+        or report.get("backend_acknowledgement_reason")
+        != common.AUNP_BACKEND_ACKNOWLEDGEMENT_REASON
         or not _anchor_is_valid(report.get("sealed_m3_anchor"))
     ):
         raise MatrixError("installed AuNP report contract differs")
@@ -569,6 +581,11 @@ def validate(output: pathlib.Path) -> dict[str, Any]:
             "scripts/user-workloads/run_aunp_performance_workload.py",
         ),
         ("common", SCRIPT_DIR / "common.py", "scripts/user-workloads/common.py"),
+        (
+            "backend_guard",
+            SCRIPT_DIR.parent / "gpmeep_backend_guard.py",
+            "scripts/gpmeep_backend_guard.py",
+        ),
     ):
         _verified_relative_record(repo, path, report.get(name), relative, name)
     tasks = report.get("tasks")

@@ -1123,6 +1123,9 @@ int main(int argc, char **argv) {
         gpu::get_phase_batch_policy_statistics();
     const gpu::curl_phase_replay_statistics local_curl_phase_replay =
         gpu::get_curl_phase_replay_statistics();
+    const gpu::structured_curl_graph_statistics
+        local_structured_curl_graph =
+            gpu::get_structured_curl_graph_statistics();
     const gpu::boundary_descriptor_replay_statistics
         local_boundary_descriptor_replay =
             gpu::get_boundary_descriptor_replay_statistics();
@@ -1445,9 +1448,56 @@ int main(int argc, char **argv) {
         global_sum(local_curl_phase_replay.generation_misses);
     const std::uint64_t phase_curl_replay_mirror_misses =
         global_sum(local_curl_phase_replay.mirror_misses);
+    const std::uint64_t structured_curl_graph_collection_checks =
+        global_sum(local_structured_curl_graph.collection_checks);
+    const std::uint64_t structured_curl_graph_collection_launches =
+        global_sum(local_structured_curl_graph.collection_launches);
+    const std::uint64_t structured_curl_graph_plan_creations =
+        global_sum(local_structured_curl_graph.plan_creations);
+    const std::uint64_t structured_curl_graph_plan_rebuilds =
+        global_sum(local_structured_curl_graph.plan_rebuilds);
+    const std::uint64_t structured_curl_graph_plan_reuses =
+        global_sum(local_structured_curl_graph.plan_reuses);
+    const std::uint64_t structured_curl_graph_plan_destroys =
+        global_sum(local_structured_curl_graph.plan_destroys);
+    const std::uint64_t structured_curl_graph_plan_destroy_failures =
+        global_sum(local_structured_curl_graph.plan_destroy_failures);
+    const std::uint64_t structured_curl_graph_live_plans =
+        global_sum(local_structured_curl_graph.live_plans);
+    const std::uint64_t structured_curl_graph_quarantined_plans =
+        global_sum(local_structured_curl_graph.quarantined_plans);
+    const std::uint64_t structured_curl_graph_logical_operations =
+        global_sum(local_structured_curl_graph.logical_operations);
+    const std::uint64_t structured_curl_graph_unsupported_fallbacks =
+        global_sum(local_structured_curl_graph.unsupported_fallbacks);
+    const std::uint64_t structured_curl_graph_creation_fallbacks =
+        global_sum(local_structured_curl_graph.creation_fallbacks);
+    const std::uint64_t structured_curl_graph_launch_failures =
+        global_sum(local_structured_curl_graph.launch_failures);
+    const std::uint64_t structured_curl_graph_replay_checks =
+        global_sum(local_structured_curl_graph.replay_checks);
+    const std::uint64_t structured_curl_graph_replay_launches =
+        global_sum(local_structured_curl_graph.replay_launches);
+    const std::uint64_t structured_curl_graph_replay_unready =
+        global_sum(local_structured_curl_graph.replay_unready);
+    const std::uint64_t structured_curl_graph_replay_generation_misses =
+        global_sum(local_structured_curl_graph.replay_generation_misses);
+    const std::uint64_t structured_curl_graph_replay_mirror_misses =
+        global_sum(local_structured_curl_graph.replay_mirror_misses);
     const std::uint64_t phase_curl_replay_disabled_ranks =
         global_sum(
             std::getenv("MEEP_GPU_DISABLE_CURL_PHASE_REPLAY") ? 1u : 0u);
+    if (structured_curl_graph_collection_checks !=
+            structured_curl_graph_collection_launches +
+                structured_curl_graph_unsupported_fallbacks +
+                structured_curl_graph_creation_fallbacks ||
+        structured_curl_graph_replay_checks !=
+            structured_curl_graph_replay_launches +
+                structured_curl_graph_replay_unready +
+                structured_curl_graph_replay_generation_misses +
+                structured_curl_graph_replay_mirror_misses)
+      throw std::runtime_error(
+          "structured-curl Graph outcome accounting is inconsistent");
     const std::uint64_t phase_update_eh_automatic_checks =
         global_sum(local_phase_batch_policy.update_eh_automatic_checks);
     const std::uint64_t phase_update_eh_automatic_selected =
@@ -1941,6 +1991,39 @@ int main(int argc, char **argv) {
           << phase_curl_replay_generation_misses
           << ",\"mirror_misses\":"
           << phase_curl_replay_mirror_misses << "}\n";
+      std::cout
+          << "gpmeep-structured-curl-graph-v1:{\"collection_checks\":"
+          << structured_curl_graph_collection_checks
+          << ",\"collection_launches\":"
+          << structured_curl_graph_collection_launches
+          << ",\"plan_creations\":"
+          << structured_curl_graph_plan_creations
+          << ",\"plan_rebuilds\":"
+          << structured_curl_graph_plan_rebuilds
+          << ",\"plan_reuses\":" << structured_curl_graph_plan_reuses
+          << ",\"plan_destroys\":" << structured_curl_graph_plan_destroys
+          << ",\"plan_destroy_failures\":"
+          << structured_curl_graph_plan_destroy_failures
+          << ",\"live_plans\":" << structured_curl_graph_live_plans
+          << ",\"quarantined_plans\":"
+          << structured_curl_graph_quarantined_plans
+          << ",\"logical_operations\":"
+          << structured_curl_graph_logical_operations
+          << ",\"unsupported_fallbacks\":"
+          << structured_curl_graph_unsupported_fallbacks
+          << ",\"creation_fallbacks\":"
+          << structured_curl_graph_creation_fallbacks
+          << ",\"launch_failures\":"
+          << structured_curl_graph_launch_failures
+          << ",\"replay_checks\":" << structured_curl_graph_replay_checks
+          << ",\"replay_launches\":"
+          << structured_curl_graph_replay_launches
+          << ",\"replay_unready\":"
+          << structured_curl_graph_replay_unready
+          << ",\"replay_generation_misses\":"
+          << structured_curl_graph_replay_generation_misses
+          << ",\"replay_mirror_misses\":"
+          << structured_curl_graph_replay_mirror_misses << "}\n";
       std::cout
           << "gpmeep-boundary-descriptor-replay-v1:{\"disabled\":"
           << (boundary_descriptor_fast_replay_disabled_everywhere

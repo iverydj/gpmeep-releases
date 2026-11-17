@@ -245,7 +245,7 @@ PROFILE = {
     "conditions": CONDITIONS,
 }
 # Updated only when an intentional profile change is reviewed with its tests.
-PROFILE_SHA256 = "7084108386244419eacf30b3e773500b7b1d1134bb869a8b4975b51f6a39206d"
+PROFILE_SHA256 = "129c8260e767f9ed884b35b7a439cd24616b5bfca0f66d5277daefe0308980c2"
 DIAGNOSTIC_SCHEMA_VERSION = 6
 CAUSAL_CONTRACT_VERSION = 2
 
@@ -302,6 +302,7 @@ INNER_BOOTSTRAP_SHA256 = hashlib.sha256(INNER_BOOTSTRAP.encode()).hexdigest()
 TILE_PREFIX = "gpmeep-tile-coalescing-v1:"
 PHASE_BATCH_POLICY_PREFIX = "gpmeep-phase-batch-policy-v1:"
 CURL_PHASE_REPLAY_PREFIX = "gpmeep-curl-phase-replay-v1:"
+STRUCTURED_CURL_GRAPH_PREFIX = "gpmeep-structured-curl-graph-v1:"
 GRAPH_PREFIX = "gpmeep-boundary-phase-graph-v1:"
 EAGER_PREFIX = "gpmeep-eager-mpi-v1:"
 PINGPONG_PREFIX = "gpmeep-receive-pingpong-v1:"
@@ -351,6 +352,29 @@ FEATURE_SCHEMAS = {
             "unready",
             "generation_misses",
             "mirror_misses",
+        },
+    ),
+    "structured_curl_graph": (
+        STRUCTURED_CURL_GRAPH_PREFIX,
+        {
+            "collection_checks",
+            "collection_launches",
+            "plan_creations",
+            "plan_rebuilds",
+            "plan_reuses",
+            "plan_destroys",
+            "plan_destroy_failures",
+            "live_plans",
+            "quarantined_plans",
+            "logical_operations",
+            "unsupported_fallbacks",
+            "creation_fallbacks",
+            "launch_failures",
+            "replay_checks",
+            "replay_launches",
+            "replay_unready",
+            "replay_generation_misses",
+            "replay_mirror_misses",
         },
     ),
     "boundary_phase_graph": (

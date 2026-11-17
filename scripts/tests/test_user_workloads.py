@@ -7,6 +7,7 @@ import json
 import math
 import os
 import pathlib
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -819,6 +820,318 @@ class UserWorkloadMatrixTests(unittest.TestCase):
             self.assertFalse((output / "FAILED.json").exists())
             self.assertFalse(output.joinpath(*partial.parts).exists())
             self.assertEqual(checkpoint.read_bytes(), b"checkpoint")
+            marker = json.loads(
+                (attempt / "ARCHIVED.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                marker["schema"], "gpmeep-user-workload-resume-archive-v2"
+            )
+            self.assertEqual(marker["member_count"], len(marker["members"]))
+            self.assertIn(
+                "FAILED.json", {member["path"] for member in marker["members"]}
+            )
+            self.assertEqual(len(MATRIX.resume_history_records(output)), 1)
+
+    def test_resume_record_copy_rejects_source_symlink_swap(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            source = root / "source.json"
+            outside = root / "outside.json"
+            destination = root / "archive" / "source.json"
+            source.write_bytes(b"trusted")
+            outside.write_bytes(b"attacker")
+            real_open = MATRIX.os.open
+            swapped = False
+
+            def swap_before_open(path, flags, *args, **kwargs):
+                nonlocal swapped
+                if (
+                    pathlib.Path(path).name == source.name
+                    and kwargs.get("dir_fd") is not None
+                    and not swapped
+                ):
+                    swapped = True
+                    source.unlink()
+                    source.symlink_to(outside)
+                return real_open(path, flags, *args, **kwargs)
+
+            with mock.patch.object(MATRIX.os, "open", side_effect=swap_before_open):
+                with self.assertRaisesRegex(
+                    COMMON.WorkloadError, "cannot be opened safely"
+                ):
+                    MATRIX._copy_resume_record(source, destination)
+            self.assertFalse(destination.exists())
+
+    def test_resume_candidate_move_rejects_source_replacement(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            source = root / "source.json"
+            destination_parent = root / "archive"
+            destination_parent.mkdir()
+            destination = destination_parent / "source.json"
+            source.write_bytes(b"trusted")
+            real_replace = MATRIX.os.replace
+            swapped = False
+
+            def replace_after_swap(source_name, destination_name, *args, **kwargs):
+                nonlocal swapped
+                if pathlib.Path(source_name).name == "source.json" and not swapped:
+                    swapped = True
+                    source.unlink()
+                    source.write_bytes(b"attacker")
+                return real_replace(source_name, destination_name, *args, **kwargs)
+
+            with mock.patch.object(
+                MATRIX.os, "replace", side_effect=replace_after_swap
+            ):
+                with self.assertRaisesRegex(
+                    COMMON.WorkloadError, "changed while it was moved"
+                ):
+                    MATRIX._move_resume_candidate(source, destination)
+
+    def test_process_record_rejects_boolean_returncode_and_string_times(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = pathlib.Path(temporary)
+            log = output / "logs" / "process.log"
+            log.parent.mkdir()
+            log.write_bytes(b"ok\n")
+            valid = {
+                "command": ["fixture"],
+                "command_pid": 1,
+                "returncode": 0,
+                "timed_out": False,
+                "output_limited": False,
+                "output_bytes": 3,
+                "peak_process_group_rss_bytes": 1,
+                "started_unix_seconds": 1.0,
+                "ended_unix_seconds": 2.0,
+                "wall_seconds": 1.0,
+                "log": COMMON.file_record(log, output),
+            }
+            MATRIX._verify_process_record(
+                output, valid, "logs/process.log", "fixture"
+            )
+            with self.assertRaisesRegex(COMMON.WorkloadError, "cleanly"):
+                MATRIX._verify_process_record(
+                    output,
+                    dict(valid, returncode=False),
+                    "logs/process.log",
+                    "fixture",
+                )
+            for name in (
+                "started_unix_seconds",
+                "ended_unix_seconds",
+                "wall_seconds",
+            ):
+                with self.subTest(name=name), self.assertRaisesRegex(
+                    COMMON.WorkloadError, "timing is invalid"
+                ):
+                    MATRIX._verify_process_record(
+                        output,
+                        {**valid, name: str(valid[name])},
+                        "logs/process.log",
+                        "fixture",
+                    )
+
+    def test_resume_history_rejects_archive_member_mutation_deletion_and_addition(self):
+        def archived_output():
+            temporary = tempfile.TemporaryDirectory()
+            output = pathlib.Path(temporary.name)
+            COMMON.atomic_write_json(output / "JOURNAL.json", {"events": []})
+            COMMON.atomic_write_json(output / "FAILED.json", {"error": "fixture"})
+            partial = pathlib.PurePosixPath("partial")
+            (output / partial).write_bytes(b"partial")
+            attempt = MATRIX.archive_interrupted_attempt(output, [partial])
+            return temporary, output, attempt
+
+        temporary, output, attempt = archived_output()
+        with temporary:
+            COMMON.atomic_write_json(
+                attempt / "FAILED.json", {"error": "forged failure cause"}
+            )
+            with self.assertRaisesRegex(
+                COMMON.WorkloadError, "member inventory changed"
+            ):
+                MATRIX.resume_history_records(output)
+
+        temporary, output, attempt = archived_output()
+        with temporary:
+            (attempt / "FAILED.json").unlink()
+            with self.assertRaisesRegex(
+                COMMON.WorkloadError, "member inventory changed"
+            ):
+                MATRIX.resume_history_records(output)
+
+        temporary, output, attempt = archived_output()
+        with temporary:
+            (attempt / "unexpected.txt").write_bytes(b"extra")
+            with self.assertRaisesRegex(
+                COMMON.WorkloadError, "member inventory changed"
+            ):
+                MATRIX.resume_history_records(output)
+
+    def test_resume_history_rejects_archive_symlink_and_mode_change(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = pathlib.Path(temporary)
+            COMMON.atomic_write_json(output / "JOURNAL.json", {"events": []})
+            partial = pathlib.PurePosixPath("partial")
+            (output / partial).write_bytes(b"partial")
+            attempt = MATRIX.archive_interrupted_attempt(output, [partial])
+            archived_partial = attempt / partial
+            archived_partial.chmod(0o600)
+            with self.assertRaisesRegex(
+                COMMON.WorkloadError, "member inventory changed"
+            ):
+                MATRIX.resume_history_records(output)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            output = pathlib.Path(temporary)
+            COMMON.atomic_write_json(output / "JOURNAL.json", {"events": []})
+            partial = pathlib.PurePosixPath("partial")
+            (output / partial).write_bytes(b"partial")
+            attempt = MATRIX.archive_interrupted_attempt(output, [partial])
+            (attempt / partial).unlink()
+            (attempt / partial).symlink_to(attempt / "JOURNAL.json")
+            with self.assertRaisesRegex(COMMON.WorkloadError, "symlink"):
+                MATRIX.resume_history_records(output)
+
+    def test_resume_history_rejects_archive_and_marker_modes_or_empty_state(self):
+        def archived_output():
+            temporary = tempfile.TemporaryDirectory()
+            output = pathlib.Path(temporary.name)
+            COMMON.atomic_write_json(output / "JOURNAL.json", {"events": []})
+            partial = pathlib.PurePosixPath("partial")
+            (output / partial).write_bytes(b"partial")
+            attempt = MATRIX.archive_interrupted_attempt(output, [partial])
+            return temporary, output, attempt
+
+        temporary, output, attempt = archived_output()
+        with temporary:
+            (attempt / "ARCHIVED.json").chmod(0o777)
+            with self.assertRaisesRegex(COMMON.WorkloadError, "marker mode differs"):
+                MATRIX.resume_history_records(output)
+
+        temporary, output, attempt = archived_output()
+        with temporary:
+            attempt.chmod(0o777)
+            with self.assertRaisesRegex(COMMON.WorkloadError, "directory mode differs"):
+                MATRIX.resume_history_records(output)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            output = pathlib.Path(temporary)
+            attempt = output / "resume-history" / "attempt-0000"
+            attempt.mkdir(parents=True, mode=0o700)
+            COMMON.atomic_write_json(
+                attempt / "ARCHIVED.json",
+                {
+                    "schema": "gpmeep-user-workload-resume-archive-v2",
+                    "archived_unix_seconds": 1.0,
+                    "partial_paths": [],
+                    "member_count": 0,
+                    "members": [],
+                },
+            )
+            with self.assertRaisesRegex(COMMON.WorkloadError, "journal is absent"):
+                MATRIX.resume_history_records(output)
+
+    def test_resume_archive_recovers_after_interruption_during_move(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = pathlib.Path(temporary)
+            COMMON.atomic_write_json(output / "JOURNAL.json", {"events": []})
+            COMMON.atomic_write_json(output / "FAILED.json", {"error": "fixture"})
+            partial = pathlib.PurePosixPath("lanes", "lane", "repeat-00")
+            partial_file = output.joinpath(*partial.parts) / "partial.dat"
+            partial_file.parent.mkdir(parents=True)
+            partial_file.write_bytes(b"partial")
+            original_replace = MATRIX.os.replace
+            interrupted = False
+
+            def replace_then_interrupt(source, destination, *args, **kwargs):
+                nonlocal interrupted
+                original_replace(source, destination, *args, **kwargs)
+                if pathlib.Path(source).name == "FAILED.json" and not interrupted:
+                    interrupted = True
+                    raise OSError("fixture interruption")
+
+            with mock.patch.object(MATRIX.os, "replace", side_effect=replace_then_interrupt):
+                with self.assertRaisesRegex(COMMON.WorkloadError, "fixture interruption"):
+                    MATRIX.archive_interrupted_attempt(output, [partial])
+            self.assertFalse(
+                MATRIX.publish_failure_record(
+                    output, {"error": "outer controller failure"}
+                )
+            )
+            self.assertFalse((output / "FAILED.json").exists())
+
+            attempt = MATRIX.archive_interrupted_attempt(output, [partial])
+            self.assertEqual(attempt.name, "attempt-0000")
+            self.assertTrue((attempt / "FAILED.json").is_file())
+            self.assertEqual((attempt / partial / "partial.dat").read_bytes(), b"partial")
+            self.assertTrue((attempt / "ARCHIVED.json").is_file())
+            self.assertFalse(list((output / "resume-history").glob(".*.intent.json")))
+            self.assertFalse(list((output / "resume-history").glob(".*.in-progress")))
+
+    def test_resume_archive_recovers_after_committed_directory_rename(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = pathlib.Path(temporary)
+            COMMON.atomic_write_json(output / "JOURNAL.json", {"events": []})
+            partial = pathlib.PurePosixPath("partial")
+            (output / partial).write_bytes(b"partial")
+            original_replace = MATRIX.os.replace
+            interrupted = False
+
+            def replace_then_interrupt(source, destination, *args, **kwargs):
+                nonlocal interrupted
+                original_replace(source, destination, *args, **kwargs)
+                if (
+                    pathlib.Path(source).name == ".attempt-0000.in-progress"
+                    and pathlib.Path(destination).name == "attempt-0000"
+                    and not interrupted
+                ):
+                    interrupted = True
+                    raise OSError("fixture interruption after archive commit")
+
+            with mock.patch.object(MATRIX.os, "replace", side_effect=replace_then_interrupt):
+                with self.assertRaisesRegex(COMMON.WorkloadError, "after archive commit"):
+                    MATRIX.archive_interrupted_attempt(output, [partial])
+            self.assertFalse(
+                MATRIX.publish_failure_record(
+                    output, {"error": "outer controller failure"}
+                )
+            )
+            self.assertFalse((output / "FAILED.json").exists())
+
+            attempt = MATRIX.archive_interrupted_attempt(output, [partial])
+            self.assertEqual((attempt / partial).read_bytes(), b"partial")
+            self.assertTrue((attempt / "ARCHIVED.json").is_file())
+            self.assertFalse(list((output / "resume-history").glob(".*.intent.json")))
+
+    def test_resume_archive_removes_its_orphaned_intent_temporary(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = pathlib.Path(temporary)
+            COMMON.atomic_write_json(output / "JOURNAL.json", {"events": []})
+            history = output / "resume-history"
+            history.mkdir()
+            orphan = history / "..attempt-0000.intent.json.abc123_tmp.tmp"
+            orphan.write_bytes(b"partial intent")
+            partial = pathlib.PurePosixPath("partial")
+            (output / partial).write_bytes(b"partial")
+
+            attempt = MATRIX.archive_interrupted_attempt(output, [partial])
+            self.assertFalse(orphan.exists())
+            self.assertTrue((attempt / "ARCHIVED.json").is_file())
+            self.assertEqual((attempt / partial).read_bytes(), b"partial")
+
+    def test_failure_record_publishes_without_active_archive(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = pathlib.Path(temporary)
+            self.assertTrue(
+                MATRIX.publish_failure_record(output, {"error": "fixture"})
+            )
+            self.assertEqual(
+                json.loads((output / "FAILED.json").read_text(encoding="utf-8")),
+                {"error": "fixture"},
+            )
 
     def test_controller_resume_skips_validated_lane_and_finishes_matrix(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1445,6 +1758,37 @@ class UserWorkloadMatrixTests(unittest.TestCase):
                 self.assertEqual(
                     MATRIX.verify_matrix_complete(output)["outcome"], "PASS"
                 )
+                attempt = output / "resume-history" / "attempt-0000"
+                attempt.mkdir(parents=True, mode=0o700)
+                (attempt / "JOURNAL.json").write_bytes(
+                    (output / "JOURNAL.json").read_bytes()
+                )
+                members = MATRIX._resume_archive_members(attempt)
+                COMMON.atomic_write_json(
+                    attempt / "ARCHIVED.json",
+                    {
+                        "schema": "gpmeep-user-workload-resume-archive-v2",
+                        "archived_unix_seconds": 1.0,
+                        "partial_paths": [],
+                        "member_count": len(members),
+                        "members": members,
+                    },
+                )
+                report["resume_history"] = MATRIX.resume_history_records(output)
+                COMMON.atomic_write_json(output / "report.json", report)
+                COMMON.atomic_write_json(
+                    output / "COMPLETE",
+                    {
+                        "schema": MATRIX.COMPLETE_SCHEMA,
+                        "outcome": "PASS",
+                        "report": COMMON.file_record(output / "report.json", output),
+                        "markdown": COMMON.file_record(output / "report.md", output),
+                        "journal": COMMON.file_record(output / "JOURNAL.json", output),
+                    },
+                )
+                self.assertEqual(
+                    MATRIX.verify_matrix_complete(output)["outcome"], "PASS"
+                )
                 report["performance"]["fdtd-cpu-fp32-to-1gpu"][
                     "conservative_speedup"
                 ] = 99.0
@@ -1476,6 +1820,7 @@ class HybridTersMatrixTests(unittest.TestCase):
                 "build_input_id": str((int(receipt_digit) + 1) % 10) * 64,
                 "artifact_set_id": str((int(receipt_digit) + 2) % 10) * 64,
                 "source_start": {"sha256": "a" * 64},
+                "git_head": "b" * 40,
             },
             root / f"{name}-pythonpath",
             root / f"{name}-lib",
@@ -2029,6 +2374,115 @@ class HybridTersMatrixTests(unittest.TestCase):
 
 
 class UserWorkloadComparisonTests(unittest.TestCase):
+    def test_stream_metrics_are_identical_across_analysis_thread_environments(self):
+        # Fresh interpreters are required: BLAS reads these variables at import.
+        program = r"""
+import importlib.util, json, pathlib, sys
+import numpy as np
+directory = pathlib.Path(sys.argv[1])
+sys.path.insert(0, str(directory))
+spec = importlib.util.spec_from_file_location('comparison', directory / 'compare_user_workloads.py')
+comparison = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(comparison)
+rng = np.random.default_rng(81279)
+reference = rng.normal(size=comparison.CHUNK_VALUES + 113)
+candidate = reference + rng.normal(scale=0.025, size=reference.size)
+complex_reference = (reference + 1j * candidate).astype(np.complex64)
+complex_candidate = (candidate + 1j * reference).astype(np.complex64)
+results = [comparison._stream_metrics(comparison._chunks(left), comparison._chunks(right))
+           for left, right in ((reference, candidate), (complex_reference, complex_candidate))]
+field_reference = complex_reference[:comparison.CHUNK_VALUES].reshape(1024, 1024)
+field_candidate = complex_candidate[:comparison.CHUNK_VALUES].reshape(1024, 1024)
+results.append(comparison.compare_ters_field(
+    field_reference, field_candidate, np.linspace(-0.02, 0.02, 1024),
+    np.linspace(0.035, 0.045, 1024), comparison.PAIR_TOLERANCES['same-fp32']))
+print(json.dumps(results, sort_keys=True, allow_nan=False))
+"""
+        variables = ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS")
+        outputs = []
+        for threads in ("1", "2", "4", None):
+            environment = dict(os.environ)
+            for variable in variables:
+                environment.pop(variable, None)
+                if threads is not None:
+                    environment[variable] = threads
+            result = subprocess.run(
+                [sys.executable, "-I", "-B", "-c", program, str(WORKLOAD_DIR)],
+                env=environment, capture_output=True, text=True, timeout=60,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            outputs.append(result.stdout)
+        self.assertTrue(all(output == outputs[0] for output in outputs[1:]), outputs)
+        retained = json.loads(outputs[0])
+        for metrics in retained[:2]:
+            self.assertEqual(metrics["count"], COMPARE.CHUNK_VALUES + 113)
+            self.assertGreater(metrics["nrmse"], 0.0)
+        self.assertGreater(retained[2]["masked_phase_rms_rad"], 0.0)
+        self.assertGreater(retained[2]["phase_sample_count"], 0)
+
+    def test_ters_norm_residual_and_phase_preserve_analytic_values(self):
+        reference = np.ones((3, 3), dtype=np.complex128)
+        candidate = reference * 1.01 * complex(math.cos(0.2), math.sin(0.2))
+        result = COMPARE.compare_ters_field(
+            reference, candidate, np.array([-0.01, 0.0, 0.01]),
+            np.array([0.0385, 0.04, 0.0415]), COMPARE.PAIR_TOLERANCES["same-fp32"],
+        )
+        self.assertEqual(result["reference"], {"l2": 3.0, "max_abs": 1.0, "energy": 9.0})
+        self.assertAlmostEqual(result["candidate"]["l2"], 3.03, places=14)
+        self.assertAlmostEqual(result["nrmse"], abs(1.01 * complex(math.cos(0.2), math.sin(0.2)) - 1), places=14)
+        self.assertAlmostEqual(result["energy_relative_error"], 1.01 ** 2 - 1, places=14)
+        self.assertAlmostEqual(result["masked_phase_rms_rad"], 0.2, places=14)
+        self.assertEqual(result["phase_sample_count"], 9)
+        self.assertEqual(result["outcome"], "FAIL")
+
+    def test_stream_metrics_preserve_real_complex_dtype_and_chunk_semantics(self):
+        for dtype in (np.float32, np.float64, np.complex64, np.complex128):
+            with self.subTest(dtype=dtype):
+                reference = np.array([[3, 0, 4], [0, 12, 0]], dtype=dtype).T
+                candidate = np.array([[0, 0, 4], [0, 0, 0]], dtype=dtype).T
+                if np.issubdtype(dtype, np.complexfloating):
+                    reference *= 1j
+                    candidate *= 1j
+                metrics = COMPARE._stream_metrics(
+                    iter((reference[:1], reference[1:])),
+                    iter((candidate[:1], candidate[1:])),
+                )
+                self.assertEqual(metrics, {
+                    "count": 6, "reference_l2": 13.0, "candidate_l2": 4.0,
+                    "reference_max_abs": 12.0, "candidate_max_abs": 4.0,
+                    "nrmse": math.sqrt(153.0) / 13.0,
+                    "peak_normalized_linf": 1.0,
+                })
+
+    def test_stream_metrics_preserve_zero_empty_shape_and_nonfinite_behavior(self):
+        zeros = np.zeros(3, dtype=np.float64)
+        equal = COMPARE._stream_metrics(iter((zeros,)), iter((zeros,)))
+        self.assertEqual(equal["reference_l2"], 0.0)
+        self.assertEqual(equal["nrmse"], 0.0)
+        self.assertEqual(equal["peak_normalized_linf"], 0.0)
+        different = COMPARE._stream_metrics(iter((zeros,)), iter((np.ones(3),)))
+        self.assertEqual(different["nrmse"], math.inf)
+        self.assertEqual(different["peak_normalized_linf"], math.inf)
+        with self.assertRaisesRegex(COMMON.WorkloadError, "empty"):
+            COMPARE._stream_metrics(iter((zeros[:0],)), iter((zeros[:0],)))
+        with self.assertRaisesRegex(COMMON.WorkloadError, "shape differs"):
+            COMPARE._stream_metrics(iter((zeros,)), iter((zeros[:1],)))
+        for value in (math.nan, math.inf, -math.inf):
+            for reference, candidate in ((np.array([value]), np.zeros(1)),
+                                         (np.zeros(1), np.array([value]))):
+                with self.subTest(value=value), self.assertRaisesRegex(COMMON.WorkloadError, "non-finite"):
+                    COMPARE._stream_metrics(iter((reference,)), iter((candidate,)))
+
+    def test_stream_metrics_preserve_square_and_accumulation_overflow(self):
+        for values in ([1e308], [1e154, 1e154]):
+            with self.subTest(values=values), np.errstate(over="ignore"):
+                array = np.array(values, dtype=np.float64)
+                metrics = COMPARE._stream_metrics(iter((array,)), iter((array,)))
+                self.assertEqual(metrics["reference_l2"], math.inf)
+                self.assertEqual(metrics["candidate_l2"], math.inf)
+                self.assertEqual(metrics["nrmse"], 0.0)
+                self.assertEqual(metrics["peak_normalized_linf"], 0.0)
+
     @staticmethod
     def run_record(index, backend="cpu"):
         before = statistics_snapshot()
@@ -2844,7 +3298,7 @@ class UserWorkloadComparisonTests(unittest.TestCase):
         COMMON.atomic_write_json(
             root / "COMPLETE",
             {
-                "schema": "gpmeep-aunp-r4000-workload-complete-v4",
+                "schema": "gpmeep-aunp-r4000-workload-complete-v5",
                 "summary": COMMON.file_record(root / "summary.json", root),
             },
         )

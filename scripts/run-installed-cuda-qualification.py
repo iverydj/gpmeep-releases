@@ -16,6 +16,7 @@ from typing import Any
 from mpi4py import MPI
 
 import meep as mp
+from meep import backend_policy
 
 
 def _load_qualification_contract():
@@ -75,9 +76,35 @@ def _load_suite(path: pathlib.Path, log_name: str) -> unittest.TestSuite:
     return unittest.defaultTestLoader.loadTestsFromModule(module)
 
 
-def _suite_summary(result: unittest.TestResult) -> dict[str, Any]:
+def _suite_test_identities(suite: unittest.TestSuite) -> tuple[str, ...]:
+    identities: list[str] = []
+
+    def visit(item: unittest.TestSuite | unittest.TestCase) -> None:
+        if isinstance(item, unittest.TestSuite):
+            for child in item:
+                visit(child)
+            return
+        parts = item.id().split(".")
+        if len(parts) < 2:
+            raise QualificationContractError(
+                f"installed CUDA test has an invalid identity: {item.id()!r}"
+            )
+        identities.append(".".join(parts[-2:]))
+
+    visit(suite)
+    if len(identities) != len(set(identities)):
+        raise QualificationContractError(
+            "installed CUDA suite contains duplicate test identities"
+        )
+    return tuple(sorted(identities))
+
+
+def _suite_summary(
+    result: unittest.TestResult, test_identities: tuple[str, ...]
+) -> dict[str, Any]:
     return {
         "tests_run": result.testsRun,
+        "test_identities": list(test_identities),
         "failures": len(result.failures),
         "errors": len(result.errors),
         "skipped": len(result.skipped),
@@ -85,6 +112,40 @@ def _suite_summary(result: unittest.TestResult) -> dict[str, Any]:
         "unexpected_successes": len(result.unexpectedSuccesses),
         "successful": result.wasSuccessful(),
     }
+
+
+def _select_suite(
+    suite: unittest.TestSuite, spec: dict[str, Any]
+) -> unittest.TestSuite:
+    # Check the complete module before applying the topology-specific scope.
+    # Loading only named selectors would silently hide unexpected source tests.
+    discovered = _suite_test_identities(suite)
+    if discovered != tuple(spec["source_test_identities"]):
+        raise QualificationContractError(
+            "installed CUDA source test inventory differs"
+        )
+    identities = tuple(spec["test_identities"])
+    selected = set(identities)
+    if (
+        identities != tuple(sorted(selected))
+        or not selected.issubset(discovered)
+        or len(identities) != spec["tests_run"]
+        or not identities
+    ):
+        raise QualificationContractError(
+            "installed CUDA selected test scope differs"
+        )
+    cases: list[unittest.TestCase] = []
+
+    def visit(item: unittest.TestSuite | unittest.TestCase) -> None:
+        if isinstance(item, unittest.TestSuite):
+            for child in item:
+                visit(child)
+        elif ".".join(item.id().split(".")[-2:]) in selected:
+            cases.append(item)
+
+    visit(suite)
+    return unittest.TestSuite(cases)
 
 
 def _cuda_execution_probe() -> dict[str, Any]:
@@ -102,7 +163,20 @@ def _cuda_execution_probe() -> dict[str, Any]:
             )
         ],
     )
-    simulation.run(until=2)
+    mismatch = None
+    try:
+        simulation.run(until=2)
+    except backend_policy.BackendRecommendationMismatch as error:
+        mismatch = error
+        mp.gpu.acknowledge_backend_mismatch(
+            error.challenge,
+            "installed CUDA qualification intentionally covers this crossover",
+        )
+        simulation.run(until=2)
+    if mismatch is None:
+        raise QualificationContractError(
+            "installed compact CUDA probe did not exercise the recommendation guard"
+        )
     value = {
         "requested_backend": mp.gpu.requested_backend,
         "active_backend": mp.gpu.active_backend,
@@ -110,6 +184,8 @@ def _cuda_execution_probe() -> dict[str, Any]:
         "selected_device_identifier": mp.gpu.selected_device_identifier,
         "cuda_execution_selected": simulation.fields.gpu_cuda_execution_selected(),
         "execution_diagnostic": simulation.fields.gpu_execution_diagnostic(),
+        "recommendation": mp.gpu.recommendation,
+        "guarded_challenge": mismatch.challenge,
         "statistics": mp.gpu.statistics(),
     }
     simulation.reset_meep()
@@ -163,7 +239,8 @@ def main() -> int:
             f"installed CUDA suite is absent or unsafe: {suite_path}"
         )
     suite_file = _file_attestation(suite_path)
-    suite = _load_suite(suite_path, args.log_name)
+    suite = _select_suite(_load_suite(suite_path, args.log_name), spec)
+    suite_test_identities = _suite_test_identities(suite)
     result = unittest.TextTestRunner(stream=sys.stdout, verbosity=2).run(suite)
 
     probe = _cuda_execution_probe()
@@ -173,14 +250,18 @@ def main() -> int:
     rank_record = {
         "world_rank": rank,
         "world_size": world_size,
-        "suite": _suite_summary(result),
+        "suite": _suite_summary(result, suite_test_identities),
         "python_extension": runtime["python_extension"],
         "libmeep": runtime["libmeep"],
         "probe": probe,
     }
     rank_records = communicator.gather(rank_record, root=0)
 
-    success = result.wasSuccessful() and result.testsRun == spec["tests_run"]
+    success = (
+        result.wasSuccessful()
+        and result.testsRun == spec["tests_run"]
+        and suite_test_identities == tuple(spec["test_identities"])
+    )
     all_success = communicator.gather(success, root=0)
     complete = False
     serialized: str | None = None

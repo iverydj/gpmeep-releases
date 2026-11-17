@@ -4,6 +4,7 @@
 @EXPLICIT
 https://conda.anaconda.org/conda-forge/linux-64/_openmp_mutex-4.5-20_gnu.conda#1dd3fffd892081df9726d7eb7e0dea6198962ba775bd88842135a4ddb4deb3c9
 https://conda.anaconda.org/conda-forge/noarch/autograd-1.9.1-pyhd8ed1ab_0.conda#424731f434698c0ff937eec4010c94b75fda29394816dc1ec34f94d605b39629
+https://conda.anaconda.org/conda-forge/noarch/attrs-26.1.0-pyhcf101f3_0.conda#1b6124230bb4e571b1b9401537ecff575b7b109cc3a21ee019f65e083b8399ab
 https://conda.anaconda.org/conda-forge/linux-64/brotli-1.2.0-h505cf86_3.conda#1f2ccfebe6e0113bfc473b21906372c1ee4eb69bf6faef0ad7f3d4d79af63a98
 https://conda.anaconda.org/conda-forge/linux-64/brotli-bin-1.2.0-h9908984_3.conda#56b2e5e8a49f9887af74cc63e0d55a3654e60b667ad5558da089549a36ae6a0c
 https://conda.anaconda.org/conda-forge/linux-64/bzip2-1.0.8-hda65f42_10.conda#1a0d382c515ebf55f8ee1f38c8b81bc95af5c2acc42ad53b66bc5df932032f96
@@ -39,6 +40,8 @@ https://conda.anaconda.org/conda-forge/linux-64/icu-78.3-py310h44b86e0_2.conda#9
 https://conda.anaconda.org/conda-forge/noarch/importlib-metadata-9.0.0-pyhcf101f3_0.conda#43e2a5497cad1598ff88a3e69f69bc88b7b8f141fa63c60eab5db296317318b8
 https://conda.anaconda.org/conda-forge/noarch/jax-0.10.2-pyhd8ed1ab_0.conda#c63764f3f6aaa7bdd2f4b3bc1c297f946ae7e5503d0d3a4ca225ba4dff3fc25b
 https://conda.anaconda.org/conda-forge/linux-64/jaxlib-0.10.2-cpu_py311hceffaa2_0.conda#0b51bff46ff6b3e4fb02c8384f1abd761cc6d74a52df18af70521d1797d6778b
+https://conda.anaconda.org/conda-forge/noarch/jsonschema-4.26.0-pyhcf101f3_1.conda#328756a4555941d57af4a5f553e5d8598e9f3b37db028f557e30f9f0b3086db6
+https://conda.anaconda.org/conda-forge/noarch/jsonschema-specifications-2025.9.1-pyhcf101f3_0.conda#0a4f3b132f0faca10c89fdf3b60e15abb62ded6fa80aebfc007d05965192aa04
 https://conda.anaconda.org/conda-forge/linux-64/keyutils-1.6.3-h7cc23a3_1.conda#dd053c96dcb0dcfd59422aefea9d2fe937a190167f34fba7893ec1e10a7e8963
 https://conda.anaconda.org/conda-forge/linux-64/kiwisolver-1.5.0-py311h724c32c_0.conda#3ff7e51c88f53f05e22ca5549e935d1ccb398665f6ec080a9c6a5c9e9b186b79
 https://conda.anaconda.org/conda-forge/linux-64/krb5-1.22.2-hbc21106_2.conda#2a5c38c85e63df84c4e69ee71439841ce570d259ae3060627bb9a49a938d66f4
@@ -131,6 +134,8 @@ https://conda.anaconda.org/conda-forge/linux-64/qhull-2020.2-h434a139_5.conda#77
 https://conda.anaconda.org/conda-forge/linux-64/rdma-core-63.1-h192683f_0.conda#93e53eeaf6e7b8d2c349cd52005720aaceb47e7ead0a741290567b2907e3a42d
 https://conda.anaconda.org/conda-forge/linux-64/re2-2025.11.05-h5301d42_1.conda#3fc684b81631348540e9a42f6768b871dfeab532d3f47d5c341f1f83e2a2b2b2
 https://conda.anaconda.org/conda-forge/linux-64/readline-8.3-hd6e31c0_1.conda#01b3fe073a66e321970d09e04b388708f8cbdca5cdfbfcb7c9eeb470ad10383d
+https://conda.anaconda.org/conda-forge/noarch/referencing-0.37.0-pyhcf101f3_0.conda#0577eedfb347ff94d0f2fa6c052c502989b028216996b45c7f21236f25864414
+https://conda.anaconda.org/conda-forge/linux-64/rpds-py-2026.6.3-py311ha6e1976_0.conda#424cea2ffd94448a6a3202c624b693d2d4db6bedce39f4ab06e9830b3f1bcd4f
 https://conda.anaconda.org/conda-forge/linux-64/scipy-1.17.1-py311hbe70eeb_1.conda#3ae2ff1d1cc5930de2ca6ac03216118bdf13b2af6098e28e827f1ba25bfcbc4e
 https://conda.anaconda.org/conda-forge/noarch/setuptools-84.0.0-pyh332efcf_0.conda#9e200ee5f9ff19a4d94e4b51c4856d53dec849f91032f345cf0c6bc3d51a7183
 https://conda.anaconda.org/conda-forge/noarch/six-1.17.0-pyhe01879c_1.conda#458227f759d5e3fcec5d9b7acce54e10c9e1f4f4b7ec978f3bfd54ce4ee9853d

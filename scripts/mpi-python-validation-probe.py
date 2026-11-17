@@ -19,10 +19,14 @@ import time
 from mpi4py import MPI
 import numpy as np
 import meep as mp
+import gpmeep_backend_guard as backend_guard
 
 
-PREFIX = "gpmeep-mpi-python-probe-v1:"
-SCHEMA_VERSION = 1
+PREFIX = "gpmeep-mpi-python-probe-v2:"
+SCHEMA_VERSION = 2
+BACKEND_ACKNOWLEDGEMENT_REASON = (
+    "M3 MPI qualification intentionally compares explicit CPU and CUDA"
+)
 EXPECTED_RANKS = 2
 RESOLUTION = 20
 CELL_SIZE = 4.0
@@ -126,9 +130,13 @@ def main() -> None:
         decimation_factor=1,
     )
     communicator.Barrier()
-    started = time.perf_counter()
-    simulation.run(until=RUN_UNTIL)
-    local_seconds = time.perf_counter() - started
+    _, backend_guard_evidence = backend_guard.invoke_with_acknowledgement(
+        mp,
+        simulation,
+        lambda: simulation.run(until=RUN_UNTIL),
+        BACKEND_ACKNOWLEDGEMENT_REASON,
+    )
+    local_seconds = backend_guard_evidence["execution_wall_seconds"]
     communicator.Barrier()
 
     field = np.asarray(
@@ -175,6 +183,7 @@ def main() -> None:
         "selected_device": int(mp.gpu.selected_device),
         "selected_device_identifier": mp.gpu.selected_device_identifier,
         "local_seconds": local_seconds,
+        "backend_guard": backend_guard_evidence,
         "statistics": statistics,
         "startup_statistics": startup_statistics,
         "metrics": metrics,

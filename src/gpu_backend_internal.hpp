@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <complex>
 #include <memory>
+#include <new>
 #include <string>
 #include <vector>
 
@@ -82,9 +83,7 @@ struct backend_preflight_status {
   bool configuration_ok;
   bool cuda_active;
   bool cuda_required;
-  bool automatic_requested;
   bool cpu_requested;
-  bool explicit_device_requested;
   std::string diagnostic;
 };
 
@@ -168,6 +167,14 @@ boundary_receive_pingpong_statistics
 get_boundary_receive_pingpong_statistics() noexcept;
 boundary_lifetime_fallback_statistics
 get_boundary_lifetime_fallback_statistics() noexcept;
+enum class local_boundary_path {
+  disabled, unready, prepare_invalidated, replay_empty, replay_work, failed
+};
+void record_local_boundary_path(local_boundary_path path) noexcept;
+void record_local_boundary_rebuild_attempt() noexcept;
+void record_boundary_prepare(std::uint64_t arrays, std::uint64_t nanoseconds,
+                             bool succeeded) noexcept;
+
 void record_boundary_receive_pingpong_selection(bool secondary) noexcept;
 void record_boundary_eh_overlap_check() noexcept;
 void record_boundary_eh_overlap_eligible() noexcept;
@@ -384,17 +391,10 @@ struct remote_boundary_operation_fp32 {
 };
 
 bool cuda_active();
-bool cuda_required();
 std::uint64_t backend_generation();
 // Never propagates backend-configuration errors. Distributed callers first
 // gather this local status so every rank takes the same success/failure path.
 backend_preflight_status probe_backend_for_distributed_step();
-// Automatic mode deliberately configures only the request syntax at first.
-// A fields owner calls this second-stage probe only after its host-only
-// workload floor says that CUDA can plausibly win.  This keeps small auto
-// simulations completely outside the CUDA runtime.
-backend_preflight_status prepare_cuda_candidate_for_distributed_step();
-automatic_device_policy_facts selected_automatic_device_policy_facts();
 std::uint64_t automatic_cuda_host_only_minimum_cells(
     std::uint64_t cpu_threads) noexcept;
 automatic_cuda_policy_decision evaluate_automatic_cuda_policy(
@@ -405,6 +405,12 @@ automatic_cuda_policy_decision evaluate_automatic_cuda_policy(
 // configuration generation.
 void activate_backend_for_owner(backend_mode execution,
                                 const std::string &diagnostic);
+// A preflighted high-level fields operation pins the process backend until
+// its matching release (or owner destruction). Idempotent selection remains
+// legal, but a different backend or device is rejected before resident state
+// or the backend generation can change.
+void pin_backend_for_owner(const void *owner, backend_mode execution);
+void unpin_backend_for_owner(const void *owner) noexcept;
 // Collective validation for a distributed fields preflight. Generic backend
 // discovery remains rank-local and never hides an MPI collective.
 void validate_distributed_device_assignment();
@@ -445,16 +451,59 @@ private:
   bool owns_phase_;
 };
 
-// Cross-operation curl and E/H kernels use a topology-aware automatic policy
-// by default. An unset enable variable requests automatic selection, exact
-// "1" forces the batched kernel for qualification, any other present value
-// disables it, and any matching disable-variable presence wins. Indexed
-// source batching remains experimental/forced-only because repeated evidence
-// has not established a favorable crossover.
+// Several CPU hot paths share their implementation with CUDA and therefore
+// carry a session whose enable predicate is false.  Avoid constructing the
+// out-of-line resident-session object in that case while preserving the exact
+// object, lifetime, and calls used by an enabled CUDA path.
+class conditional_resident_curl_session {
+public:
+  conditional_resident_curl_session(const void *owner, bool enabled)
+      : session_(enabled
+                     ? ::new (static_cast<void *>(storage_))
+                           resident_curl_session(owner, true)
+                     : nullptr) {}
+
+  ~conditional_resident_curl_session() {
+    if (session_) session_->~resident_curl_session();
+  }
+
+  conditional_resident_curl_session(
+      const conditional_resident_curl_session &) = delete;
+  conditional_resident_curl_session &operator=(
+      const conditional_resident_curl_session &) = delete;
+
+  bool active() const noexcept {
+    return session_ && session_->active();
+  }
+  resident_cache *cache() const noexcept {
+    return session_ ? session_->cache() : nullptr;
+  }
+  void finish(bool synchronize_to_host = true) {
+    if (session_) session_->finish(synchronize_to_host);
+  }
+
+private:
+  alignas(resident_curl_session)
+      unsigned char storage_[sizeof(resident_curl_session)];
+  resident_curl_session *session_;
+};
+
+// Cross-operation curl and constitutive E/H use distinct topology-aware
+// automatic policies. Curl admits only launch-bound phases whose entire block
+// map fits a conservative per-SM budget; E/H retains its per-operation budget.
+// Exact "1" still forces either kernel for qualification, any other present
+// enable value disables it, and any matching disable-variable presence wins.
+// Indexed source batching remains experimental/forced-only because repeated
+// evidence has not established a favorable crossover.
 enum class phase_batch_mode { disabled, automatic, forced };
 phase_batch_mode phase_batched_curl_mode() noexcept;
 phase_batch_mode phase_batched_update_eh_mode() noexcept;
 bool phase_batched_source_opted_in() noexcept;
+// Sequence-preserving CUDA Graph submission is a separate expert opt-in from
+// the regressive fused curl-phase kernel. Exact "1" enables it, any disable
+// variable presence wins, and an explicitly forced fused kernel takes
+// precedence so two curl submission algorithms are never active together.
+bool structured_curl_graph_opted_in() noexcept;
 
 // Pure operation-topology policy used by production and host-only tests.
 // Logical blocks are the sum of ceil(point_count / 256) over every operation;
@@ -464,6 +513,14 @@ bool automatic_phase_batch_selected(std::size_t operation_count,
                                     std::size_t logical_block_count,
                                     std::size_t maximum_operation_block_count,
                                     int multiprocessor_count) noexcept;
+// Curl-specific policy: the total phase must fit within 24 logical blocks per
+// SM and no one operation may exceed 12 blocks per SM. Keeping this separate
+// prevents future E/H tuning from silently widening the qualified curl
+// topology or admitting a phase dominated by one large launch.
+bool automatic_curl_phase_batch_selected(
+    std::size_t operation_count, std::size_t logical_block_count,
+    std::size_t maximum_operation_block_count,
+    int multiprocessor_count) noexcept;
 
 // Collects independent Cartesian curl launches across rank-local chunks and
 // emits one phase-wide kernel. Unsupported dependent corrections flush the
@@ -473,7 +530,8 @@ public:
   resident_curl_phase_batch(const void *owner, int phase_key,
                             phase_batch_mode mode,
                             std::uint64_t topology_fingerprint,
-                            bool replay_supported);
+                            bool replay_supported,
+                            bool structured_graph);
   ~resident_curl_phase_batch();
 
   resident_curl_phase_batch(const resident_curl_phase_batch &) = delete;
@@ -497,6 +555,16 @@ struct curl_phase_replay_plan_snapshot {
   bool exists;
   bool complete_phase;
   std::size_t stable_reuses;
+  bool structured_graph;
+  bool has_structured_graph;
+  bool quarantined;
+  std::size_t cache_dependencies;
+  std::size_t writable_mirrors;
+  std::size_t quarantined_dependencies;
+  int device_ordinal;
+  bool automatic_rejected;
+  std::uint64_t topology_fingerprint;
+  std::size_t operation_count;
 };
 curl_phase_replay_plan_snapshot
 get_curl_phase_replay_plan_snapshot_for_testing(
@@ -505,6 +573,13 @@ get_curl_phase_replay_plan_snapshot_for_testing(
 // this count at zero; reset_dispatch_statistics also clears it.
 void set_curl_phase_replay_launch_failures_for_testing(
     std::uint64_t count) noexcept;
+void set_structured_curl_graph_creation_failures_for_testing(
+    std::uint64_t count) noexcept;
+// After a successful old-plan destroy, select this runtime ordinal exactly
+// once.  A replacement must explicitly restore its collection device before
+// graph creation and launch.  Negative values disable the perturbation.
+void set_structured_curl_graph_post_destroy_device_for_testing(
+    int device_ordinal) noexcept;
 
 void destroy_resident_curl_phase_batches_for_owner(
     const void *owner) noexcept;
@@ -616,12 +691,50 @@ struct resident_cache_snapshot_for_testing {
 
 resident_cache_snapshot_for_testing get_resident_cache_snapshot_for_testing(
     const void *owner) noexcept;
+// Host-only registry gauges used by subprocess lifetime-failure tests.  A
+// detached quarantine is intentionally unreachable by owner lookup but must
+// remain reachable from the process-long intrusive list.
+struct resident_cache_registry_snapshot_for_testing {
+  std::size_t active_caches;
+  std::size_t active_quarantined_caches;
+  std::size_t detached_quarantined_caches;
+};
+resident_cache_registry_snapshot_for_testing
+get_resident_cache_registry_snapshot_for_testing() noexcept;
+
+// Destructive, subprocess-only generation hooks used to force fail-closed
+// exhaustion paths without billions of time steps.  Tests must never restore
+// a process-wide counter after saturation because that would permit ABA reuse.
+struct sparse_lorentzian_generation_snapshot_for_testing {
+  bool exists;
+  bool permanent_dense_lock;
+  bool device_storage_quarantined;
+  std::uint64_t epoch;
+  std::uint64_t allocation_generation;
+  std::uint64_t control_generation;
+};
+
+sparse_lorentzian_generation_snapshot_for_testing
+get_sparse_lorentzian_generation_snapshot_for_testing(
+    const void *owner) noexcept;
+void set_resident_epoch_for_testing(const void *owner,
+                                    std::uint64_t value) noexcept;
+void set_sparse_lorentzian_control_generation_for_testing(
+    const void *owner, std::uint64_t value) noexcept;
+void set_resident_allocation_generation_counter_for_testing(
+    std::uint64_t value) noexcept;
+void set_sparse_lorentzian_reset_generation_for_testing(
+    std::uint64_t value) noexcept;
+void set_sparse_lorentzian_host_opt_in_counters_for_testing(
+    std::uint64_t calls, std::uint64_t points) noexcept;
 
 void destroy_resident_cache_for_owner(const void *owner) noexcept;
 // Destruction-only variant: the owner and its host arrays are about to be
 // deleted, so publishing device-authoritative mirrors would be wasted work.
 void discard_resident_cache_for_owner(const void *owner) noexcept;
 void sync_resident_cache_for_owner(const void *owner);
+// Record the selected path after its setup succeeds; not a step-completion verdict.
+void record_material_phasing(bool reused, bool disabled) noexcept;
 // Transactionally validate and invalidate every resident mirror containing a
 // host pointer before an in-place host algorithm writes those arrays.  No
 // mirror is invalidated when any requested mirror is still device

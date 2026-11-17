@@ -161,7 +161,7 @@ if [[ ! -x "${MAMBA}" || \
   exit 1
 fi
 
-# The only worker entry point repairs and audits the prefix itself. Positional
+# The only worker entry point verifies and audits the prefix itself. Positional
 # audit, attestation, or canonical-environment inputs are never accepted, so a
 # direct worker invocation cannot self-seal fabricated evidence.
 USER_HOME="$(/usr/bin/getent passwd "$(/usr/bin/id -u)" | /usr/bin/cut -d: -f6)"
@@ -172,14 +172,31 @@ fi
 /usr/bin/mkdir -p "${MAMBA_CACHE}" "${MAMBA_PACKAGES}" \
   "${FRESH_ATTESTATION_DIRECTORY}"
 /usr/bin/chmod 700 "${FRESH_ATTESTATION_DIRECTORY}"
-"${MAMBA}" --no-rc install --yes --force-reinstall \
-  --no-pyc \
-  --safety-checks enabled --extra-safety-checks \
-  --root-prefix "${MAMBA_ROOT}" --prefix "${PREFIX}" --file "${LOCK}"
-PREFIX_BYTECODE_NORMALIZATION_TEMP="${MAMBA_CACHE}/cuda-mpi-bytecode-normalization.$$.json"
+# Bootstrap has just materialized this exact-lock prefix once.  Reinstalling
+# every package here is unsafe for binary prefix-placeholder packages: a
+# second relocation can rewrite an already relocated ELF while recording a
+# different sha256_in_prefix.  Verify the package URL+SHA set without mutation;
+# the archive-bound byte audit below remains the fail-closed content authority.
+PREFIX_PACKAGE_SET_TEMP="${MAMBA_CACHE}/cuda-mpi-installed-package-set.$$.txt"
+LOCK_PACKAGE_SET_TEMP="${MAMBA_CACHE}/cuda-mpi-locked-package-set.$$.txt"
+"${MAMBA}" --no-rc list \
+  --root-prefix "${MAMBA_ROOT}" --prefix "${PREFIX}" \
+  --explicit --sha256 |
+  /usr/bin/sed -n '/:\/\//p' |
+  /usr/bin/sort >"${PREFIX_PACKAGE_SET_TEMP}"
+/usr/bin/sed -n '/:\/\//p' "${LOCK}" |
+  /usr/bin/sort >"${LOCK_PACKAGE_SET_TEMP}"
+if ! /usr/bin/cmp --silent \
+    "${LOCK_PACKAGE_SET_TEMP}" "${PREFIX_PACKAGE_SET_TEMP}"; then
+  /usr/bin/diff -u \
+    "${LOCK_PACKAGE_SET_TEMP}" "${PREFIX_PACKAGE_SET_TEMP}" >&2 || true
+  echo "error: fresh exact-lock package set differs" >&2
+  exit 1
+fi
+/usr/bin/rm -f "${LOCK_PACKAGE_SET_TEMP}" "${PREFIX_PACKAGE_SET_TEMP}"
 "${SYSTEM_CONTROL_PYTHON[@]}" \
-  "${SCRIPT_DIR}/normalize-conda-generated-bytecode.py" \
-  --prefix "${PREFIX}" --output "${PREFIX_BYTECODE_NORMALIZATION_TEMP}"
+  "${SCRIPT_DIR}/stage-conda-lock-archives.py" \
+  --lock "${LOCK}" --package-cache "${MAMBA_PACKAGES}"
 # The pinned Fontconfig package installs an empty writable cache directory.
 # Seal it before the byte audit and fresh-environment attestation: directory
 # modes are part of every later identity and receipt tree manifest.
@@ -210,11 +227,28 @@ if [[ "$(/usr/bin/stat -c '%a' "${PREFIX_FONTCONFIG_CACHE}")" != 555 || \
   echo "error: conda prefix Fontconfig cache could not be sealed" >&2
   exit 1
 fi
-PREFIX_PRE_NORMALIZATION_AUDIT_TEMP="${MAMBA_CACHE}/cuda-mpi-prefix-pre-normalization-audit.$$.json"
-"${SYSTEM_CONTROL_PYTHON[@]}" "${SCRIPT_DIR}/audit-conda-prefix.py" \
-  --prefix "${PREFIX}" --lock "${LOCK}" \
-  --package-cache "${MAMBA_PACKAGES}" \
-  --output "${PREFIX_PRE_NORMALIZATION_AUDIT_TEMP}"
+PREFIX_BYTECODE_NORMALIZATION_TEMP=""
+PREFIX_PRE_NORMALIZATION_AUDIT_TEMP=""
+PREFIX_PREPARATION_PASSED=0
+for prefix_preparation_attempt in 1 2 3; do
+  PREFIX_BYTECODE_NORMALIZATION_TEMP="${MAMBA_CACHE}/cuda-mpi-bytecode-normalization.$$.${prefix_preparation_attempt}.json"
+  PREFIX_PRE_NORMALIZATION_AUDIT_TEMP="${MAMBA_CACHE}/cuda-mpi-prefix-pre-normalization-audit.$$.${prefix_preparation_attempt}.json"
+  if "${SYSTEM_CONTROL_PYTHON[@]}" \
+      "${SCRIPT_DIR}/normalize-conda-generated-bytecode.py" \
+      --prefix "${PREFIX}" --output "${PREFIX_BYTECODE_NORMALIZATION_TEMP}" && \
+    "${SYSTEM_CONTROL_PYTHON[@]}" "${SCRIPT_DIR}/audit-conda-prefix.py" \
+      --prefix "${PREFIX}" --lock "${LOCK}" \
+      --package-cache "${MAMBA_PACKAGES}" \
+      --output "${PREFIX_PRE_NORMALIZATION_AUDIT_TEMP}"; then
+    PREFIX_PREPARATION_PASSED=1
+    break
+  fi
+  echo "warning: CUDA prefix bytecode preparation attempt ${prefix_preparation_attempt}/3 did not stabilize" >&2
+done
+if [[ "${PREFIX_PREPARATION_PASSED}" -ne 1 ]]; then
+  echo "error: CUDA prefix bytecode preparation did not stabilize" >&2
+  exit 1
+fi
 PREFIX_SOURCE_BYTECODE_NORMALIZATION_TEMP="${MAMBA_CACHE}/cuda-mpi-source-bytecode-normalization.$$.json"
 "${SYSTEM_CONTROL_PYTHON[@]}" \
   "${SCRIPT_DIR}/normalize-conda-relocated-bytecode.py" \
@@ -915,6 +949,28 @@ env HOME="${QUALIFICATION_HOME}" MEEP_GPU_BACKEND=cuda MEEP_GPU_STRICT=1 \
   >"${TEST_LOG_DIR}/gpu-step-db-full-one-rank.log" 2>&1
 printf '%s\n' 'gpmeep-qualification:gpu-step-db-full-one-rank.log:PASS' >> \
   "${TEST_LOG_DIR}/gpu-step-db-full-one-rank.log"
+env HOME="${QUALIFICATION_HOME}" CUDA_VISIBLE_DEVICES=0 \
+  MEEP_GPU_BACKEND=cuda MEEP_GPU_STRICT=1 \
+  MEEP_GPU_VALIDATION_ALLOW_SMALL_DOMAINS=1 \
+  MEEP_GPU_MPI_TRANSPORT=pinned \
+  MEEP_GPU_TEST_BACKEND_TRANSITION_ONLY=1 \
+  "${TIMEOUT}" --kill-after=10s 120s "${PREFIX}/bin/mpiexec" -n 1 \
+  "${GPU_STEP_DB_ELF}" \
+  >"${TEST_LOG_DIR}/gpu-step-db-backend-transition-one-rank.log" 2>&1
+printf '%s\n' \
+  'gpmeep-qualification:gpu-step-db-backend-transition-one-rank.log:PASS' >> \
+  "${TEST_LOG_DIR}/gpu-step-db-backend-transition-one-rank.log"
+env HOME="${QUALIFICATION_HOME}" CUDA_VISIBLE_DEVICES=0 \
+  MEEP_GPU_BACKEND=cuda MEEP_GPU_STRICT=1 \
+  MEEP_GPU_VALIDATION_ALLOW_SMALL_DOMAINS=1 \
+  MEEP_GPU_MPI_TRANSPORT=pinned \
+  MEEP_GPU_TEST_TRANSITION_ROLLBACK_ONLY=1 \
+  "${TIMEOUT}" --kill-after=10s 120s "${PREFIX}/bin/mpiexec" -n 1 \
+  "${GPU_STEP_DB_ELF}" \
+  >"${TEST_LOG_DIR}/gpu-step-db-transition-rollback-one-rank.log" 2>&1
+printf '%s\n' \
+  'gpmeep-qualification:gpu-step-db-transition-rollback-one-rank.log:PASS' >> \
+  "${TEST_LOG_DIR}/gpu-step-db-transition-rollback-one-rank.log"
 env HOME="${QUALIFICATION_HOME}" MEEP_GPU_BACKEND=cuda MEEP_GPU_STRICT=1 \
   MEEP_GPU_VALIDATION_ALLOW_SMALL_DOMAINS=1 \
   MEEP_GPU_MPI_TRANSPORT=pinned MEEP_GPU_TEST_PHASE_SOURCE_ONLY=1 \
@@ -1049,39 +1105,48 @@ env HOME="${QUALIFICATION_HOME}" MEEP_GPU_BACKEND=cuda MEEP_GPU_STRICT=1 \
 printf '%s\n' \
   'gpmeep-qualification:gpu-step-db-full-waitall-two-rank.log:PASS' >> \
   "${TEST_LOG_DIR}/gpu-step-db-full-waitall-two-rank.log"
-env HOME="${QUALIFICATION_HOME}" MEEP_GPU_BACKEND=auto \
-  MEEP_GPU_AUTO_MIN_CELLS=0 \
+env HOME="${QUALIFICATION_HOME}" MEEP_GPU_BACKEND=cuda MEEP_GPU_STRICT=1 \
   MEEP_GPU_VALIDATION_ALLOW_SMALL_DOMAINS=1 \
   MEEP_GPU_MPI_TRANSPORT=pinned MEEP_GPU_TEST_PREFLIGHT_ONLY=1 \
   "${TIMEOUT}" --kill-after=10s 120s "${PREFIX}/bin/mpiexec" -n 1 \
   "${GPU_STEP_DB_ELF}" \
-  >"${TEST_LOG_DIR}/gpu-step-db-auto-cuda-one-rank.log" 2>&1
+  >"${TEST_LOG_DIR}/gpu-step-db-explicit-cuda-one-rank.log" 2>&1
 printf '%s\n' \
-  'gpmeep-qualification:gpu-step-db-auto-cuda-one-rank.log:PASS' >> \
-  "${TEST_LOG_DIR}/gpu-step-db-auto-cuda-one-rank.log"
-env HOME="${QUALIFICATION_HOME}" MEEP_GPU_BACKEND=auto \
+  'gpmeep-qualification:gpu-step-db-explicit-cuda-one-rank.log:PASS' >> \
+  "${TEST_LOG_DIR}/gpu-step-db-explicit-cuda-one-rank.log"
+env HOME="${QUALIFICATION_HOME}" CUDA_VISIBLE_DEVICES=0,1 \
+  MEEP_GPU_BACKEND=cuda MEEP_GPU_STRICT=1 \
+  MEEP_GPU_VALIDATION_ALLOW_SMALL_DOMAINS=1 \
+  MEEP_GPU_MPI_TRANSPORT=pinned MEEP_GPU_TEST_PREFLIGHT_ONLY=1 \
+  MEEP_GPU_TEST_DEVICE_SWAP=1 \
+  "${TIMEOUT}" --kill-after=10s 120s "${PREFIX}/bin/mpiexec" -n 1 \
+  "${GPU_STEP_DB_ELF}" \
+  >"${TEST_LOG_DIR}/gpu-step-db-backend-pin-device-swap-one-rank.log" 2>&1
+printf '%s\n' \
+  'gpmeep-qualification:gpu-step-db-backend-pin-device-swap-one-rank.log:PASS' >> \
+  "${TEST_LOG_DIR}/gpu-step-db-backend-pin-device-swap-one-rank.log"
+env HOME="${QUALIFICATION_HOME}" MEEP_GPU_BACKEND=cpu \
   MEEP_GPU_VALIDATION_ALLOW_SMALL_DOMAINS=1 \
   MEEP_GPU_MPI_TRANSPORT=pinned MEEP_GPU_TEST_PREFLIGHT_ONLY=1 \
   MEEP_GPU_TEST_EXPECT_CPU=1 \
   "${TIMEOUT}" --kill-after=10s 120s "${PREFIX}/bin/mpiexec" -n 1 \
   "${GPU_STEP_DB_ELF}" \
-  >"${TEST_LOG_DIR}/gpu-step-db-auto-cpu-one-rank.log" 2>&1
+  >"${TEST_LOG_DIR}/gpu-step-db-explicit-cpu-one-rank.log" 2>&1
 printf '%s\n' \
-  'gpmeep-qualification:gpu-step-db-auto-cpu-one-rank.log:PASS' >> \
-  "${TEST_LOG_DIR}/gpu-step-db-auto-cpu-one-rank.log"
-env HOME="${QUALIFICATION_HOME}" MEEP_GPU_BACKEND=auto \
-  MEEP_GPU_AUTO_MIN_CELLS=0 \
+  'gpmeep-qualification:gpu-step-db-explicit-cpu-one-rank.log:PASS' >> \
+  "${TEST_LOG_DIR}/gpu-step-db-explicit-cpu-one-rank.log"
+env HOME="${QUALIFICATION_HOME}" MEEP_GPU_BACKEND=cuda MEEP_GPU_STRICT=1 \
   MEEP_GPU_VALIDATION_ALLOW_SMALL_DOMAINS=1 \
   MEEP_GPU_MPI_TRANSPORT=pinned MEEP_GPU_TEST_PREFLIGHT_ONLY=1 \
   MEEP_GPU_TEST_EXPECT_PINNED_TRANSPORT=1 \
   "${TIMEOUT}" --kill-after=10s 120s "${PREFIX}/bin/mpiexec" -n 2 \
   "${GPU_STEP_DB_ELF}" \
-  >"${TEST_LOG_DIR}/gpu-step-db-auto-cuda-two-rank.log" 2>&1
+  >"${TEST_LOG_DIR}/gpu-step-db-explicit-cuda-two-rank.log" 2>&1
 printf '%s\n' \
-  'gpmeep-qualification:gpu-step-db-auto-cuda-two-rank.log:PASS' >> \
-  "${TEST_LOG_DIR}/gpu-step-db-auto-cuda-two-rank.log"
+  'gpmeep-qualification:gpu-step-db-explicit-cuda-two-rank.log:PASS' >> \
+  "${TEST_LOG_DIR}/gpu-step-db-explicit-cuda-two-rank.log"
 env HOME="${QUALIFICATION_HOME}" CUDA_VISIBLE_DEVICES=0,1 \
-  MEEP_GPU_BACKEND=auto MEEP_GPU_AUTO_MIN_CELLS=0 \
+  MEEP_GPU_BACKEND=cuda MEEP_GPU_STRICT=1 \
   MEEP_GPU_ALLOW_OVERSUBSCRIBE=0 \
   MEEP_GPU_VALIDATION_ALLOW_SMALL_DOMAINS=1 \
   MEEP_GPU_MPI_TRANSPORT=pinned MEEP_GPU_MPI_COMPLETION=waitsome \
@@ -1093,7 +1158,7 @@ printf '%s\n' \
   'gpmeep-qualification:gpu-step-db-dynamic-claim-two-rank.log:PASS' >> \
   "${TEST_LOG_DIR}/gpu-step-db-dynamic-claim-two-rank.log"
 env HOME="${QUALIFICATION_HOME}" CUDA_VISIBLE_DEVICES=0 \
-  MEEP_GPU_BACKEND=auto MEEP_GPU_AUTO_MIN_CELLS=0 \
+  MEEP_GPU_BACKEND=cuda MEEP_GPU_STRICT=1 \
   MEEP_GPU_ALLOW_OVERSUBSCRIBE=1 \
   MEEP_GPU_VALIDATION_ALLOW_SMALL_DOMAINS=1 \
   MEEP_GPU_MPI_TRANSPORT=pinned MEEP_GPU_TEST_PREFLIGHT_ONLY=1 \
@@ -1101,23 +1166,21 @@ env HOME="${QUALIFICATION_HOME}" CUDA_VISIBLE_DEVICES=0 \
   MEEP_GPU_TEST_EXPECT_POSITIVE_OVERSUBSCRIPTION=1 \
   "${TIMEOUT}" --kill-after=10s 120s "${PREFIX}/bin/mpiexec" -n 2 \
   "${GPU_STEP_DB_ELF}" \
-  >"${TEST_LOG_DIR}/automatic-explicit-oversubscription-two-rank.log" 2>&1
+  >"${TEST_LOG_DIR}/explicit-oversubscription-two-rank.log" 2>&1
 printf '%s\n' \
-  'gpmeep-qualification:automatic-explicit-oversubscription-two-rank.log:PASS' >> \
-  "${TEST_LOG_DIR}/automatic-explicit-oversubscription-two-rank.log"
-env HOME="${QUALIFICATION_HOME}" MEEP_GPU_BACKEND=auto \
-  MEEP_GPU_AUTO_MIN_CELLS=0 \
+  'gpmeep-qualification:explicit-oversubscription-two-rank.log:PASS' >> \
+  "${TEST_LOG_DIR}/explicit-oversubscription-two-rank.log"
+env HOME="${QUALIFICATION_HOME}" MEEP_GPU_BACKEND=cuda MEEP_GPU_STRICT=1 \
   MEEP_GPU_VALIDATION_ALLOW_SMALL_DOMAINS=1 \
   MEEP_GPU_MPI_TRANSPORT=cuda-aware MEEP_GPU_TEST_PREFLIGHT_ONLY=1 \
   MEEP_GPU_TEST_EXPECT_CUDA_AWARE_TRANSPORT=1 \
   "${TIMEOUT}" --kill-after=10s 120s "${PREFIX}/bin/mpiexec" -n 2 \
   "${GPU_STEP_DB_ELF}" \
-  >"${TEST_LOG_DIR}/gpu-step-db-auto-cuda-aware-two-rank.log" 2>&1
+  >"${TEST_LOG_DIR}/gpu-step-db-explicit-cuda-aware-two-rank.log" 2>&1
 printf '%s\n' \
-  'gpmeep-qualification:gpu-step-db-auto-cuda-aware-two-rank.log:PASS' >> \
-  "${TEST_LOG_DIR}/gpu-step-db-auto-cuda-aware-two-rank.log"
-env HOME="${QUALIFICATION_HOME}" MEEP_GPU_BACKEND=auto \
-  MEEP_GPU_AUTO_MIN_CELLS=0 \
+  'gpmeep-qualification:gpu-step-db-explicit-cuda-aware-two-rank.log:PASS' >> \
+  "${TEST_LOG_DIR}/gpu-step-db-explicit-cuda-aware-two-rank.log"
+env HOME="${QUALIFICATION_HOME}" MEEP_GPU_BACKEND=cuda MEEP_GPU_STRICT=1 \
   MEEP_GPU_VALIDATION_ALLOW_SMALL_DOMAINS=1 \
   MEEP_GPU_MPI_TRANSPORT=cuda-aware MEEP_GPU_MPI_COMPLETION=waitall \
   MEEP_GPU_TEST_PREFLIGHT_ONLY=1 \
@@ -1125,20 +1188,20 @@ env HOME="${QUALIFICATION_HOME}" MEEP_GPU_BACKEND=auto \
   MEEP_GPU_TEST_EXPECT_WAITALL_COMPLETION=1 \
   "${TIMEOUT}" --kill-after=10s 120s "${PREFIX}/bin/mpiexec" -n 2 \
   "${GPU_STEP_DB_ELF}" \
-  >"${TEST_LOG_DIR}/gpu-step-db-auto-cuda-aware-waitall-two-rank.log" 2>&1
+  >"${TEST_LOG_DIR}/gpu-step-db-explicit-cuda-aware-waitall-two-rank.log" 2>&1
 printf '%s\n' \
-  'gpmeep-qualification:gpu-step-db-auto-cuda-aware-waitall-two-rank.log:PASS' >> \
-  "${TEST_LOG_DIR}/gpu-step-db-auto-cuda-aware-waitall-two-rank.log"
-env HOME="${QUALIFICATION_HOME}" MEEP_GPU_BACKEND=auto \
+  'gpmeep-qualification:gpu-step-db-explicit-cuda-aware-waitall-two-rank.log:PASS' >> \
+  "${TEST_LOG_DIR}/gpu-step-db-explicit-cuda-aware-waitall-two-rank.log"
+env HOME="${QUALIFICATION_HOME}" MEEP_GPU_BACKEND=cpu \
   MEEP_GPU_VALIDATION_ALLOW_SMALL_DOMAINS=1 \
   MEEP_GPU_MPI_TRANSPORT=pinned MEEP_GPU_TEST_PREFLIGHT_ONLY=1 \
   MEEP_GPU_TEST_EXPECT_CPU=1 \
   "${TIMEOUT}" --kill-after=10s 120s "${PREFIX}/bin/mpiexec" -n 2 \
   "${GPU_STEP_DB_ELF}" \
-  >"${TEST_LOG_DIR}/gpu-step-db-auto-cpu-two-rank.log" 2>&1
+  >"${TEST_LOG_DIR}/gpu-step-db-explicit-cpu-two-rank.log" 2>&1
 printf '%s\n' \
-  'gpmeep-qualification:gpu-step-db-auto-cpu-two-rank.log:PASS' >> \
-  "${TEST_LOG_DIR}/gpu-step-db-auto-cpu-two-rank.log"
+  'gpmeep-qualification:gpu-step-db-explicit-cpu-two-rank.log:PASS' >> \
+  "${TEST_LOG_DIR}/gpu-step-db-explicit-cpu-two-rank.log"
 env HOME="${QUALIFICATION_HOME}" MEEP_GPU_BACKEND=cuda MEEP_GPU_STRICT=1 \
   MEEP_GPU_VALIDATION_ALLOW_SMALL_DOMAINS=1 \
   MEEP_GPU_MPI_TRANSPORT=cuda-aware \
@@ -1149,6 +1212,56 @@ env HOME="${QUALIFICATION_HOME}" MEEP_GPU_BACKEND=cuda MEEP_GPU_STRICT=1 \
 printf '%s\n' \
   'gpmeep-qualification:dft-phase-sharing-exact-two-rank.log:PASS' >> \
   "${TEST_LOG_DIR}/dft-phase-sharing-exact-two-rank.log"
+
+# Bind the sparse Lorentzian plan's focused lifecycle, fail-closed fallback,
+# exact-FP32 recurrence, and statistics contracts to every CUDA qualification.
+env HOME="${QUALIFICATION_HOME}" MEEP_GPU_BACKEND=cuda MEEP_GPU_STRICT=1 \
+  MEEP_GPU_VALIDATION_ALLOW_SMALL_DOMAINS=1 \
+  MEEP_GPU_TEST_SPARSE_LORENTZIAN_ONLY=1 \
+  "${TIMEOUT}" --kill-after=30s 600s "${PREFIX}/bin/mpiexec" -n 1 \
+  "${GPU_STEP_DB_ELF}" \
+  >"${TEST_LOG_DIR}/sparse-lorentzian-contract-one-rank.log" 2>&1
+printf '%s\n' \
+  'gpmeep-qualification:sparse-lorentzian-contract-one-rank.log:PASS' >> \
+  "${TEST_LOG_DIR}/sparse-lorentzian-contract-one-rank.log"
+env HOME="${QUALIFICATION_HOME}" CUDA_VISIBLE_DEVICES=0,1 \
+  MEEP_GPU_BACKEND=cuda MEEP_GPU_STRICT=1 \
+  MEEP_GPU_ALLOW_OVERSUBSCRIBE=0 \
+  MEEP_GPU_VALIDATION_ALLOW_SMALL_DOMAINS=1 \
+  MEEP_GPU_TEST_SPARSE_LORENTZIAN_ONLY=1 \
+  "${TIMEOUT}" --kill-after=30s 600s "${PREFIX}/bin/mpiexec" -n 2 \
+  "${GPU_STEP_DB_ELF}" \
+  >"${TEST_LOG_DIR}/sparse-lorentzian-contract-two-rank.log" 2>&1
+printf '%s\n' \
+  'gpmeep-qualification:sparse-lorentzian-contract-two-rank.log:PASS' >> \
+  "${TEST_LOG_DIR}/sparse-lorentzian-contract-two-rank.log"
+env HOME="${QUALIFICATION_HOME}" MEEP_GPU_BACKEND=cuda MEEP_GPU_STRICT=1 \
+  MEEP_GPU_VALIDATION_ALLOW_SMALL_DOMAINS=1 \
+  MEEP_GPU_TEST_SPARSE_LORENTZIAN_QUIESCENCE_FAILURE_ONLY=1 \
+  "${TIMEOUT}" --kill-after=30s 120s "${PREFIX}/bin/mpiexec" -n 1 \
+  "${GPU_STEP_DB_ELF}" \
+  >"${TEST_LOG_DIR}/sparse-lorentzian-quiescence-failure-one-rank.log" 2>&1
+printf '%s\n' \
+  'gpmeep-qualification:sparse-lorentzian-quiescence-failure-one-rank.log:PASS' >> \
+  "${TEST_LOG_DIR}/sparse-lorentzian-quiescence-failure-one-rank.log"
+env HOME="${QUALIFICATION_HOME}" MEEP_GPU_BACKEND=cuda MEEP_GPU_STRICT=1 \
+  MEEP_GPU_VALIDATION_ALLOW_SMALL_DOMAINS=1 \
+  MEEP_GPU_TEST_SPARSE_LORENTZIAN_EXHAUSTION_ONLY=1 \
+  "${TIMEOUT}" --kill-after=30s 120s "${PREFIX}/bin/mpiexec" -n 1 \
+  "${GPU_STEP_DB_ELF}" \
+  >"${TEST_LOG_DIR}/sparse-lorentzian-exhaustion-one-rank.log" 2>&1
+printf '%s\n' \
+  'gpmeep-qualification:sparse-lorentzian-exhaustion-one-rank.log:PASS' >> \
+  "${TEST_LOG_DIR}/sparse-lorentzian-exhaustion-one-rank.log"
+env HOME="${QUALIFICATION_HOME}" MEEP_GPU_BACKEND=cuda MEEP_GPU_STRICT=1 \
+  MEEP_GPU_VALIDATION_ALLOW_SMALL_DOMAINS=1 \
+  MEEP_GPU_TEST_SPARSE_LORENTZIAN_RESET_RECLAIM_FAILURE_ONLY=1 \
+  "${TIMEOUT}" --kill-after=30s 120s "${PREFIX}/bin/mpiexec" -n 1 \
+  "${GPU_STEP_DB_ELF}" \
+  >"${TEST_LOG_DIR}/sparse-lorentzian-reset-reclaim-failure-one-rank.log" 2>&1
+printf '%s\n' \
+  'gpmeep-qualification:sparse-lorentzian-reset-reclaim-failure-one-rank.log:PASS' >> \
+  "${TEST_LOG_DIR}/sparse-lorentzian-reset-reclaim-failure-one-rank.log"
 
 # The generic material suite catches numerical mismatches, but these focused
 # gates bind the FP32 ADE representation contract to the production
@@ -1206,6 +1319,13 @@ env HOME="${QUALIFICATION_HOME}" PYTHONNOUSERSITE=1 MPLBACKEND=Agg MPLCONFIGDIR=
   >"${TEST_LOG_DIR}/python-gpu-backend-two-rank.log" 2>&1
 printf '%s\n' 'gpmeep-qualification:python-gpu-backend-two-rank.log:PASS' >> \
   "${TEST_LOG_DIR}/python-gpu-backend-two-rank.log"
+env HOME="${QUALIFICATION_HOME}" PYTHONNOUSERSITE=1 MPLBACKEND=Agg MPLCONFIGDIR="${MPL_CONFIG}" \
+  PYTHONPATH="${BUILD_DIR}/python" MEEP_GPU_BACKEND=cpu \
+  "${TIMEOUT}" --kill-after=10s 120s "${PREFIX}/bin/mpiexec" -n 2 \
+  "${PREFIX}/bin/python" "${REPO_ROOT}/python/tests/test_backend_policy_mpi.py" \
+  >"${TEST_LOG_DIR}/python-backend-policy-two-rank.log" 2>&1
+printf '%s\n' 'gpmeep-qualification:python-backend-policy-two-rank.log:PASS' >> \
+  "${TEST_LOG_DIR}/python-backend-policy-two-rank.log"
 env HOME="${QUALIFICATION_HOME}" MEEP_GPU_BACKEND=cuda MEEP_GPU_STRICT=1 \
   MEEP_GPU_VALIDATION_ALLOW_SMALL_DOMAINS=1 \
   MEEP_GPU_MPI_TRANSPORT=cuda-aware MEEP_GPU_MULTI_PIXELS=16 \
@@ -1866,40 +1986,38 @@ if /usr/bin/grep -aFq -- \
   exit 1
 fi
 run_expected_preflight_failure \
-  automatic-backend-request-mismatch-two-rank 2 \
+  backend-request-mismatch-two-rank 2 \
   "distributed Meep backend requests differ across MPI ranks" \
   MEEP_GPU_BACKEND=cuda MEEP_GPU_STRICT=1 \
   MEEP_GPU_MPI_TRANSPORT=auto MEEP_GPU_MPI_COMPLETION=waitsome \
   MEEP_GPU_TEST_PREFLIGHT_ONLY=1 MEEP_GPU_TEST_RANK_BACKEND_MISMATCH=1
 run_expected_preflight_failure \
-  automatic-threshold-mismatch-two-rank 2 \
-  "MEEP_GPU_AUTO_MIN_CELLS differs across MPI ranks" \
-  MEEP_GPU_BACKEND=cuda MEEP_GPU_STRICT=1 \
-  MEEP_GPU_MPI_TRANSPORT=auto MEEP_GPU_MPI_COMPLETION=waitsome \
-  MEEP_GPU_TEST_PREFLIGHT_ONLY=1 \
-  MEEP_GPU_TEST_RANK_AUTO_THRESHOLD_MISMATCH=1
+  automatic-backend-disabled-one-rank 1 \
+  "automatic selection is disabled" \
+  MEEP_GPU_BACKEND=auto MEEP_GPU_MPI_TRANSPORT=pinned \
+  MEEP_GPU_TEST_PREFLIGHT_ONLY=1
 run_expected_preflight_failure \
-  automatic-invalid-device-two-rank 2 \
+  automatic-backend-token-disabled-one-rank 1 \
+  "automatic selection is disabled" \
+  MEEP_GPU_BACKEND=cuda MEEP_GPU_STRICT=1 \
+  MEEP_GPU_MPI_TRANSPORT=pinned MEEP_GPU_TEST_PREFLIGHT_ONLY=1 \
+  MEEP_GPU_TEST_AUTOMATIC_BACKEND_TOKEN=1
+run_expected_preflight_failure \
+  invalid-device-two-rank 2 \
   "invalid MEEP_GPU_DEVICE='invalid'" \
   MEEP_GPU_BACKEND=cuda MEEP_GPU_STRICT=1 \
   MEEP_GPU_MPI_TRANSPORT=auto MEEP_GPU_MPI_COMPLETION=waitsome \
   MEEP_GPU_TEST_PREFLIGHT_ONLY=1 MEEP_GPU_TEST_RANK_INVALID_DEVICE=1
 run_expected_preflight_failure \
-  automatic-invalid-backend-hidden-one-rank 1 \
+  invalid-backend-hidden-one-rank 1 \
   "invalid MEEP_GPU_BACKEND='definitely-invalid'" \
   CUDA_VISIBLE_DEVICES= MEEP_GPU_BACKEND=definitely-invalid \
   MEEP_GPU_MPI_TRANSPORT=pinned MEEP_GPU_TEST_PREFLIGHT_ONLY=1
 run_expected_preflight_failure \
-  automatic-overflow-threshold-hidden-one-rank 1 \
-  "MEEP_GPU_AUTO_MIN_CELLS must be a non-negative integer" \
-  CUDA_VISIBLE_DEVICES= MEEP_GPU_BACKEND=auto \
-  MEEP_GPU_AUTO_MIN_CELLS=18446744073709551616 \
-  MEEP_GPU_MPI_TRANSPORT=pinned MEEP_GPU_TEST_PREFLIGHT_ONLY=1
-run_expected_preflight_failure \
-  automatic-explicit-duplicate-device-two-rank 2 \
+  explicit-duplicate-device-two-rank 2 \
   "MPI ranks did not select distinct physical CUDA/MIG devices" \
   CUDA_VISIBLE_DEVICES=0,1 MEEP_GPU_ALLOW_OVERSUBSCRIBE=0 \
-  MEEP_GPU_BACKEND=auto MEEP_GPU_AUTO_MIN_CELLS=0 MEEP_GPU_DEVICE=0 \
+  MEEP_GPU_BACKEND=cuda MEEP_GPU_STRICT=1 MEEP_GPU_DEVICE=0 \
   MEEP_GPU_MPI_TRANSPORT=pinned MEEP_GPU_TEST_PREFLIGHT_ONLY=1
 run_expected_preflight_failure \
   ade-state-contract-cuda-required-hidden-one-rank 1 \

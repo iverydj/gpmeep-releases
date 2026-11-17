@@ -7,7 +7,32 @@ import numpy as np
 from scipy import linalg, signal
 
 
+def _nuttall_time_vector(t, state):
+    """Evaluate the Nuttall basis without retaining its owning source."""
+    a = [0.355768, 0.4873960, 0.144232, 0.012604]
+    cos_sum = sum(
+        (-1) ** k
+        * a[k]
+        * np.cos(2 * np.pi * t * k / state["T"])
+        for k in range(len(a))
+    )
+    return np.exp(
+        -1j * 2 * np.pi * state["center_frequencies"] * t
+    ) * cos_sum
+
+
 class FilteredSource(CustomSource):
+    def __setattr__(self, name, value):
+        object.__setattr__(self, name, value)
+        state = self.__dict__.get("_callback_state")
+        if state is not None and name in (
+            "T",
+            "dt",
+            "center_frequencies",
+            "nodes",
+        ):
+            state[name] = value
+
     def __init__(
         self,
         center_frequency: float,
@@ -32,17 +57,24 @@ class FilteredSource(CustomSource):
         self.N = np.rint(self.T / self.dt)
         self.t = np.arange(0, dt * (self.N), dt)
         self.n = np.arange(self.N)
+        self._callback_state = {
+            "T": self.T,
+            "dt": self.dt,
+            "center_frequencies": self.center_frequencies,
+            "nodes": None,
+        }
         f = self.func()
 
         # frequency bandwidth of the Nuttall window function
         fwidth = self.nuttall_bandwidth()
 
+        callback_state = self._callback_state
         self.bf = [
-            lambda t, i=i: 0
-            if t > self.T
+            lambda t, i=i, state=callback_state: 0
+            if t > state["T"]
             else (
-                self.nuttall(t, self.center_frequencies)
-                / (self.dt / np.sqrt(2 * np.pi))
+                _nuttall_time_vector(t, state)
+                / (state["dt"] / np.sqrt(2 * np.pi))
             )[i]
             for i in range(len(self.center_frequencies))
         ]
@@ -54,7 +86,7 @@ class FilteredSource(CustomSource):
                 end_time=self.T,
                 fwidth=fwidth,
             )
-            for bfi in self.bf
+            for bfi, center_frequency in zip(self.bf, self.center_frequencies)
         ]
 
         if time_src:
@@ -166,8 +198,15 @@ class FilteredSource(CustomSource):
         return np.inner(vec, self.nodes)
 
     def func(self):
+        state = self._callback_state
+
         def _f(t):
-            return self(t)
+            if t > state["T"]:
+                return 0
+            vec = _nuttall_time_vector(t, state) / (
+                state["dt"] / np.sqrt(2 * np.pi)
+            )
+            return state["nodes"].dot(vec)
 
         return _f
 
@@ -192,3 +231,13 @@ class FilteredSource(CustomSource):
         response_energy = np.sum(np.abs(H) ** 2)
         l2_err = residual_energy / max(response_energy, np.finfo(float).tiny)
         return nodes, l2_err
+
+
+# ``meep.backend_policy`` freezes package-defined classes during ordinary
+# solver startup.  This optional SciPy-backed module is intentionally loaded
+# later, so register the exact class now.  Its semantic Python state remains
+# fully fingerprinted while the derived native ``swigobj`` handle is omitted
+# just like it is for eagerly loaded Meep source classes.
+from meep import backend_policy as _backend_policy
+
+_backend_policy._register_trusted_meep_class(FilteredSource)

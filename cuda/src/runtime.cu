@@ -18,11 +18,35 @@
 #include <stdexcept>
 
 namespace meep_cuda {
-namespace {
+// NVCC 12.4 includes the build directory in anonymous-namespace symbols.
+// Keep private implementation symbols hidden while giving repeated package
+// builds the same names. This namespace is confined to this translation unit.
+namespace runtime_detail __attribute__((visibility("hidden"))) {
 
 std::atomic<std::uint64_t> availability_probes(0);
 std::atomic<std::uint64_t> device_enumerations(0);
 std::atomic<std::uint64_t> device_selections(0);
+std::atomic<std::uint64_t>
+    structured_curl_graph_launch_api_failures_for_testing(0);
+std::atomic<std::uint64_t>
+    structured_curl_graph_post_enqueue_failures_for_testing(0);
+std::atomic<std::uint64_t>
+    structured_curl_graph_destroy_sync_failures_for_testing(0);
+std::atomic<std::uint64_t>
+    structured_curl_graph_async_device_failures_for_testing(0);
+std::atomic<std::uint64_t>
+    structured_curl_graph_destroy_cuda_sync_failures_observed_for_testing(0);
+
+bool consume_failure_for_testing(
+    std::atomic<std::uint64_t> &remaining) noexcept {
+  std::uint64_t count = remaining.load(std::memory_order_relaxed);
+  while (count != 0)
+    if (remaining.compare_exchange_weak(
+            count, count - 1, std::memory_order_relaxed,
+            std::memory_order_relaxed))
+      return true;
+  return false;
+}
 
 std::runtime_error cuda_exception(cudaError_t error, const char *operation) {
   std::ostringstream message;
@@ -38,6 +62,7 @@ void check(cudaError_t error, const char *operation) {
 struct current_device_cache {
   int ordinal = -1;
   int max_threads_per_block = 0;
+  int multiprocessor_count = 0;
   std::size_t max_grid_x = 0;
   std::size_t max_grid_y = 0;
   std::size_t max_grid_z = 0;
@@ -53,6 +78,7 @@ thread_local current_device_cache launch_device;
 void cache_device_properties(int ordinal, const cudaDeviceProp &property) {
   launch_device.ordinal = ordinal;
   launch_device.max_threads_per_block = property.maxThreadsPerBlock;
+  launch_device.multiprocessor_count = property.multiProcessorCount;
   launch_device.max_grid_x =
       static_cast<std::size_t>(property.maxGridSize[0]);
   launch_device.max_grid_y =
@@ -760,6 +786,9 @@ __global__ void update_lorentzian_fp32_kernel(
       material.gamma_previous,
       material.omega_dt_squared,
       material.omega_dt_squared_denominator};
+  const bool elide_bit_identical_positive_zero =
+      (material.options &
+       lorentzian_elide_bit_identical_positive_zero_fp32) != 0;
   const std::size_t grid_stride =
       static_cast<std::size_t>(gridDim.x) *
       static_cast<std::size_t>(blockDim.x);
@@ -783,7 +812,7 @@ __global__ void update_lorentzian_fp32_kernel(
     detail::apply_lorentzian_update_fp32(
         polarization[i], previous_polarization[i], field[i],
         material.sigma[i], offdiagonal1, offdiagonal2, anisotropic,
-        coefficients);
+        coefficients, elide_bit_identical_positive_zero);
   }
 }
 
@@ -803,6 +832,9 @@ __global__ void update_lorentzian_structured_fp32_kernel(
       material.gamma_previous,
       material.omega_dt_squared,
       material.omega_dt_squared_denominator};
+  const bool elide_bit_identical_positive_zero =
+      (material.options &
+       lorentzian_elide_bit_identical_positive_zero_fp32) != 0;
   const std::size_t grid_stride =
       static_cast<std::size_t>(gridDim.x) *
       static_cast<std::size_t>(blockDim.x);
@@ -826,7 +858,7 @@ __global__ void update_lorentzian_structured_fp32_kernel(
     detail::apply_lorentzian_update_fp32(
         polarization[i], previous_polarization[i], field[i],
         material.sigma[i], offdiagonal1, offdiagonal2, anisotropic,
-        coefficients);
+        coefficients, elide_bit_identical_positive_zero);
   }
 }
 
@@ -846,6 +878,9 @@ __global__ void update_lorentzian_increment_fp32_kernel(
       material.gamma_previous,
       material.omega_dt_squared,
       material.omega_dt_squared_denominator};
+  const bool elide_bit_identical_positive_zero =
+      (material.options &
+       lorentzian_elide_bit_identical_positive_zero_fp32) != 0;
   const std::size_t grid_stride =
       static_cast<std::size_t>(gridDim.x) *
       static_cast<std::size_t>(blockDim.x);
@@ -869,7 +904,7 @@ __global__ void update_lorentzian_increment_fp32_kernel(
     detail::apply_lorentzian_increment_update_fp32(
         polarization[i], polarization_increment[i], field[i],
         material.sigma[i], offdiagonal1, offdiagonal2, anisotropic,
-        coefficients);
+        coefficients, elide_bit_identical_positive_zero);
   }
 }
 
@@ -889,6 +924,9 @@ __global__ void update_lorentzian_increment_structured_fp32_kernel(
       material.gamma_previous,
       material.omega_dt_squared,
       material.omega_dt_squared_denominator};
+  const bool elide_bit_identical_positive_zero =
+      (material.options &
+       lorentzian_elide_bit_identical_positive_zero_fp32) != 0;
   const std::size_t grid_stride =
       static_cast<std::size_t>(gridDim.x) *
       static_cast<std::size_t>(blockDim.x);
@@ -912,7 +950,269 @@ __global__ void update_lorentzian_increment_structured_fp32_kernel(
     detail::apply_lorentzian_increment_update_fp32(
         polarization[i], polarization_increment[i], field[i],
         material.sigma[i], offdiagonal1, offdiagonal2, anisotropic,
-        coefficients);
+        coefficients, elide_bit_identical_positive_zero);
+  }
+}
+
+__device__ void lorentzian_sparse_ledger_add(
+    std::uint64_t *counter, std::uint64_t increment,
+    lorentzian_sparse_execution_ledger_fp32 *ledger) {
+  unsigned long long *const address =
+      reinterpret_cast<unsigned long long *>(counter);
+  unsigned long long observed = *address;
+  for (;;) {
+    const unsigned long long assumed = observed;
+    const bool overflow =
+        increment > static_cast<std::uint64_t>(~0ULL - assumed);
+    const unsigned long long desired =
+        overflow ? ~0ULL : assumed + increment;
+    observed = atomicCAS(address, assumed, desired);
+    if (observed == assumed) {
+      if (overflow) atomicOr(&ledger->counter_overflow, 1U);
+      return;
+    }
+  }
+}
+
+__device__ bool lorentzian_sparse_point_is_active(
+    const float *polarization, const float *auxiliary,
+    std::ptrdiff_t index, lorentzian_material_fp32 material) {
+  return detail::lorentzian_sparse_point_active_fp32(
+      polarization[index], auxiliary[index], material.sigma[index]);
+}
+
+__global__ void count_lorentzian_sparse_active_blocks_fp32_kernel(
+    const float *polarization, const float *auxiliary,
+    index_space_fp32 index_space, std::size_t count,
+    lorentzian_material_fp32 material, bool increment_state,
+    std::uint32_t *block_counts, std::uint32_t *plan_validation_flag,
+    std::size_t logical_block_count) {
+  __shared__ std::uint32_t active_flags[
+      lorentzian_sparse_compaction_block_size];
+  __shared__ std::uint32_t coefficient_safe;
+  if (threadIdx.x == 0) {
+    const detail::lorentzian_coefficients_fp32 coefficients = {
+        material.gamma_inverse,
+        material.gamma_previous,
+        material.omega_dt_squared,
+        material.omega_dt_squared_denominator};
+    coefficient_safe =
+        detail::lorentzian_sparse_coefficients_safe_fp32(
+            coefficients, increment_state)
+            ? 1U
+            : 0U;
+    if (!coefficient_safe)
+      atomicOr(plan_validation_flag,
+               lorentzian_sparse_coefficient_unsafe_fp32);
+  }
+  __syncthreads();
+  for (std::size_t logical_block = blockIdx.x;
+       logical_block < logical_block_count; logical_block += gridDim.x) {
+    const std::size_t point =
+        logical_block * lorentzian_sparse_compaction_block_size +
+        threadIdx.x;
+    bool active = false;
+    if (point < count) {
+      const std::ptrdiff_t index =
+          detail::decode_index_space_fp32(index_space, point).field;
+      active = !coefficient_safe || lorentzian_sparse_point_is_active(
+                                         polarization, auxiliary, index,
+                                         material);
+    }
+    active_flags[threadIdx.x] = active ? 1U : 0U;
+    __syncthreads();
+    for (unsigned int retained =
+             lorentzian_sparse_compaction_block_size / 2;
+         retained != 0; retained /= 2) {
+      if (threadIdx.x < retained)
+        active_flags[threadIdx.x] +=
+            active_flags[threadIdx.x + retained];
+      __syncthreads();
+    }
+    if (threadIdx.x == 0)
+      block_counts[logical_block] = active_flags[0];
+    __syncthreads();
+  }
+}
+
+__global__ void fill_lorentzian_sparse_active_indices_fp32_kernel(
+    const float *polarization, const float *auxiliary,
+    index_space_fp32 index_space, std::size_t count,
+    lorentzian_material_fp32 material, bool increment_state,
+    const std::uint64_t *block_offsets, std::size_t active_count,
+    std::ptrdiff_t *active_indices,
+    std::uint32_t *plan_validation_flag,
+    std::size_t logical_block_count) {
+  __shared__ std::uint32_t inclusive_prefix[
+      lorentzian_sparse_compaction_block_size];
+  __shared__ std::uint32_t coefficient_safe;
+  if (threadIdx.x == 0) {
+    const detail::lorentzian_coefficients_fp32 coefficients = {
+        material.gamma_inverse,
+        material.gamma_previous,
+        material.omega_dt_squared,
+        material.omega_dt_squared_denominator};
+    coefficient_safe =
+        detail::lorentzian_sparse_coefficients_safe_fp32(
+            coefficients, increment_state)
+            ? 1U
+            : 0U;
+    if (!coefficient_safe)
+      atomicOr(plan_validation_flag,
+               lorentzian_sparse_coefficient_unsafe_fp32);
+  }
+  __syncthreads();
+  for (std::size_t logical_block = blockIdx.x;
+       logical_block < logical_block_count; logical_block += gridDim.x) {
+    const std::size_t point =
+        logical_block * lorentzian_sparse_compaction_block_size +
+        threadIdx.x;
+    bool active = false;
+    std::ptrdiff_t index = 0;
+    if (point < count) {
+      index = detail::decode_index_space_fp32(index_space, point).field;
+      active = !coefficient_safe || lorentzian_sparse_point_is_active(
+                                         polarization, auxiliary, index,
+                                         material);
+    }
+    inclusive_prefix[threadIdx.x] = active ? 1U : 0U;
+    __syncthreads();
+    for (unsigned int offset = 1;
+         offset < lorentzian_sparse_compaction_block_size; offset *= 2) {
+      const std::uint32_t addend =
+          threadIdx.x >= offset
+              ? inclusive_prefix[threadIdx.x - offset]
+              : 0U;
+      __syncthreads();
+      if (threadIdx.x >= offset)
+        inclusive_prefix[threadIdx.x] += addend;
+      __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+      const std::uint64_t base = block_offsets[logical_block];
+      const std::uint64_t block_active_count =
+          inclusive_prefix[lorentzian_sparse_compaction_block_size - 1];
+      bool invalid = logical_block == 0 && base != 0;
+      std::uint64_t block_end = 0;
+      const std::uint64_t maximum_uint64 =
+          ~static_cast<std::uint64_t>(0);
+      if (base > maximum_uint64 - block_active_count)
+        invalid = true;
+      else {
+        block_end = base + block_active_count;
+        if (block_end > active_count) invalid = true;
+        if (logical_block + 1 < logical_block_count) {
+          if (block_offsets[logical_block + 1] != block_end)
+            invalid = true;
+        }
+        else if (block_end != active_count)
+          invalid = true;
+      }
+      if (invalid)
+        atomicOr(plan_validation_flag,
+                 lorentzian_sparse_fill_invalid_fp32);
+    }
+    __syncthreads();
+    if (active) {
+      const std::uint64_t base = block_offsets[logical_block];
+      const std::uint64_t rank =
+          static_cast<std::uint64_t>(inclusive_prefix[threadIdx.x] - 1U);
+      const std::uint64_t maximum_uint64 =
+          ~static_cast<std::uint64_t>(0);
+      if (base > maximum_uint64 - rank)
+        atomicOr(plan_validation_flag,
+                 lorentzian_sparse_fill_invalid_fp32);
+      else {
+        const std::uint64_t destination = base + rank;
+        if (destination < active_count)
+          active_indices[static_cast<std::size_t>(destination)] = index;
+        else
+          atomicOr(plan_validation_flag,
+                   lorentzian_sparse_fill_invalid_fp32);
+      }
+    }
+    __syncthreads();
+  }
+}
+
+__global__ void scan_lorentzian_sparse_field_finite_fp32_kernel(
+    const float *field, index_space_fp32 index_space, std::size_t count,
+    std::uint32_t *sticky_nonfinite,
+    lorentzian_sparse_execution_ledger_fp32 *ledger) {
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    lorentzian_sparse_ledger_add(&ledger->guard_scan_calls, 1, ledger);
+    lorentzian_sparse_ledger_add(
+        &ledger->guard_scan_points, static_cast<std::uint64_t>(count),
+        ledger);
+  }
+  const std::size_t grid_stride =
+      static_cast<std::size_t>(gridDim.x) * blockDim.x;
+  for (std::size_t point =
+           static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       point < count; point += grid_stride) {
+    const std::ptrdiff_t index =
+        detail::decode_index_space_fp32(index_space, point).field;
+    if (!detail::lorentzian_finite_fp32(field[index]))
+      atomicOr(sticky_nonfinite, 1U);
+  }
+}
+
+template <bool IncrementState>
+__global__ void update_lorentzian_sparse_guarded_fp32_kernel(
+    float *polarization, float *auxiliary, const float *field,
+    const std::ptrdiff_t *active_indices, std::size_t active_count,
+    index_space_fp32 index_space, std::size_t structured_count,
+    lorentzian_material_fp32 material,
+    const std::uint32_t *plan_validation_flag,
+    const std::uint32_t *sticky_nonfinite,
+    lorentzian_sparse_execution_ledger_fp32 *ledger) {
+  const detail::lorentzian_coefficients_fp32 coefficients = {
+      material.gamma_inverse,
+      material.gamma_previous,
+      material.omega_dt_squared,
+      material.omega_dt_squared_denominator};
+  const bool dense_fallback =
+      *plan_validation_flag != 0 || *sticky_nonfinite != 0;
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    if (dense_fallback) {
+      lorentzian_sparse_ledger_add(
+          &ledger->dense_fallback_calls, 1, ledger);
+      lorentzian_sparse_ledger_add(
+          &ledger->dense_fallback_points,
+          static_cast<std::uint64_t>(structured_count), ledger);
+    }
+    else {
+      lorentzian_sparse_ledger_add(
+          &ledger->sparse_update_calls, 1, ledger);
+      lorentzian_sparse_ledger_add(
+          &ledger->sparse_update_points,
+          static_cast<std::uint64_t>(active_count), ledger);
+    }
+  }
+  const bool elide_bit_identical_positive_zero =
+      (material.options &
+       lorentzian_elide_bit_identical_positive_zero_fp32) != 0;
+  const std::size_t selected_count =
+      dense_fallback ? structured_count : active_count;
+  const std::size_t grid_stride =
+      static_cast<std::size_t>(gridDim.x) * blockDim.x;
+  for (std::size_t point =
+           static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       point < selected_count; point += grid_stride) {
+    const std::ptrdiff_t index =
+        dense_fallback
+            ? detail::decode_index_space_fp32(index_space, point).field
+            : active_indices[point];
+    if (IncrementState)
+      detail::apply_lorentzian_increment_update_fp32(
+          polarization[index], auxiliary[index], field[index],
+          material.sigma[index], 0.0f, 0.0f, false, coefficients,
+          elide_bit_identical_positive_zero);
+    else
+      detail::apply_lorentzian_update_fp32(
+          polarization[index], auxiliary[index], field[index],
+          material.sigma[index], 0.0f, 0.0f, false, coefficients,
+          elide_bit_identical_positive_zero);
   }
 }
 
@@ -3941,6 +4241,29 @@ unsigned int launch_cooperative_block_count(std::size_t logical_block_count,
   return static_cast<unsigned int>(blocks);
 }
 
+// Persistent guarded kernels cover either a sparse indexed domain or a dense
+// structured fallback without a host readback. A small resident grid preserves
+// enough occupancy for the dense grid-stride loop while avoiding one empty
+// block per dense-domain tile on the common sparse branch.
+unsigned int launch_resident_block_count(std::size_t maximum_count,
+                                         int threads_per_block) {
+  const unsigned int requested =
+      launch_block_count(maximum_count, threads_per_block);
+  constexpr std::size_t blocks_per_multiprocessor = 4;
+  const std::size_t multiprocessors =
+      launch_device.multiprocessor_count > 0
+          ? static_cast<std::size_t>(launch_device.multiprocessor_count)
+          : 1;
+  const std::size_t resident_cap =
+      multiprocessors >
+              std::numeric_limits<std::size_t>::max() /
+                  blocks_per_multiprocessor
+          ? std::numeric_limits<std::size_t>::max()
+          : multiprocessors * blocks_per_multiprocessor;
+  return static_cast<unsigned int>(
+      std::min<std::size_t>(requested, std::max<std::size_t>(1, resident_cap)));
+}
+
 std::size_t dft_work_count(std::size_t point_count,
                            std::size_t frequency_count) {
   if (point_count == 0 || frequency_count == 0) return 0;
@@ -4006,7 +4329,16 @@ void validate_index_space(const index_space_fp32 &space,
         "structured index-space extents do not match the launch count");
 }
 
-} // namespace
+void validate_lorentzian_options(std::uint32_t options) {
+  constexpr std::uint32_t supported =
+      lorentzian_elide_bit_identical_positive_zero_fp32;
+  if ((options & ~supported) != 0)
+    throw std::invalid_argument("unsupported Lorentzian runtime option");
+}
+
+} // namespace runtime_detail
+
+using namespace runtime_detail;
 
 bool runtime_available(std::string *diagnostic) {
   availability_probes.fetch_add(1, std::memory_order_relaxed);
@@ -4418,6 +4750,232 @@ void step_curl_material_phase_batched_fp32(
         "step_curl_material_phase_batched_fp32 kernel launch");
 }
 
+struct structured_curl_graph_fp32 {
+  cudaGraphExec_t executable = nullptr;
+  int device_ordinal = -1;
+};
+
+// This kernel exists only to qualify the process-long quarantine contract at
+// a real CUDA asynchronous-completion boundary.  Executing a device trap
+// poisons the context, so submission is reachable only through the explicitly
+// test-only hook below and every caller must exit afterward.
+__global__ void structured_curl_graph_async_failure_kernel_for_testing() {
+  asm volatile("trap;");
+}
+
+structured_curl_graph_fp32 *create_structured_curl_graph_fp32(
+    const curl_phase_operation_fp32 *operations,
+    std::size_t operation_count, int threads_per_block) {
+  if (!operations)
+    throw std::invalid_argument(
+        "structured curl graph operations must be non-null");
+  if (operation_count == 0)
+    throw std::invalid_argument(
+        "structured curl graph operation count must be nonzero");
+
+  // Validate the complete operation vector before creating a CUDA object.
+  // Resident Meep callers pass normalized operands, so g1 is mandatory and
+  // g2 is optional. This also lets CPU-only argument tests fail before a
+  // runtime device query.
+  for (std::size_t index = 0; index < operation_count; ++index) {
+    const curl_phase_operation_fp32 &operation = operations[index];
+    if (!operation.field)
+      throw std::invalid_argument(
+          "structured curl graph field must be non-null");
+    if (!operation.g1)
+      throw std::invalid_argument(
+          "structured curl graph normalized first operand must be non-null");
+    if (operation.point_count == 0)
+      throw std::invalid_argument(
+          "structured curl graph point count must be nonzero");
+    const bool pml_f = operation.material.sigma ||
+                       operation.material.kappa ||
+                       operation.material.sigma_inverse;
+    if (pml_f && !(operation.material.sigma && operation.material.kappa &&
+                   operation.material.sigma_inverse))
+      throw std::invalid_argument(
+          "structured curl graph PML-f pointers must be all present");
+    const bool pml_u = operation.material.sigma_u ||
+                       operation.material.kappa_u ||
+                       operation.material.sigma_u_inverse ||
+                       operation.material.field_u;
+    if (pml_u &&
+        !(operation.material.sigma_u && operation.material.kappa_u &&
+          operation.material.sigma_u_inverse &&
+          operation.material.field_u))
+      throw std::invalid_argument(
+          "structured curl graph PML-u pointers must be all present");
+    const bool conductivity = operation.material.conductivity ||
+                              operation.material.conductivity_inverse;
+    if (conductivity &&
+        !(operation.material.conductivity &&
+          operation.material.conductivity_inverse))
+      throw std::invalid_argument(
+          "structured curl graph conductivity pointers must be both present");
+    if (conductivity && pml_f &&
+        !operation.material.field_conductivity)
+      throw std::invalid_argument(
+          "structured curl graph PML conductivity requires an auxiliary field");
+    if (operation.material.field_conductivity &&
+        !(conductivity && pml_f))
+      throw std::invalid_argument(
+          "structured curl graph conductivity auxiliary field is inconsistent");
+    if ((pml_f && operation.inline_space.coefficient_start < 0) ||
+        (pml_u && operation.inline_space.coefficient2_start < 0))
+      throw std::invalid_argument(
+          "structured curl graph PML requires coefficient index spaces");
+    validate_index_space(operation.inline_space, operation.point_count);
+  }
+
+  int device_ordinal = -1;
+  check(cudaGetDevice(&device_ordinal),
+        "cudaGetDevice structured curl graph");
+  cudaGraph_t graph = nullptr;
+  cudaGraphExec_t executable = nullptr;
+  try {
+    check(cudaGraphCreate(&graph, 0),
+          "cudaGraphCreate structured curl graph");
+    cudaGraphNode_t tail = nullptr;
+    for (std::size_t index = 0; index < operation_count; ++index) {
+      const curl_phase_operation_fp32 &operation = operations[index];
+      const unsigned int blocks =
+          launch_block_count(operation.point_count, threads_per_block);
+      cudaKernelNodeParams parameters{};
+      parameters.func = reinterpret_cast<void *>(
+          step_curl_material_structured_fp32_kernel);
+      parameters.gridDim = dim3(blocks);
+      parameters.blockDim = dim3(threads_per_block);
+
+      float *field = operation.field;
+      const float *g1 = operation.g1;
+      const float *g2 = operation.g2;
+      index_space_fp32 index_space = operation.inline_space;
+      std::size_t point_count = operation.point_count;
+      std::ptrdiff_t stride1 = operation.stride1;
+      std::ptrdiff_t stride2 = operation.stride2;
+      float dtdx = operation.dtdx;
+      curl_material_fp32 material = operation.material;
+      void *arguments[] = {
+          &field, &g1, &g2, &index_space, &point_count,
+          &stride1, &stride2, &dtdx, &material};
+      parameters.kernelParams = arguments;
+      const cudaGraphNode_t *dependencies = tail ? &tail : nullptr;
+      const std::size_t dependency_count = tail ? 1u : 0u;
+      cudaGraphNode_t node = nullptr;
+      check(cudaGraphAddKernelNode(
+                &node, graph, dependencies, dependency_count,
+                &parameters),
+            "cudaGraphAddKernelNode structured curl graph");
+      tail = node;
+    }
+    check(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0),
+          "cudaGraphInstantiate structured curl graph");
+    check(cudaGraphDestroy(graph),
+          "cudaGraphDestroy structured curl graph");
+    graph = nullptr;
+
+    structured_curl_graph_fp32 *result =
+        new structured_curl_graph_fp32;
+    result->executable = executable;
+    result->device_ordinal = device_ordinal;
+    return result;
+  }
+  catch (...) {
+    if (executable) (void)cudaGraphExecDestroy(executable);
+    if (graph) (void)cudaGraphDestroy(graph);
+    throw;
+  }
+}
+
+void launch_structured_curl_graph_fp32(
+    structured_curl_graph_fp32 *graph) {
+  if (!graph || !graph->executable)
+    throw std::invalid_argument(
+        "structured curl graph executable must be non-null");
+  const bool inject_api_failure = consume_failure_for_testing(
+      structured_curl_graph_launch_api_failures_for_testing);
+  // Exercise the actual CUDA API-return failure boundary without mutating the
+  // valid retained executable.  A null launch handle is rejected
+  // synchronously by cudaGraphLaunch itself.
+  check(cudaGraphLaunch(
+            inject_api_failure ? nullptr : graph->executable, nullptr),
+        inject_api_failure
+            ? "injected cudaGraphLaunch structured curl graph API return"
+            : "cudaGraphLaunch structured curl graph");
+  if (consume_failure_for_testing(
+          structured_curl_graph_post_enqueue_failures_for_testing))
+    throw std::runtime_error(
+        "injected structured curl graph synthetic post-enqueue uncertainty");
+}
+
+bool destroy_structured_curl_graph_fp32(
+    structured_curl_graph_fp32 *graph) noexcept {
+  if (!graph) return true;
+  if (!graph->executable) {
+    delete graph;
+    return true;
+  }
+  try {
+    select_device(graph->device_ordinal);
+  }
+  catch (...) {
+    return false;
+  }
+  if (consume_failure_for_testing(
+          structured_curl_graph_destroy_sync_failures_for_testing))
+    return false;
+  // Submit only after creation-device selection and immediately before the
+  // fence: no other CUDA API can race to consume the real asynchronous device
+  // failure which this process-isolated qualification mode creates.
+  if (consume_failure_for_testing(
+          structured_curl_graph_async_device_failures_for_testing))
+    structured_curl_graph_async_failure_kernel_for_testing<<<1, 1>>>();
+  if (cudaDeviceSynchronize() != cudaSuccess) {
+    structured_curl_graph_destroy_cuda_sync_failures_observed_for_testing
+        .fetch_add(1, std::memory_order_relaxed);
+    return false;
+  }
+  if (cudaGraphExecDestroy(graph->executable) != cudaSuccess) return false;
+  graph->executable = nullptr;
+  delete graph;
+  return true;
+}
+
+void set_structured_curl_graph_launch_api_failures_for_testing(
+    std::uint64_t count) noexcept {
+  structured_curl_graph_launch_api_failures_for_testing.store(
+      count, std::memory_order_relaxed);
+}
+
+void set_structured_curl_graph_post_enqueue_failures_for_testing(
+    std::uint64_t count) noexcept {
+  structured_curl_graph_post_enqueue_failures_for_testing.store(
+      count, std::memory_order_relaxed);
+}
+
+void set_structured_curl_graph_destroy_sync_failures_for_testing(
+    std::uint64_t count) noexcept {
+  structured_curl_graph_destroy_sync_failures_for_testing.store(
+      count, std::memory_order_relaxed);
+}
+
+void set_structured_curl_graph_async_device_failures_for_testing(
+    std::uint64_t count) noexcept {
+  structured_curl_graph_async_device_failures_for_testing.store(
+      count, std::memory_order_relaxed);
+}
+
+std::uint64_t
+structured_curl_graph_destroy_cuda_sync_failures_for_testing() noexcept {
+  return structured_curl_graph_destroy_cuda_sync_failures_observed_for_testing
+      .load(std::memory_order_relaxed);
+}
+
+int current_device_ordinal_for_testing() noexcept {
+  int ordinal = -1;
+  return cudaGetDevice(&ordinal) == cudaSuccess ? ordinal : -1;
+}
+
 void step_beta_structured_fp32(
     float *field, const float *g, const index_space_fp32 &index_space,
     std::size_t count, float betadt, const beta_material_fp32 &material,
@@ -4826,6 +5384,7 @@ void update_lorentzian_fp32(
   if (!field || !material.sigma)
     throw std::invalid_argument(
         "Lorentzian field and diagonal sigma pointers must be non-null");
+  validate_lorentzian_options(material.options);
   const detail::lorentzian_operands_fp32 operands =
       detail::normalize_lorentzian_operands(
           field1, field2, material.offdiagonal1, material.offdiagonal2,
@@ -4861,6 +5420,7 @@ void update_lorentzian_structured_fp32(
   if (!field || !material.sigma)
     throw std::invalid_argument(
         "Lorentzian field and diagonal sigma pointers must be non-null");
+  validate_lorentzian_options(material.options);
   const detail::lorentzian_operands_fp32 operands =
       detail::normalize_lorentzian_operands(
           field1, field2, material.offdiagonal1, material.offdiagonal2,
@@ -4898,6 +5458,7 @@ void update_lorentzian_increment_fp32(
   if (!field || !material.sigma)
     throw std::invalid_argument(
         "Lorentzian field and diagonal sigma pointers must be non-null");
+  validate_lorentzian_options(material.options);
   const detail::lorentzian_operands_fp32 operands =
       detail::normalize_lorentzian_operands(
           field1, field2, material.offdiagonal1, material.offdiagonal2,
@@ -4934,6 +5495,7 @@ void update_lorentzian_increment_structured_fp32(
   if (!field || !material.sigma)
     throw std::invalid_argument(
         "Lorentzian field and diagonal sigma pointers must be non-null");
+  validate_lorentzian_options(material.options);
   const detail::lorentzian_operands_fp32 operands =
       detail::normalize_lorentzian_operands(
           field1, field2, material.offdiagonal1, material.offdiagonal2,
@@ -4957,6 +5519,166 @@ void update_lorentzian_increment_structured_fp32(
           index_space, count, field_stride, stride1, stride2, material);
   check(cudaGetLastError(),
         "update_lorentzian_increment_structured_fp32 kernel launch");
+}
+
+std::size_t lorentzian_sparse_compaction_block_count(
+    std::size_t point_count) noexcept {
+  return point_count / lorentzian_sparse_compaction_block_size +
+         (point_count % lorentzian_sparse_compaction_block_size != 0);
+}
+
+void count_lorentzian_sparse_active_blocks_fp32(
+    const float *polarization, const float *auxiliary,
+    const index_space_fp32 &index_space, std::size_t count,
+    const lorentzian_material_fp32 &material, bool increment_state,
+    std::uint32_t *block_counts, std::uint32_t *plan_validation_flag) {
+  if (!polarization || !auxiliary || !material.sigma)
+    throw std::invalid_argument(
+        "sparse Lorentzian states and diagonal sigma must be non-null");
+  if (material.offdiagonal1 || material.offdiagonal2)
+    throw std::invalid_argument(
+        "sparse Lorentzian compaction requires isotropic sigma");
+  validate_lorentzian_options(material.options);
+  if (count == 0) return;
+  if (!block_counts || !plan_validation_flag)
+    throw std::invalid_argument(
+        "sparse Lorentzian block counts and validation flag must be non-null");
+  validate_index_space(index_space, count);
+  const std::size_t logical_blocks =
+      lorentzian_sparse_compaction_block_count(count);
+  const unsigned int blocks = launch_cooperative_block_count(
+      logical_blocks,
+      static_cast<int>(lorentzian_sparse_compaction_block_size));
+  count_lorentzian_sparse_active_blocks_fp32_kernel
+      <<<blocks, lorentzian_sparse_compaction_block_size>>>(
+          polarization, auxiliary, index_space, count, material,
+          increment_state, block_counts, plan_validation_flag,
+          logical_blocks);
+  check(cudaGetLastError(),
+        "count_lorentzian_sparse_active_blocks_fp32 kernel launch");
+}
+
+void fill_lorentzian_sparse_active_indices_fp32(
+    const float *polarization, const float *auxiliary,
+    const index_space_fp32 &index_space, std::size_t count,
+    const lorentzian_material_fp32 &material, bool increment_state,
+    const std::uint64_t *block_offsets, std::size_t active_count,
+    std::ptrdiff_t *active_indices,
+    std::uint32_t *plan_validation_flag) {
+  if (!polarization || !auxiliary || !material.sigma)
+    throw std::invalid_argument(
+        "sparse Lorentzian states and diagonal sigma must be non-null");
+  if (material.offdiagonal1 || material.offdiagonal2)
+    throw std::invalid_argument(
+        "sparse Lorentzian compaction requires isotropic sigma");
+  validate_lorentzian_options(material.options);
+  if (active_count > count)
+    throw std::invalid_argument(
+        "sparse Lorentzian active count exceeds structured count");
+  if (count == 0) return;
+  if (!block_offsets || !plan_validation_flag)
+    throw std::invalid_argument(
+        "sparse Lorentzian offsets and validation flag must be non-null");
+  if (active_count != 0 && !active_indices)
+    throw std::invalid_argument(
+        "sparse Lorentzian active indices must be non-null");
+  validate_index_space(index_space, count);
+  const std::size_t logical_blocks =
+      lorentzian_sparse_compaction_block_count(count);
+  const unsigned int blocks = launch_cooperative_block_count(
+      logical_blocks,
+      static_cast<int>(lorentzian_sparse_compaction_block_size));
+  fill_lorentzian_sparse_active_indices_fp32_kernel
+      <<<blocks, lorentzian_sparse_compaction_block_size>>>(
+          polarization, auxiliary, index_space, count, material,
+          increment_state, block_offsets, active_count, active_indices,
+          plan_validation_flag, logical_blocks);
+  check(cudaGetLastError(),
+        "fill_lorentzian_sparse_active_indices_fp32 kernel launch");
+}
+
+void scan_lorentzian_sparse_field_finite_fp32(
+    const float *field, const index_space_fp32 &index_space,
+    std::size_t count, std::uint32_t *sticky_nonfinite,
+    lorentzian_sparse_execution_ledger_fp32 *ledger) {
+  if (!field || !sticky_nonfinite || !ledger)
+    throw std::invalid_argument(
+        "sparse Lorentzian guard pointers must be non-null");
+  if (count == 0) return;
+  validate_index_space(index_space, count);
+  const unsigned int blocks = launch_block_count(count, 256);
+  scan_lorentzian_sparse_field_finite_fp32_kernel<<<blocks, 256>>>(
+      field, index_space, count, sticky_nonfinite, ledger);
+  check(cudaGetLastError(),
+        "scan_lorentzian_sparse_field_finite_fp32 kernel launch");
+}
+
+template <bool IncrementState>
+void launch_lorentzian_sparse_guarded_fp32(
+    float *polarization, float *auxiliary, const float *field,
+    const std::ptrdiff_t *active_indices, std::size_t active_count,
+    const index_space_fp32 &index_space, std::size_t structured_count,
+    const lorentzian_material_fp32 &material,
+    const std::uint32_t *plan_validation_flag,
+    const std::uint32_t *sticky_nonfinite,
+    lorentzian_sparse_execution_ledger_fp32 *ledger,
+    int threads_per_block, const char *operation) {
+  if (!polarization || !auxiliary || !field || !material.sigma ||
+      !plan_validation_flag || !sticky_nonfinite || !ledger)
+    throw std::invalid_argument(
+        "guarded sparse Lorentzian pointers must be non-null");
+  if (material.offdiagonal1 || material.offdiagonal2)
+    throw std::invalid_argument(
+        "guarded sparse Lorentzian update requires isotropic sigma");
+  if (active_count > structured_count)
+    throw std::invalid_argument(
+        "guarded sparse Lorentzian active count exceeds structured count");
+  if (active_count != 0 && !active_indices)
+    throw std::invalid_argument(
+        "guarded sparse Lorentzian indices must be non-null");
+  validate_lorentzian_options(material.options);
+  if (structured_count == 0) return;
+  validate_index_space(index_space, structured_count);
+  const unsigned int blocks =
+      launch_resident_block_count(structured_count, threads_per_block);
+  update_lorentzian_sparse_guarded_fp32_kernel<IncrementState>
+      <<<blocks, threads_per_block>>>(
+          polarization, auxiliary, field, active_indices, active_count,
+          index_space, structured_count, material, plan_validation_flag,
+          sticky_nonfinite, ledger);
+  check(cudaGetLastError(), operation);
+}
+
+void update_lorentzian_sparse_guarded_fp32(
+    float *polarization, float *previous_polarization, const float *field,
+    const std::ptrdiff_t *active_indices, std::size_t active_count,
+    const index_space_fp32 &index_space, std::size_t structured_count,
+    const lorentzian_material_fp32 &material,
+    const std::uint32_t *plan_validation_flag,
+    const std::uint32_t *sticky_nonfinite,
+    lorentzian_sparse_execution_ledger_fp32 *ledger,
+    int threads_per_block) {
+  launch_lorentzian_sparse_guarded_fp32<false>(
+      polarization, previous_polarization, field, active_indices,
+      active_count, index_space, structured_count, material,
+      plan_validation_flag, sticky_nonfinite, ledger, threads_per_block,
+      "update_lorentzian_sparse_guarded_fp32 kernel launch");
+}
+
+void update_lorentzian_increment_sparse_guarded_fp32(
+    float *polarization, float *polarization_increment, const float *field,
+    const std::ptrdiff_t *active_indices, std::size_t active_count,
+    const index_space_fp32 &index_space, std::size_t structured_count,
+    const lorentzian_material_fp32 &material,
+    const std::uint32_t *plan_validation_flag,
+    const std::uint32_t *sticky_nonfinite,
+    lorentzian_sparse_execution_ledger_fp32 *ledger,
+    int threads_per_block) {
+  launch_lorentzian_sparse_guarded_fp32<true>(
+      polarization, polarization_increment, field, active_indices,
+      active_count, index_space, structured_count, material,
+      plan_validation_flag, sticky_nonfinite, ledger, threads_per_block,
+      "update_lorentzian_increment_sparse_guarded_fp32 kernel launch");
 }
 
 void update_gyrotropic_structured_fp32(
@@ -6083,7 +6805,7 @@ void vector_scaled_sum_squares_fp32(const float *values,
         "vector_scaled_sum_squares_fp32 final kernel launch");
 }
 
-namespace {
+namespace runtime_detail __attribute__((visibility("hidden"))) {
 
 dim3 cw_field_vector_grid(std::size_t segment_count,
                           std::size_t maximum_point_count,
@@ -6098,7 +6820,7 @@ dim3 cw_field_vector_grid(std::size_t segment_count,
               static_cast<unsigned int>(segment_count));
 }
 
-} // namespace
+} // namespace runtime_detail
 
 void gather_cw_field_vector_fp32(
     const cw_field_vector_segment_fp32 *segments,

@@ -149,6 +149,26 @@ def feature_records(condition: str, ranks: int = 1) -> dict[str, dict]:
             "generation_misses": 0,
             "mirror_misses": 0,
         },
+        "structured_curl_graph": {
+            "collection_checks": 0,
+            "collection_launches": 0,
+            "plan_creations": 0,
+            "plan_rebuilds": 0,
+            "plan_reuses": 0,
+            "plan_destroys": 0,
+            "plan_destroy_failures": 0,
+            "live_plans": 0,
+            "quarantined_plans": 0,
+            "logical_operations": 0,
+            "unsupported_fallbacks": 0,
+            "creation_fallbacks": 0,
+            "launch_failures": 0,
+            "replay_checks": 0,
+            "replay_launches": 0,
+            "replay_unready": 0,
+            "replay_generation_misses": 0,
+            "replay_mirror_misses": 0,
+        },
         "boundary_phase_graph": {"creations": 1, "launches": 80},
         "eager_mpi": {
             "receive_start_calls": 0,
@@ -588,6 +608,21 @@ class StrictParsingTests(unittest.TestCase):
             diag.parse_sample(
                 valid_output(self.item) + "gpmeep-surprise-v1:{}\n", self.item
             )
+
+    def test_structured_curl_graph_v1_is_bound_and_v2_fails_closed(self) -> None:
+        output = valid_output(self.item)
+        parsed = diag.parse_sample(output, self.item)
+        record = parsed["feature_markers"]["structured_curl_graph"]
+        self.assertEqual(
+            set(record), diag.FEATURE_SCHEMAS["structured_curl_graph"][1]
+        )
+        future = output.replace(
+            diag.STRUCTURED_CURL_GRAPH_PREFIX,
+            "gpmeep-structured-curl-graph-v2:",
+            1,
+        )
+        with self.assertRaisesRegex(diag.DiagnosticError, "unknown gpmeep marker"):
+            diag.parse_sample(future, self.item)
 
     def test_initial_condition_and_setup_timing_are_exact_and_bound(self) -> None:
         output = valid_output(self.item)

@@ -95,6 +95,16 @@ REQUIRED_IMMUTABLE_EMPTY_DIRECTORIES = {
 REQUIRED_IMMUTABLE_EMPTY_DIRECTORY_RELATIVE_PATHS = {
     "qualification_pycache": "qualification-pycache",
 }
+ACKNOWLEDGEMENT_BINDING_KEYS = (
+    "selected_backend",
+    "recommended_backend",
+    "workload_fingerprint",
+    "recommendation_policy_version",
+    "mpi_topology_digest",
+    "native_state_digest",
+    "process_nonce",
+    "run_nonce",
+)
 
 # This is deliberately an explicit checked-in set.  A builder edit which adds
 # a new PASS-producing gate must update this contract; deriving the set from
@@ -102,13 +112,13 @@ REQUIRED_IMMUTABLE_EMPTY_DIRECTORY_RELATIVE_PATHS = {
 REQUIRED_QUALIFICATION_LOGS = (
     "ade-state-contract-cuda-required-hidden-one-rank.log",
     "ade-state-contract-one-rank.log",
-    "automatic-backend-request-mismatch-two-rank.log",
-    "automatic-explicit-duplicate-device-two-rank.log",
-    "automatic-explicit-oversubscription-two-rank.log",
-    "automatic-invalid-backend-hidden-one-rank.log",
-    "automatic-invalid-device-two-rank.log",
-    "automatic-overflow-threshold-hidden-one-rank.log",
-    "automatic-threshold-mismatch-two-rank.log",
+    "backend-request-mismatch-two-rank.log",
+    "explicit-duplicate-device-two-rank.log",
+    "explicit-oversubscription-two-rank.log",
+    "invalid-backend-hidden-one-rank.log",
+    "invalid-device-two-rank.log",
+    "automatic-backend-disabled-one-rank.log",
+    "automatic-backend-token-disabled-one-rank.log",
     "boundary-eh-overlap-default-off-two-rank.log",
     "boundary-eh-overlap-eager-disabled-two-rank.log",
     "boundary-eh-overlap-exact-comparison.log",
@@ -146,12 +156,14 @@ REQUIRED_QUALIFICATION_LOGS = (
     "eager-pingpong-waitall-two-rank.log",
     "gpu-backend-direct-elf-provenance.log",
     "gpu-mpi-performance-direct-elf-provenance.log",
-    "gpu-step-db-auto-cpu-one-rank.log",
-    "gpu-step-db-auto-cpu-two-rank.log",
-    "gpu-step-db-auto-cuda-aware-two-rank.log",
-    "gpu-step-db-auto-cuda-aware-waitall-two-rank.log",
-    "gpu-step-db-auto-cuda-one-rank.log",
-    "gpu-step-db-auto-cuda-two-rank.log",
+    "gpu-step-db-backend-pin-device-swap-one-rank.log",
+    "gpu-step-db-backend-transition-one-rank.log",
+    "gpu-step-db-explicit-cpu-one-rank.log",
+    "gpu-step-db-explicit-cpu-two-rank.log",
+    "gpu-step-db-explicit-cuda-aware-two-rank.log",
+    "gpu-step-db-explicit-cuda-aware-waitall-two-rank.log",
+    "gpu-step-db-explicit-cuda-one-rank.log",
+    "gpu-step-db-explicit-cuda-two-rank.log",
     "gpu-step-db-cw-breakdown-one-rank.log",
     "gpu-step-db-cw-breakdown-two-rank.log",
     "gpu-step-db-cw-solver-one-rank.log",
@@ -169,6 +181,7 @@ REQUIRED_QUALIFICATION_LOGS = (
     "gpu-step-db-near2farcyl-two-gpu.log",
     "gpu-step-db-phase-source-one-rank.log",
     "gpu-step-db-phase-source-two-rank.log",
+    "gpu-step-db-transition-rollback-one-rank.log",
     "halo-curl-overlap-bfast-rejected-two-rank.log",
     "halo-curl-overlap-default-off-two-rank.log",
     "halo-curl-overlap-eager-disabled-two-rank.log",
@@ -203,8 +216,14 @@ REQUIRED_QUALIFICATION_LOGS = (
     "pinned-boundary-two-rank.log",
     "python-gpu-backend-singleton.log",
     "python-gpu-backend-two-rank.log",
+    "python-backend-policy-two-rank.log",
     SENTINEL_LOG_NAME,
     "runtime-dependency-closure.log",
+    "sparse-lorentzian-contract-one-rank.log",
+    "sparse-lorentzian-contract-two-rank.log",
+    "sparse-lorentzian-exhaustion-one-rank.log",
+    "sparse-lorentzian-quiescence-failure-one-rank.log",
+    "sparse-lorentzian-reset-reclaim-failure-one-rank.log",
     "source-enabled-mismatch-two-rank.log",
     "source-profile-invalid-rank-two-rank.log",
     "source-profile-mismatch-two-rank.log",
@@ -651,7 +670,7 @@ INSTALLED_LAZY_API_TEST_SPECS = (
         ("TestVisualization.test_plot2D",),
         1,
     ),
-    ("python/tests/test_adjoint_utils.py", (), 7),
+    ("python/tests/test_adjoint_utils.py", (), 9),
     (
         "python/tests/test_adjoint_jax.py",
         (
@@ -676,11 +695,61 @@ INSTALLED_LAZY_API_TEST_SPECS = (
 INSTALLED_CUDA_QUALIFICATION_NAME = (
     "gpmeep-installed-cuda-python-same-process-v1"
 )
+GPU_BACKEND_INSTALLED_TEST_IDENTITIES = (
+    "TestGpuBackend.test_automatic_backend_selection_is_rejected",
+    "TestGpuBackend.test_backend_control_and_inventory",
+    "TestGpuBackend.test_boundary_execution_statistics_cpu_backend",
+    "TestGpuBackend.test_initialized_native_step_invalidates_acknowledgement",
+    (
+        "TestGpuBackend."
+        "test_initialized_public_native_mutators_invalidate_acknowledgement"
+    ),
+    "TestGpuBackend.test_internal_mpi_overlap_state_is_not_python_api",
+    "TestGpuBackend.test_low_level_automatic_backend_token_is_rejected",
+    (
+        "TestGpuBackend."
+        "test_preflighted_fields_pin_backend_until_run_scope_ends"
+    ),
+    "TestGpuBackend.test_required_cuda_boundary_replay_observations",
+    "TestGpuBackend.test_required_cuda_centered_grid_unequal_dft_reduction",
+    "TestGpuBackend.test_required_cuda_cylindrical_cartesian_near2far",
+    "TestGpuBackend.test_required_cuda_python_step",
+    "TestGpuBackend.test_required_cuda_resident_dft_scale_statistics",
+    (
+        "TestGpuBackend."
+        "test_required_cuda_sparse_drude_increment_production_path"
+    ),
+    "TestGpuBackend.test_required_cuda_sparse_lorentzian_production_path",
+    "TestGpuBackend.test_sourcedata_python_state_invalidates_acknowledgement",
+    "TestGpuBackend.test_statistics_have_stable_groups",
+    "TestGpuBackend.test_zero_state_elision_statistics_follow_opt_in",
+)
+GPU_BACKEND_TWO_RANK_TEST_IDENTITIES = tuple(
+    identity
+    for identity in GPU_BACKEND_INSTALLED_TEST_IDENTITIES
+    if identity != "TestGpuBackend.test_required_cuda_boundary_replay_observations"
+)
+ADJOINT_INSTALLED_CUDA_TEST_IDENTITIES = (
+    (
+        "TestAdjointDefaultMaterialGrid."
+        "test_analytic_required_rejects_every_unsupported_class"
+    ),
+    (
+        "TestAdjointDefaultMaterialGrid."
+        "test_default_material_grid_legacy_matches_analytic"
+    ),
+    (
+        "TestAdjointDefaultMaterialGrid."
+        "test_projected_grid_auto_uses_legacy_semantics"
+    ),
+)
 INSTALLED_CUDA_QUALIFICATION_SPECS = {
     "installed-python-gpu-backend-singleton.log": {
         "mode": "gpu-backend",
         "test_file": "python/tests/test_gpu_backend.py",
-        "tests_run": 9,
+        "source_test_identities": GPU_BACKEND_INSTALLED_TEST_IDENTITIES,
+        "test_identities": GPU_BACKEND_INSTALLED_TEST_IDENTITIES,
+        "tests_run": len(GPU_BACKEND_INSTALLED_TEST_IDENTITIES),
         "world_size": 1,
         "environment": {
             "CUDA_VISIBLE_DEVICES": "0",
@@ -696,7 +765,9 @@ INSTALLED_CUDA_QUALIFICATION_SPECS = {
     "installed-python-gpu-backend-two-rank.log": {
         "mode": "gpu-backend",
         "test_file": "python/tests/test_gpu_backend.py",
-        "tests_run": 9,
+        "source_test_identities": GPU_BACKEND_INSTALLED_TEST_IDENTITIES,
+        "test_identities": GPU_BACKEND_TWO_RANK_TEST_IDENTITIES,
+        "tests_run": len(GPU_BACKEND_TWO_RANK_TEST_IDENTITIES),
         "world_size": 2,
         "environment": {
             "CUDA_VISIBLE_DEVICES": "0,1",
@@ -712,7 +783,9 @@ INSTALLED_CUDA_QUALIFICATION_SPECS = {
     "installed-adjoint-default-material-grid-cuda.log": {
         "mode": "adjoint",
         "test_file": "python/tests/test_adjoint_default_material_grid.py",
-        "tests_run": 3,
+        "source_test_identities": ADJOINT_INSTALLED_CUDA_TEST_IDENTITIES,
+        "test_identities": ADJOINT_INSTALLED_CUDA_TEST_IDENTITIES,
+        "tests_run": len(ADJOINT_INSTALLED_CUDA_TEST_IDENTITIES),
         "world_size": 1,
         "environment": {
             "CUDA_VISIBLE_DEVICES": "0",
@@ -1466,6 +1539,8 @@ def validate_installed_cuda_qualification_logs(
             )
         by_rank: dict[int, dict[str, Any]] = {}
         identifiers: set[str] = set()
+        guarded_challenges: set[str] = set()
+        recommendations: list[dict[str, Any]] = []
         cuda_source_calls = 0
         for record in rank_records:
             if not isinstance(record, dict) or set(record) != {
@@ -1493,6 +1568,7 @@ def validate_installed_cuda_qualification_logs(
             suite = record.get("suite")
             if not isinstance(suite, dict) or set(suite) != {
                 "tests_run",
+                "test_identities",
                 "failures",
                 "errors",
                 "skipped",
@@ -1505,6 +1581,8 @@ def validate_installed_cuda_qualification_logs(
                 )
             if (
                 suite.get("tests_run") != spec["tests_run"]
+                or suite.get("test_identities")
+                != list(spec["test_identities"])
                 or any(
                     suite.get(name) != 0
                     for name in (
@@ -1540,13 +1618,46 @@ def validate_installed_cuda_qualification_logs(
                 "selected_device_identifier",
                 "cuda_execution_selected",
                 "execution_diagnostic",
+                "guarded_challenge",
+                "recommendation",
                 "statistics",
             }:
                 raise QualificationContractError(
                     f"installed CUDA execution probe is invalid: {log_name}"
                 )
             identifier = probe.get("selected_device_identifier")
+            challenge = probe.get("guarded_challenge")
+            recommendation = probe.get("recommendation")
             statistics = probe.get("statistics")
+            acknowledgement_reason = (
+                recommendation.get("acknowledgement_reason")
+                if isinstance(recommendation, dict)
+                else None
+            )
+            topology = (
+                recommendation.get("mpi_gpu_topology")
+                if isinstance(recommendation, dict)
+                else None
+            )
+            topology_by_rank = {
+                item.get("rank"): item
+                for item in topology
+                if isinstance(item, dict)
+            } if isinstance(topology, list) else {}
+            topology_entry = topology_by_rank.get(rank)
+            expected_challenge = (
+                _canonical_sha256(
+                    {
+                        "schema": "gpmeep-v110-backend-ack-v1",
+                        **{
+                            key: recommendation.get(key)
+                            for key in ACKNOWLEDGEMENT_BINDING_KEYS
+                        },
+                    }
+                )
+                if isinstance(recommendation, dict)
+                else None
+            )
             if (
                 probe.get("requested_backend") != "cuda"
                 or probe.get("active_backend") != "cuda"
@@ -1557,12 +1668,91 @@ def validate_installed_cuda_qualification_logs(
                 or identifier in identifiers
                 or not isinstance(probe.get("execution_diagnostic"), str)
                 or "CUDA" not in probe["execution_diagnostic"]
+                or not isinstance(challenge, str)
+                or len(challenge) != 64
+                or any(character not in "0123456789abcdef" for character in challenge)
+                or not isinstance(recommendation, dict)
+                or recommendation.get("schema")
+                != "gpmeep-v110-backend-recommendation-v3"
+                or recommendation.get("selected_backend") != "cuda"
+                or recommendation.get("recommended_backend") != "cpu"
+                or recommendation.get("reason_class") != "hardware_crossover"
+                or recommendation.get("recommendation_confidence") != "high"
+                or recommendation.get("acknowledgement") is not True
+                or recommendation.get("acknowledgement_allowed") is not True
+                or recommendation.get("acknowledgement_reused") is not False
+                or recommendation.get("acknowledgement_scope") != "simulation"
+                or recommendation.get(
+                    "acknowledgement_origin_cohort_digest"
+                ) != challenge
+                or recommendation.get("acknowledgement_scope_cache_enabled")
+                is not True
+                or recommendation.get("workload_fingerprint_evaluated") is not True
+                or recommendation.get("acknowledgement_digest") != challenge
+                or not isinstance(acknowledgement_reason, str)
+                or not 8 <= len(acknowledgement_reason.encode("utf-8")) <= 512
+                or recommendation.get("recommendation_policy_version")
+                != "gpmeep-v110-explicit-backend-guard-v24"
+                or not isinstance(recommendation.get("workload_fingerprint"), str)
+                or len(recommendation["workload_fingerprint"]) != 64
+                or any(
+                    not isinstance(recommendation.get(key), str)
+                    or len(recommendation[key]) != 64
+                    or any(
+                        character not in "0123456789abcdef"
+                        for character in recommendation[key]
+                    )
+                    for key in (
+                        "workload_fingerprint",
+                        "mpi_topology_digest",
+                        "native_state_digest",
+                        "process_nonce",
+                        "run_nonce",
+                        "acknowledgement_scope_digest",
+                    )
+                )
+                or not isinstance(topology, list)
+                or len(topology) != world_size
+                or set(topology_by_rank) != set(range(world_size))
+                or recommendation.get("mpi_topology_digest")
+                != _canonical_sha256(topology)
+                or not isinstance(topology_entry, dict)
+                or set(topology_entry) != {
+                    "rank",
+                    "global_rank",
+                    "active_size",
+                    "node_rank",
+                    "node_size",
+                    "device_identifier",
+                    "device_ordinal",
+                }
+                or topology_entry.get("global_rank") != rank
+                or topology_entry.get("active_size") != world_size
+                or topology_entry.get("device_identifier") != identifier
+                or topology_entry.get("device_ordinal")
+                != probe.get("selected_device")
+                or not _strict_int(topology_entry.get("node_rank"))
+                or not _strict_int(topology_entry.get("node_size"), minimum=1)
+                or topology_entry["node_rank"] >= topology_entry["node_size"]
+                or not isinstance(recommendation.get("rank_local_cells"), list)
+                or len(recommendation["rank_local_cells"]) != world_size
+                or any(
+                    not _strict_int(cells, minimum=1)
+                    for cells in recommendation["rank_local_cells"]
+                )
                 or not isinstance(statistics, dict)
             ):
                 raise QualificationContractError(
                     f"installed CUDA execution was not rank-local CUDA: {log_name}"
                 )
+            if challenge != expected_challenge:
+                raise QualificationContractError(
+                    "installed CUDA guarded challenge does not bind the exact "
+                    f"workload, topology, and native state: {log_name}"
+                )
             identifiers.add(identifier)
+            guarded_challenges.add(challenge)
+            recommendations.append(recommendation)
             dispatch = statistics.get("dispatch")
             updates = statistics.get("field_updates")
             sources = statistics.get("sources")
@@ -1591,6 +1781,13 @@ def validate_installed_cuda_qualification_logs(
         if set(by_rank) != set(range(world_size)) or len(identifiers) != world_size:
             raise QualificationContractError(
                 f"installed CUDA ranks do not map to distinct devices: {log_name}"
+            )
+        if len(guarded_challenges) != 1 or any(
+            recommendation != recommendations[0]
+            for recommendation in recommendations[1:]
+        ):
+            raise QualificationContractError(
+                f"installed CUDA ranks did not agree on one guarded recommendation: {log_name}"
             )
         if cuda_source_calls <= 0:
             raise QualificationContractError(
@@ -2215,6 +2412,114 @@ def _cpu_reference_exact_keys(
     return value
 
 
+def _cpu_reference_source_bytecode_paths(
+    value: Any,
+    *,
+    ownership: str,
+    python_version: str,
+) -> list[str]:
+    if ownership == "relocated":
+        exact_keys = {
+            "archive_sha256",
+            "current_sha256",
+            "current_state",
+            "derived_sha256",
+            "derived_size_bytes",
+            "installed_source_hash_hex",
+            "installed_source_sha256",
+            "path",
+            "source_path",
+        }
+        expected_state = "relocated-source-compiled"
+    elif ownership == "generated":
+        exact_keys = {
+            "current_sha256",
+            "current_state",
+            "derived_sha256",
+            "derived_size_bytes",
+            "installed_source_hash_hex",
+            "installed_source_sha256",
+            "path",
+            "source_path",
+        }
+        expected_state = "source-compiled"
+    else:  # pragma: no cover - internal programming invariant
+        raise AssertionError(f"unsupported bytecode ownership: {ownership}")
+    if not isinstance(value, list) or not value:
+        raise QualificationContractError(
+            f"CPU reference {ownership} source bytecode is absent"
+        )
+    cache_tag = python_version.replace(".", "")
+    target_pattern = re.compile(
+        rf"(.+)/__pycache__/([^/]+)\.cpython-{re.escape(cache_tag)}"
+        r"(?:\.opt-[0-9]+)?\.pyc"
+    )
+    paths: list[str] = []
+    for index, raw_record in enumerate(value):
+        record = _cpu_reference_exact_keys(
+            raw_record,
+            exact_keys,
+            f"{ownership} source bytecode record {index}",
+        )
+        path = record["path"]
+        source_path = record["source_path"]
+        target = pathlib.PurePosixPath(path) if isinstance(path, str) else None
+        source = (
+            pathlib.PurePosixPath(source_path)
+            if isinstance(source_path, str)
+            else None
+        )
+        match = target_pattern.fullmatch(path) if isinstance(path, str) else None
+        if (
+            target is None
+            or source is None
+            or target.is_absolute()
+            or source.is_absolute()
+            or not target.parts
+            or not source.parts
+            or any(part in {".", ".."} for part in (*target.parts, *source.parts))
+            or "\\" in path
+            or "\\" in source_path
+            or target.as_posix() != path
+            or source.as_posix() != source_path
+            or match is None
+            or source_path != f"{match.group(1)}/{match.group(2)}.py"
+            or record["current_state"] != expected_state
+            or re.fullmatch(r"[0-9a-f]{64}", str(record["current_sha256"]))
+            is None
+            or record["current_sha256"] != record["derived_sha256"]
+            or re.fullmatch(r"[0-9a-f]{64}", str(record["derived_sha256"]))
+            is None
+            or re.fullmatch(
+                r"[0-9a-f]{64}", str(record["installed_source_sha256"])
+            )
+            is None
+            or re.fullmatch(
+                r"[0-9a-f]{16}", str(record["installed_source_hash_hex"])
+            )
+            is None
+            or not isinstance(record["derived_size_bytes"], int)
+            or isinstance(record["derived_size_bytes"], bool)
+            or record["derived_size_bytes"] < 16
+            or (
+                ownership == "relocated"
+                and re.fullmatch(
+                    r"[0-9a-f]{64}", str(record["archive_sha256"])
+                )
+                is None
+            )
+        ):
+            raise QualificationContractError(
+                f"CPU reference {ownership} source bytecode record is invalid"
+            )
+        paths.append(path)
+    if paths != sorted(paths) or len(paths) != len(set(paths)):
+        raise QualificationContractError(
+            f"CPU reference {ownership} source bytecode paths are not canonical"
+        )
+    return paths
+
+
 def _cpu_reference_json(payload: str, label: str) -> dict[str, Any]:
     def object_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
         result: dict[str, Any] = {}
@@ -2656,7 +2961,12 @@ def validate_cpu_reference_receipt(
             "hashed_installed_path_count",
             "archive_bound_hardlink_count",
             "relocated_hardlink_count",
-            "unhashed_bytecode_path_count",
+            "python_version",
+            "relocated_source_bytecode_count",
+            "relocated_source_bytecode",
+            "generated_source_bytecode_count",
+            "generated_source_bytecode",
+            "declared_generated_bytecode_path_count",
             "generated_entry_points",
             "softlink_count",
             "softlinks",
@@ -2708,10 +3018,45 @@ def validate_cpu_reference_receipt(
         "hashed_installed_path_count",
         "archive_bound_hardlink_count",
         "relocated_hardlink_count",
-        "unhashed_bytecode_path_count",
+        "relocated_source_bytecode_count",
+        "generated_source_bytecode_count",
+        "declared_generated_bytecode_path_count",
         "softlink_count",
         "unowned_allowed_path_count",
     )
+    count_fields_valid = all(
+        isinstance(audit[name], int)
+        and not isinstance(audit[name], bool)
+        and audit[name] >= 0
+        for name in count_fields
+    )
+    relocated_source_bytecode = audit["relocated_source_bytecode"]
+    generated_source_bytecode = audit["generated_source_bytecode"]
+    python_version = audit["python_version"]
+    bytecode_records_valid = True
+    try:
+        if re.fullmatch(r"[0-9]+\.[0-9]+", str(python_version)) is None:
+            raise QualificationContractError(
+                "CPU reference conda-prefix Python version is invalid"
+            )
+        relocated_source_bytecode_paths = _cpu_reference_source_bytecode_paths(
+            relocated_source_bytecode,
+            ownership="relocated",
+            python_version=str(python_version),
+        )
+        generated_source_bytecode_paths = _cpu_reference_source_bytecode_paths(
+            generated_source_bytecode,
+            ownership="generated",
+            python_version=str(python_version),
+        )
+        if set(relocated_source_bytecode_paths) & set(
+            generated_source_bytecode_paths
+        ):
+            raise QualificationContractError(
+                "CPU reference source bytecode ownership overlaps"
+            )
+    except QualificationContractError:
+        bytecode_records_valid = False
     try:
         package_cache_path = pathlib.Path(audit_package_cache["path"])
         package_cache_canonical = (
@@ -2730,7 +3075,7 @@ def validate_cpu_reference_receipt(
         package_cache_canonical = False
         decoder_canonical = False
     if (
-        audit["schema_version"] != 3
+        audit["schema_version"] != 4
         or not locked_packages
         or len(locked_packages)
         != len({item["url"] for item in locked_packages})
@@ -2756,21 +3101,24 @@ def validate_cpu_reference_receipt(
         or not audit_decoder["version"]
         or audit_decoder["timeout_seconds"] != 120
         or audit["package_records"] != locked_packages
+        or not bytecode_records_valid
+        or audit["relocated_source_bytecode_count"]
+        != len(relocated_source_bytecode)
+        or audit["generated_source_bytecode_count"]
+        != len(generated_source_bytecode)
+        or audit["declared_generated_bytecode_path_count"]
+        != len(generated_source_bytecode)
+        or not count_fields_valid
         or not isinstance(audit["generated_entry_points"], list)
         or not isinstance(audit["softlinks"], list)
         or audit["softlink_count"] != len(audit["softlinks"])
         or audit["archive_bound_hardlink_count"] <= 0
         or audit["archive_bound_hardlink_count"]
+        + audit["relocated_source_bytecode_count"]
         + audit["softlink_count"]
-        + audit["unhashed_bytecode_path_count"]
+        + audit["declared_generated_bytecode_path_count"]
         + len(audit["generated_entry_points"])
         != audit["owned_path_count"]
-        or any(
-            not isinstance(audit[name], int)
-            or isinstance(audit[name], bool)
-            or audit[name] < 0
-            for name in count_fields
-        )
     ):
         raise QualificationContractError(
             "CPU reference conda-prefix content audit is not exact"

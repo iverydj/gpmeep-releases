@@ -1229,7 +1229,7 @@ def main(argv: list[str] | None = None) -> int:
         }
         if (output / "JOURNAL.json").is_file():
             failure["journal"] = file_record(output / "JOURNAL.json", output)
-        atomic_write_json(output / "FAILED.json", failure)
+        matrix.publish_failure_record(output, failure)
         raise
     finally:
         for stable in code_stables.values():

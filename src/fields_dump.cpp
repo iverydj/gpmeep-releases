@@ -243,6 +243,7 @@ void fields::load_fields_chunk_field(h5file *h5f, bool single_parallel_file,
 }
 
 void fields::load(const char *filename, bool single_parallel_file) {
+  gpmeep_note_state_mutation();
   if (verbosity > 0)
     printf("reading fields from file \"%s\" (%d)...\n", filename, single_parallel_file);
 

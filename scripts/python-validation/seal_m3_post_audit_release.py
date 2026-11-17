@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Seal the post-audit M1--M3 release closure without a circular dependency."""
+"""Seal the post-audit current-scope M3 release closure."""
 
 from __future__ import annotations
 
@@ -15,19 +15,14 @@ SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-import run_m3_release_aggregation as aggregation  # noqa: E402
+import run_current_scope_release as aggregation  # noqa: E402
 import seal_m3_plan_replay as publication  # noqa: E402
 import seal_milestone_adversarial_audit as audit_seal  # noqa: E402
 
 
-SCHEMA = "gpmeep-m3-post-audit-release-v1"
+SCHEMA = "gpmeep-m3-post-audit-release-v3"
 PREFIX = "GPMEEP_M3_POST_AUDIT_RELEASE="
 MATERIAL_SEVERITIES = {"critical", "high", "medium"}
-MANDATORY_M4_REQUIREMENTS = {
-    "m4.portable_gpu_distribution",
-    "m4.private_github_release",
-}
-OPTIONAL_M4_REQUIREMENTS = {"m4.long_horizon_dispatch"}
 
 
 class PostAuditError(RuntimeError):
@@ -58,53 +53,55 @@ def _code_records() -> dict[str, dict[str, Any]]:
 
 
 def _validate_report(report: dict[str, Any]) -> dict[str, Any]:
-    closure = report.get("requirement_closure")
-    if not isinstance(closure, dict):
-        raise PostAuditError("aggregate requested-scope closure is absent")
-    achieved = closure.get("achieved")
-    deferred = closure.get("deferred")
+    policy = report.get("backend_policy")
+    examples = report.get("official_meep_examples")
+    aunp = report.get("aunp")
     if (
-        closure.get("outcome") != "PASS_WITH_EXPLICIT_M4_DEFERRED_SCOPE"
-        or closure.get("achieved_count") != 11
-        or not isinstance(achieved, list)
-        or len(achieved) != 11
-        or any(
-            not isinstance(item, dict) or item.get("outcome") != "PASS"
-            for item in achieved
+        report.get("schema") != aggregation.SCHEMA
+        or report.get("outcome") != "PASS"
+        or report.get("next_action")
+        != "STOP_FOR_M4_COORDINATION_AFTER_M3_ADVERSARIAL_AUDIT"
+        or not isinstance(policy, dict)
+        or policy.get("outcome") != "PASS"
+        or policy.get("backend_selection") != "user-explicit-only"
+        or policy.get("automatic_backend_selection") is not False
+        or policy.get("feature_ids")
+        != list(aggregation.explicit_policy_evidence.EXPECTED_FEATURES)
+        or not isinstance(examples, dict)
+        or examples.get("outcome") != "PASS"
+        or examples.get("feature_count") != 42
+        or not isinstance(aunp, dict)
+        or aunp.get("outcome") != "PASS"
+        or aunp.get("adversarial_audit", {}).get("outcome") != "PASS"
+    ):
+        raise PostAuditError("current-scope M3 aggregate differs")
+    try:
+        aggregate = (
+            aggregation.explicit_policy_evidence.validate_aggregate_projection(
+                policy.get("aggregate")
+            )
         )
-        or len({item.get("requirement_id") for item in achieved}) != 11
-        or not isinstance(deferred, list)
-        or closure.get("deferred_count") != len(deferred)
-    ):
-        raise PostAuditError("aggregate requested-scope closure differs")
-    deferred_ids = {
-        item.get("requirement_id")
-        for item in deferred
-        if isinstance(item, dict)
-        and item.get("outcome") == "DEFERRED_TO_M4_COORDINATION"
-    }
-    allowed = MANDATORY_M4_REQUIREMENTS | OPTIONAL_M4_REQUIREMENTS
+    except aggregation.WorkloadError as exc:
+        raise PostAuditError("current-scope M3 policy aggregate differs") from exc
     if (
-        len(deferred_ids) != len(deferred)
-        or not MANDATORY_M4_REQUIREMENTS <= deferred_ids
-        or not deferred_ids <= allowed
+        policy.get("classification_unit") != "guard-event"
+        or policy.get("case_level_recommendations_used") is not False
     ):
-        raise PostAuditError("aggregate M4 deferred scope differs")
-    audits = report.get("adversarial_audits")
-    if (
-        not isinstance(audits, dict)
-        or set(audits) != {"m1", "m2"}
-        or any(
-            not isinstance(value, dict) or value.get("outcome") != "PASS"
-            for value in audits.values()
-        )
-    ):
-        raise PostAuditError("aggregate M1/M2 adversarial closure differs")
+        raise PostAuditError("current-scope M3 policy classification differs")
     return {
-        "outcome": closure["outcome"],
-        "achieved_count": closure["achieved_count"],
-        "deferred_count": closure["deferred_count"],
-        "deferred_requirement_ids": sorted(deferred_ids),
+        "outcome": "PASS",
+        "feature_count": examples["feature_count"],
+        "total_physical_units": examples["total_physical_units"],
+        "backend_selection": policy["backend_selection"],
+        "automatic_backend_selection": policy[
+            "automatic_backend_selection"
+        ],
+        "classification_unit": policy["classification_unit"],
+        "case_level_recommendations_used": policy[
+            "case_level_recommendations_used"
+        ],
+        "aggregate": aggregate,
+        "next_action": "STOP_FOR_M4_COORDINATION",
     }
 
 
@@ -136,8 +133,14 @@ def derive(
         "commit": before_source["commit"],
         "status_porcelain": "",
     }
+    expected_report_source = {
+        "repository": str(repo),
+        "git_commit": before_source["commit"],
+        "git_status_porcelain": "",
+    }
     if (
-        audit.get("milestone") != "M3"
+        report.get("source") != expected_report_source
+        or audit.get("milestone") != "M3"
         or audit.get("source") != expected_audit_source
         or not isinstance(audit_evidence, dict)
         or audit_evidence.get("root") != str(aggregation_root)
@@ -149,7 +152,7 @@ def derive(
             for severity in MATERIAL_SEVERITIES
         )
     ):
-        raise PostAuditError("M3 adversarial audit binding differs")
+        raise PostAuditError("M3 aggregation/source/adversarial audit binding differs")
     requested_scope = _validate_report(report)
     after_source = _source_state(repo)
     after_code = _code_records()
@@ -169,7 +172,7 @@ def derive(
     return {
         "schema": SCHEMA,
         "outcome": "PASS",
-        "release_status": "M1_M3_COMPLETE_M4_COORDINATION_REQUIRED",
+        "release_status": "M3_COMPLETE_M4_COORDINATION_REQUIRED",
         "next_action": "STOP_FOR_M4_COORDINATION",
         "source": before_source,
         "aggregation": {
@@ -177,7 +180,7 @@ def derive(
             "terminal": before_terminal,
             "report_schema": report["schema"],
             "requested_scope": requested_scope,
-            "embedded_adversarial_audits": ["M1", "M2"],
+            "embedded_adversarial_audits": ["M2"],
         },
         "m3_adversarial_audit": {
             "receipt": before_audit,
@@ -185,7 +188,7 @@ def derive(
             "finding_counts": audit["finding_counts"],
             "unresolved_counts": audit["unresolved_counts"],
         },
-        "adversarial_milestones": ["M1", "M2", "M3"],
+        "adversarial_milestones": ["M2", "M3"],
         "code": before_code,
     }
 
@@ -197,7 +200,7 @@ def verify(path: pathlib.Path) -> dict[str, Any]:
         or retained.get("schema") != SCHEMA
         or retained.get("outcome") != "PASS"
         or retained.get("release_status")
-        != "M1_M3_COMPLETE_M4_COORDINATION_REQUIRED"
+        != "M3_COMPLETE_M4_COORDINATION_REQUIRED"
         or retained.get("next_action") != "STOP_FOR_M4_COORDINATION"
     ):
         raise PostAuditError("post-audit release receipt is not an exact PASS")

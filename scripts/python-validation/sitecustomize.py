@@ -16,6 +16,7 @@ import json
 import math
 import os
 import pathlib
+import stat
 import sys
 import tempfile
 import time
@@ -23,7 +24,14 @@ import traceback
 from fractions import Fraction
 
 
+_SCRIPTS_DIRECTORY = pathlib.Path(__file__).resolve().parents[1]
+if str(_SCRIPTS_DIRECTORY) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS_DIRECTORY))
+import gpmeep_backend_guard as _backend_guard  # noqa: E402
+
+
 _STARTED = time.time()
+_GPU_OBSERVATION_AT_START = os.environ.get("GPMEEP_VALIDATION_GPU_OBSERVATION")
 _COMPLETION_PATH_AT_START = os.environ.get(
     "GPMEEP_VALIDATION_COMPLETE_FILE"
 )
@@ -33,6 +41,14 @@ _COMPLETION_PREEXISTED = bool(
 )
 _REGISTERED_INVOCATION_SHA256 = None
 _REGISTERED_RESULT_SHA256 = None
+_BACKEND_GUARD_EVENTS = []
+_BACKEND_GUARD_MAX_EVENTS = 4096
+_GUARDED_SIMULATION_METHODS = (
+    "run",
+    "run_k_point",
+    "solve_cw",
+    "solve_eigfreq",
+)
 
 
 _GPU_NATIVE_FUNCTIONS = (
@@ -354,11 +370,74 @@ def _install_meep_native_seal():
                     f"native Meep extension is missing callable {name}"
                 )
             functions.append((name, value))
+        guard_reason = os.environ.get(
+            "GPMEEP_VALIDATION_BACKEND_ACKNOWLEDGEMENT_REASON"
+        )
+        simulation_class = getattr(module, "Simulation", None)
+        original_simulation_methods = {}
+        guarded_simulation_methods = {}
+        if guard_reason is not None:
+            _backend_guard.validate_reason(guard_reason)
+            if not isinstance(simulation_class, type):
+                raise RuntimeError(
+                    "Meep Simulation class is unavailable for qualification guard"
+                )
+            for method_name in _GUARDED_SIMULATION_METHODS:
+                original_method = getattr(simulation_class, method_name, None)
+                if not callable(original_method):
+                    raise RuntimeError(
+                        f"Meep Simulation.{method_name} is unavailable for "
+                        "qualification guard"
+                    )
+                original_simulation_methods[method_name] = original_method
+
+                def make_guarded_method(name, pristine_method):
+                    def qualification_guarded_method(
+                        simulation, *args, **kwargs
+                    ):
+                        if len(_BACKEND_GUARD_EVENTS) >= _BACKEND_GUARD_MAX_EVENTS:
+                            raise RuntimeError(
+                                "validation backend-guard event bound was exceeded"
+                            )
+
+                        def invoke_pristine_method():
+                            return _backend_guard.invoke_pristine_class_method(
+                                simulation_class,
+                                name,
+                                qualification_guarded_method,
+                                pristine_method,
+                                simulation,
+                                args,
+                                kwargs,
+                                original_methods=original_simulation_methods,
+                                guarded_methods=guarded_simulation_methods,
+                            )
+
+                        result, evidence = (
+                            _backend_guard.invoke_with_acknowledgement(
+                                module,
+                                simulation,
+                                invoke_pristine_method,
+                                guard_reason,
+                            )
+                        )
+                        _BACKEND_GUARD_EVENTS.append(evidence)
+                        return result
+
+                    return qualification_guarded_method
+
+                guarded_method = make_guarded_method(method_name, original_method)
+                guarded_simulation_methods[method_name] = guarded_method
+                setattr(simulation_class, method_name, guarded_method)
         state["seal"] = {
             "module": module,
             "extension": extension,
             "gpu": gpu,
             "functions": tuple(functions),
+            "guard_reason": guard_reason,
+            "simulation_class": simulation_class,
+            "original_simulation_methods": original_simulation_methods,
+            "guarded_simulation_methods": guarded_simulation_methods,
         }
 
     class SealingLoader(importlib.abc.Loader):
@@ -408,6 +487,13 @@ def _install_meep_native_seal():
             raise RuntimeError("sealed native Meep extension identity changed")
         if getattr(module, "gpu", None) is not sealed["gpu"]:
             raise RuntimeError("sealed meep.gpu controller identity changed")
+        guarded_simulation_methods = sealed["guarded_simulation_methods"]
+        for method_name, guarded_method in guarded_simulation_methods.items():
+            if getattr(sealed["simulation_class"], method_name, None) is not guarded_method:
+                raise RuntimeError(
+                    "qualification backend-guard "
+                    f"Simulation.{method_name} identity changed"
+                )
         functions = dict(sealed["functions"])
         for name, value in sealed["functions"]:
             if getattr(extension, name, None) is not value:
@@ -419,6 +505,9 @@ def _install_meep_native_seal():
             "extension": extension,
             "gpu": sealed["gpu"],
             "functions": functions,
+            "guard_reason": sealed["guard_reason"],
+            "guarded_simulation_run": guarded_simulation_methods.get("run"),
+            "guarded_simulation_methods": dict(guarded_simulation_methods),
         }
 
     return snapshot
@@ -953,6 +1042,142 @@ def _receipt_artifact_record(receipt, name):
     }
 
 
+def _observation_tail(path, state=None, limit=1024 * 1024):
+    """Read complete live JSONL rows without following links or waiting on FIFOs."""
+    path = pathlib.Path(path)
+    if not path.is_absolute() or path.parent.resolve(strict=True) != path.parent:
+        raise ValueError("observation stream parent is not canonical")
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        metadata = os.fstat(descriptor)
+        if (not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1
+                or metadata.st_uid != os.getuid()):
+            raise ValueError("observation stream is not a regular file")
+        identity = (metadata.st_dev, metadata.st_ino)
+        if state and (state["identity"] != identity or metadata.st_size < state["size"]):
+            raise ValueError("observation stream was replaced or truncated")
+        start = max(0, metadata.st_size - limit)
+        os.lseek(descriptor, start, os.SEEK_SET)
+        payload = os.read(descriptor, limit)
+        after = path.stat(follow_symlinks=False)
+        if (after.st_dev, after.st_ino) != identity or after.st_size < metadata.st_size:
+            raise ValueError("observation stream changed while reading")
+        if state is not None:
+            state.update(identity=identity, size=metadata.st_size)
+        if start:
+            boundary = payload.find(b"\n")
+            if boundary < 0:
+                return []
+            start += boundary + 1
+            payload = payload[boundary + 1:]
+        rows = []
+        for line in payload.splitlines(keepends=True):
+            if not line.endswith(b"\n"):
+                break  # An append in progress is not evidence yet.
+            value = json.loads(line)
+            rows.append((value, {
+                "offset": start, "size_bytes": len(line),
+                "sha256": hashlib.sha256(line).hexdigest(),
+            }))
+            start += len(line)
+        return rows
+    finally:
+        os.close(descriptor)
+
+
+def _await_gpu_observation(result):
+    """Keep the completed correctness child's existing CUDA context observable.
+
+    This does no CUDA work and never creates or edits observer evidence. Only
+    the paired correctness runner opts in; benchmark/timing paths do not.
+    The parent still independently verifies both complete telemetry streams.
+    """
+    encoded = _GPU_OBSERVATION_AT_START
+    if encoded is None:
+        return
+    config = json.loads(encoded)
+    if not isinstance(config, dict) or set(config) != {
+        "root_pid", "root_start_time_ticks", "label", "gpu_uuid",
+        "host_stream", "gpu_stream", "timeout_seconds",
+    }:
+        raise ValueError("GPU observation configuration fields differ")
+    for key in ("root_pid", "root_start_time_ticks"):
+        if type(config[key]) is not int or config[key] <= 0:
+            raise ValueError("GPU observation process identity is invalid")
+    timeout = config["timeout_seconds"]
+    if (type(timeout) not in (int, float) or not math.isfinite(timeout)
+            or not 1 <= timeout <= 210):
+        raise ValueError("GPU observation timeout is invalid")
+    uuid = config["gpu_uuid"]
+    if (not isinstance(config["label"], str) or not config["label"]
+            or not isinstance(uuid, str) or not uuid.startswith("GPU-")
+            or len(uuid) != 40):
+        raise ValueError("GPU observation selection is invalid")
+    native_uuid = result.get("selected_device_identifier")
+    if (result.get("expected_backend") != "cuda"
+            or result.get("strict_cuda_marker") is not True
+            or (native_uuid and native_uuid.lower() != uuid[4:].replace("-", "").lower())):
+        raise ValueError("GPU observation differs from the native CUDA selection")
+    pid = os.getpid()
+    raw = pathlib.Path("/proc/self/stat").read_text()
+    child_start = int(raw[raw.rfind(")") + 2:].split()[19])
+    started = time.monotonic()
+    root_identity = (config["root_pid"], config["root_start_time_ticks"])
+    observed = {}
+    streams = {"host": {}, "gpu": {}}
+    while True:
+        raw = (pathlib.Path("/proc") / str(root_identity[0]) / "stat").read_text()
+        fields = raw[raw.rfind(")") + 2:].split()
+        if fields[0] in {"Z", "X"} or int(fields[19]) != root_identity[1]:
+            raise ValueError("GPU observation controller exited or changed")
+        for kind in ("host", "gpu"):
+            if kind in observed:
+                continue
+            try:
+                rows = _observation_tail(config[kind + "_stream"], streams[kind])
+            except FileNotFoundError:
+                rows = []
+            for row, reference in reversed(rows):
+                if not isinstance(row, dict):
+                    raise ValueError("GPU observation stream contains a non-object")
+                if (row.get("root_pid"), row.get("root_start_time_ticks")) != root_identity or row.get("label") != config["label"]:
+                    raise ValueError("GPU observation stream identity differs")
+                if row.get("root_alive") is not True:
+                    raise ValueError("GPU observation stream is already terminal")
+                if row.get("captured_unix_seconds", 0) < _STARTED:
+                    continue
+                if kind == "host":
+                    matched = (
+                        row.get("schema") == "gpmeep-host-process-telemetry-sample-v2"
+                        and any(p.get("pid") == pid and p.get("start_time_ticks") == child_start
+                                and p.get("state") not in {"Z", "X"}
+                                for p in row.get("processes", []))
+                    )
+                else:
+                    matched = (
+                        row.get("schema") == "gpmeep-gpu-telemetry-sample-v3"
+                        and row.get("query_error") is None
+                        and row.get("selected_gpu_uuids") == [uuid]
+                        and any(p.get("pid") == pid and p.get("gpu_uuid") == uuid
+                                for p in row.get("compute_applications", []))
+                    )
+                if matched:
+                    observed[kind] = dict(reference, sequence=row["sequence"])
+                    break
+        if set(observed) == {"host", "gpu"}:
+            result["gpu_observation"] = {
+                "schema": "gpmeep-correctness-gpu-observation-v1", "state": "OBSERVED",
+                "configuration": config, "pid": pid, "start_time_ticks": child_start,
+                "run_nonce": result["run_nonce"], "samples": observed,
+                "child_hook_started_unix_seconds": _STARTED,
+                "wait_seconds": time.monotonic() - started,
+            }
+            return
+        if time.monotonic() - started >= timeout:
+            raise TimeoutError("completed CUDA child was not observed by both collectors")
+        time.sleep(0.05)
+
+
 def _capture(_native_snapshot=_NATIVE_MEEP_SNAPSHOT) -> None:
     destination = os.environ.get("GPMEEP_VALIDATION_STATS_FILE")
     if not destination:
@@ -978,6 +1203,21 @@ def _capture(_native_snapshot=_NATIVE_MEEP_SNAPSHOT) -> None:
         "python_version": sys.version,
         "meep_imported": "meep" in sys.modules,
         "gpu_api_available": False,
+        "backend_guard": {
+            "schema": "gpmeep-validation-backend-guard-events-v2",
+            "mode": (
+                "reason-bound-policy-scope"
+                if os.environ.get(
+                    "GPMEEP_VALIDATION_BACKEND_ACKNOWLEDGEMENT_REASON"
+                )
+                is not None
+                else "disabled"
+            ),
+            "reason": os.environ.get(
+                "GPMEEP_VALIDATION_BACKEND_ACKNOWLEDGEMENT_REASON"
+            ),
+            "events": list(_BACKEND_GUARD_EVENTS),
+        },
     }
     benchmark_payload = None
     try:
@@ -1101,6 +1341,7 @@ def _capture(_native_snapshot=_NATIVE_MEEP_SNAPSHOT) -> None:
             result["benchmark_result"] = _file_record_from_bytes(
                 benchmark_result, benchmark_payload
             )
+        _await_gpu_observation(result)
     except BaseException:
         result["capture_status"] = "capture_error"
         result["capture_error"] = traceback.format_exc()

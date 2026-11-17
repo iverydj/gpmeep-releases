@@ -159,15 +159,15 @@ void fields::initialize_with_n_tm(int ntot) {
 }
 
 void fields::initialize_field(component c, complex<double> func(const vec &)) {
+  gpmeep_note_state_mutation();
   // The user initializer itself may fail on one rank before peers enter a
   // CPU or CUDA boundary exchange, so keep this backend-independent.
   distributed_initialization_failure_guard distributed_failure_guard(
       count_processors() > 1);
   require_component(c);
   // initialize_field can execute boundary and E/H phases before the first
-  // fields::step. Resolve the per-owner automatic workload policy first so a
-  // launch-latency-dominated initialization cannot touch CUDA and only fall
-  // back to the CPU on the subsequent time step.
+  // fields::step. Resolve and pin the user's explicit backend first so the
+  // complete initialization operation uses one consistent backend.
   cuda_backend_preflight();
   cuda_step_preflight();
   for (int i = 0; i < num_chunks; i++)

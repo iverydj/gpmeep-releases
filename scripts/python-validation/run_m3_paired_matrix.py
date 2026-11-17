@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
 import json
 import math
 import os
@@ -34,6 +35,7 @@ from common import (  # noqa: E402
     WorkloadError,
     absolute_file_record,
     atomic_write_json,
+    durable_publish_terminal,
     file_record,
 )
 
@@ -51,6 +53,9 @@ MINIMUM_CGROUP_FREE_BYTES = 4 * 1024**3
 MINIMUM_GPU_FREE_MEMORY_FRACTION = 0.20
 MAXIMUM_GPU_TEMPERATURE_CELSIUS = 90.0
 MAXIMUM_HOST_TEMPERATURE_MILLIDEGREES = 95_000.0
+BACKEND_ACKNOWLEDGEMENT_REASON = (
+    "M3 paired correctness intentionally compares explicit CPU and CUDA"
+)
 
 
 @dataclass(frozen=True)
@@ -189,10 +194,20 @@ def task_command(
         str(output.joinpath(*task_raw_relative(task).parts)),
         "--backend",
         "both",
+        "--acknowledge-backend-mismatch-reason",
+        BACKEND_ACKNOWLEDGEMENT_REASON,
         "--tier",
         "full",
         "--case",
         task.case_path,
+        "--gpu-observation-directory",
+        str(output.joinpath(*task_telemetry_relative(task).parts)),
+        "--gpu-observation-label",
+        task_name(task),
+        "--gpu-observation-uuid",
+        contract["gpu_device"],
+        "--gpu-observation-timeout-seconds",
+        str(contract["limits"]["telemetry_interval_seconds"] * 3 + 30),
     ]
 
 
@@ -237,6 +252,9 @@ def _stable_code_records(
         "controller": pathlib.Path(__file__),
         "plan_loader": SCRIPT_DIR / "m3_execution_plan.py",
         "runner": SCRIPT_DIR / "run_validation.py",
+        "backend_guard": SCRIPT_DIR.parent / "gpmeep_backend_guard.py",
+        "oracle": SCRIPT_DIR / "run_example_oracle.py",
+        "sitecustomize": SCRIPT_DIR / "sitecustomize.py",
         "archive_replay": SCRIPT_DIR / "archive_validation.py",
         "manifest": SCRIPT_DIR / "manifest.json",
         "provenance": SCRIPT_DIR.parent / "gpmeep_provenance.py",
@@ -267,6 +285,13 @@ def _receipt_record(
     source_sha256 = receipt.get("source_start", {}).get("sha256")
     if not isinstance(source_sha256, str) or len(source_sha256) != 64:
         raise WorkloadError("M3 paired build source identity is invalid")
+    git_head = receipt.get("git_head")
+    if (
+        not isinstance(git_head, str)
+        or len(git_head) != 40
+        or any(character not in "0123456789abcdef" for character in git_head)
+    ):
+        raise WorkloadError("M3 paired build Git identity is invalid")
     return {
         "path": str(receipt_path),
         "size_bytes": receipt_path.stat().st_size,
@@ -275,6 +300,7 @@ def _receipt_record(
         "build_input_id": receipt["build_input_id"],
         "artifact_set_id": receipt["artifact_set_id"],
         "source_sha256": source_sha256,
+        "git_head": git_head,
     }
 
 
@@ -413,6 +439,9 @@ def validate_contract(
         "controller": pathlib.Path(__file__),
         "plan_loader": SCRIPT_DIR / "m3_execution_plan.py",
         "runner": SCRIPT_DIR / "run_validation.py",
+        "backend_guard": SCRIPT_DIR.parent / "gpmeep_backend_guard.py",
+        "oracle": SCRIPT_DIR / "run_example_oracle.py",
+        "sitecustomize": SCRIPT_DIR / "sitecustomize.py",
         "archive_replay": SCRIPT_DIR / "archive_validation.py",
         "manifest": SCRIPT_DIR / "manifest.json",
         "provenance": SCRIPT_DIR.parent / "gpmeep_provenance.py",
@@ -654,6 +683,77 @@ def _load_json(path: pathlib.Path, label: str) -> dict[str, Any]:
     return value
 
 
+def validate_child_observation(task, run, output, contract):
+    """Bind the exit barrier to actual rows in independently verified telemetry."""
+    stats = run.get("statistics", {})
+    proof = stats.get("gpu_observation", {})
+    config = proof.get("configuration", {})
+    telemetry = output.joinpath(*task_telemetry_relative(task).parts)
+    expected = {
+        "root_pid": config.get("root_pid"),
+        "root_start_time_ticks": config.get("root_start_time_ticks"),
+        "label": task_name(task), "gpu_uuid": contract["gpu_device"],
+        "host_stream": str(telemetry / "host.jsonl"),
+        "gpu_stream": str(telemetry / "gpu.jsonl"),
+        "timeout_seconds": contract["limits"]["telemetry_interval_seconds"] * 3 + 30,
+    }
+    encoded = run.get("environment_contract", {}).get("environment", {}).get(
+        "GPMEEP_VALIDATION_GPU_OBSERVATION"
+    )
+    if (config != expected or not isinstance(encoded, str)
+            or json.loads(encoded) != expected
+            or proof.get("schema") != "gpmeep-correctness-gpu-observation-v1"
+            or proof.get("state") != "OBSERVED"
+            or type(proof.get("pid")) is not int or proof["pid"] <= 1
+            or proof["pid"] != stats.get("pid")
+            or type(proof.get("start_time_ticks")) is not int or proof["start_time_ticks"] <= 0
+            or proof.get("run_nonce") != run.get("run_nonce")
+            or set(proof.get("samples", {})) != {"host", "gpu"}
+            or type(proof.get("wait_seconds")) not in (int, float)
+            or not math.isfinite(proof["wait_seconds"])
+            or type(proof.get("child_hook_started_unix_seconds")) not in (int, float)
+            or not math.isfinite(proof["child_hook_started_unix_seconds"])
+            or not 0 <= proof["wait_seconds"] <= expected["timeout_seconds"] + 1):
+        raise WorkloadError("M3 paired CUDA observation barrier differs")
+    for kind in ("host", "gpu"):
+        reference = proof["samples"][kind]
+        if (not isinstance(reference, dict)
+                or set(reference) != {"offset", "size_bytes", "sha256", "sequence"}
+                or type(reference["offset"]) is not int or reference["offset"] < 0
+                or type(reference["size_bytes"]) is not int or not 1 <= reference["size_bytes"] <= 1024 * 1024
+                or type(reference["sequence"]) is not int or reference["sequence"] < 0):
+            raise WorkloadError("M3 paired observation row reference differs")
+        with StableFile(telemetry / (kind + ".jsonl"), "paired child observation") as stable:
+            with stable.file_object() as handle:
+                if reference["offset"]:
+                    handle.seek(reference["offset"] - 1)
+                    if handle.read(1) != b"\n":
+                        raise WorkloadError("M3 paired observation offset is not a row boundary")
+                payload = handle.read(reference["size_bytes"])
+        if (not payload.endswith(b"\n") or payload.count(b"\n") != 1
+                or hashlib.sha256(payload).hexdigest() != reference["sha256"]):
+            raise WorkloadError("M3 paired observation row bytes differ")
+        row = json.loads(payload)
+        if (row.get("root_pid") != config["root_pid"]
+                or row.get("root_start_time_ticks") != config["root_start_time_ticks"]
+                or row.get("label") != config["label"] or row.get("root_alive") is not True
+                or row.get("sequence") != reference["sequence"]
+                or row.get("captured_unix_seconds", 0) < proof["child_hook_started_unix_seconds"]):
+            raise WorkloadError("M3 paired observation row process identity differs")
+        if kind == "host":
+            matched = any(p.get("pid") == proof["pid"]
+                          and p.get("start_time_ticks") == proof["start_time_ticks"]
+                          and p.get("state") not in {"Z", "X"}
+                          for p in row.get("processes", []))
+        else:
+            matched = (row.get("query_error") is None
+                       and row.get("selected_gpu_uuids") == [contract["gpu_device"]]
+                       and any(p.get("pid") == proof["pid"] and p.get("gpu_uuid") == contract["gpu_device"]
+                               for p in row.get("compute_applications", [])))
+        if not matched:
+            raise WorkloadError("M3 paired observation row did not observe the CUDA child")
+
+
 def derive_archive_record(
     task: Task,
     output: pathlib.Path,
@@ -700,6 +800,7 @@ def derive_archive_record(
         is not False
     ):
         raise WorkloadError("M3 paired selected runner result is not an exact PASS")
+    validate_child_observation(task, selected[0]["runs"]["cuda"], output, contract)
     return {
         "path": task_archive_relative(task).as_posix(),
         "archive_complete": matrix.stable_file_record(
@@ -972,7 +1073,9 @@ def publish_terminal(output: pathlib.Path, report: dict[str, Any]) -> None:
         output / "PENDING_PAIRED_COMPLETE", _terminal_payload(output, report)
     )
     verify_complete(output, "PENDING_PAIRED_COMPLETE")
-    os.replace(output / "PENDING_PAIRED_COMPLETE", output / "PAIRED_COMPLETE")
+    durable_publish_terminal(
+        output / "PENDING_PAIRED_COMPLETE", output / "PAIRED_COMPLETE"
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1201,7 +1304,7 @@ def main(argv: list[str] | None = None) -> int:
         }
         if (output / "JOURNAL.json").is_file():
             failure["journal"] = file_record(output / "JOURNAL.json", output)
-        atomic_write_json(output / "FAILED.json", failure)
+        matrix.publish_failure_record(output, failure)
         raise
     finally:
         for stable in code_stables.values():

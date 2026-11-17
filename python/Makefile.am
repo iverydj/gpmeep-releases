@@ -42,6 +42,8 @@ TESTS =                                        \
     $(TEST_DIR)/test_3rd_harm_1d.py            \
     $(TEST_DIR)/test_absorber_1d.py            \
     $(TEST_DIR)/test_antenna_radiation.py      \
+    $(TEST_DIR)/test_backend_policy.py         \
+    $(TEST_DIR)/test_backend_policy_mpi.py     \
     $(TEST_DIR)/test_array_metadata.py         \
     $(TEST_DIR)/test_bend_flux.py              \
     $(TEST_DIR)/test_binary_partition_utils.py \
@@ -232,6 +234,7 @@ endif # MAINTAINER_MODE
 ######################################################################
 HL_IFACE =                  \
     $(srcdir)/binary_partition_utils.py       \
+    $(srcdir)/backend_policy.py       \
     $(srcdir)/chunk_balancer.py       \
     $(srcdir)/geom.py       \
     $(srcdir)/simulation.py \

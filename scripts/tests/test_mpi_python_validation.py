@@ -14,6 +14,9 @@ import unittest
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 MODULE_PATH = ROOT / "scripts" / "run-mpi-python-validation.py"
 sys.path.insert(0, str(ROOT / "scripts"))
+sys.path.insert(0, str(ROOT / "scripts" / "tests"))
+from backend_guard_test_fixture import evidence as guard_evidence  # noqa: E402
+
 SPEC = importlib.util.spec_from_file_location("gpmeep_mpi_python_validation", MODULE_PATH)
 MODULE = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = MODULE
@@ -79,6 +82,16 @@ class TestMpiPythonValidation(unittest.TestCase):
     def artifact(marker):
         return {"path": f"/runtime/{marker}", "size_bytes": 10, "sha256": marker * 64}
 
+    @staticmethod
+    def backend_guard(backend):
+        return guard_evidence(
+            MODULE.backend_guard,
+            backend,
+            "cpu",
+            reason=MODULE.BACKEND_ACKNOWLEDGEMENT_REASON,
+            ranks=2,
+        )
+
     def record(self, lane):
         backend = "cpu" if lane == "cpu-hidden" else "cuda"
         transport = "cuda-aware" if lane == "cuda-aware-waitall" else "pinned"
@@ -105,6 +118,7 @@ class TestMpiPythonValidation(unittest.TestCase):
                     "selected_device": -1 if backend == "cpu" else rank,
                     "selected_device_identifier": "" if backend == "cpu" else str(rank + 1) * 32,
                     "local_seconds": 1.0,
+                    "backend_guard": self.backend_guard(backend),
                     "statistics": self.statistics(backend, transport),
                     "startup_statistics": self.statistics("cpu"),
                     "metrics": copy.deepcopy(metrics),
@@ -121,7 +135,7 @@ class TestMpiPythonValidation(unittest.TestCase):
                 }
             )
         return {
-            "schema_version": 1,
+            "schema_version": MODULE.SCHEMA_VERSION,
             "lane": lane,
             "receipt_id": self.receipt_id,
             "nonce": self.nonce,
@@ -284,7 +298,7 @@ class TestMpiPythonValidation(unittest.TestCase):
         records = []
         for rank in range(2):
             records.append({
-                "schema_version": 1,
+                "schema_version": 2,
                 "nonce": self.nonce,
                 "world_rank": rank,
                 "pid": 200 + rank,
@@ -293,12 +307,19 @@ class TestMpiPythonValidation(unittest.TestCase):
                 "requested_backend": "cuda",
                 "selected_device": rank,
                 "selected_device_identifier": str(rank + 1) * 32,
+                "backend_guard": self.backend_guard("cuda"),
                 "startup_statistics": self.statistics("cpu"),
                 "statistics": self.statistics("cuda", "pinned"),
             })
         self.assertTrue(MODULE.validate_divide_telemetry(
             records, backend="cuda", nonce=self.nonce
         )["pass"])
+        tampered_guard = copy.deepcopy(records)
+        tampered_guard[0]["backend_guard"]["attempts"] = 3
+        with self.assertRaisesRegex(MODULE.EvidenceError, "backend-guard"):
+            MODULE.validate_divide_telemetry(
+                tampered_guard, backend="cuda", nonce=self.nonce
+            )
         records[0]["statistics"]["dispatch"]["cpu_curl_calls"] = 1
         with self.assertRaisesRegex(MODULE.EvidenceError, "cpu fallback"):
             MODULE.validate_divide_telemetry(
@@ -357,7 +378,7 @@ class TestMpiPythonValidation(unittest.TestCase):
                 encoding="utf-8",
             )
             witness = {
-                "schema_version": 1,
+                "schema_version": 2,
                 "sha256": MODULE.sha256_file(path),
             }
             encoded = MODULE.DIVIDE_PREFIX + json.dumps(witness)

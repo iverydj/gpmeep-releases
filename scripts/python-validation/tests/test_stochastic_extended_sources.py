@@ -131,10 +131,17 @@ def compute_flux(_method, n):
             example = pathlib.Path(directory) / "line.py"
             example.touch()
             previous_argv = sys.argv
+            previous_contents = list(previous_argv)
+
+            def identity_run_path(path: str, *, run_name: str):
+                self.assertIs(sys.argv, previous_argv)
+                return self.fake_run_path(path, run_name=run_name)
+
             result = LINE.run_basis_matrix(
-                self.make_args(example), run_path=self.fake_run_path
+                self.make_args(example), run_path=identity_run_path
             )
         self.assertIs(sys.argv, previous_argv)
+        self.assertEqual(sys.argv, previous_contents)
         self.assertEqual(result["line_flat_basis_flux"].shape, (5, 2))
         self.assertEqual(result["line_flat_basis_flux_full"].shape, (5, 15))
         self.assertEqual(result["line_full_basis_gram"].shape, (15, 15))
@@ -2206,6 +2213,78 @@ class ExecutionIdentityTests(unittest.TestCase):
 
 
 class TargetLifecycleContractTests(unittest.TestCase):
+    @staticmethod
+    def _load_random_source_definitions():
+        target = WRAPPER_DIR.parents[1] / "python/examples/stochastic_emitter.py"
+        tree = ast.parse(target.read_text(encoding="utf-8"))
+        definitions = [
+            node
+            for node in tree.body
+            if (
+                isinstance(node, ast.ClassDef)
+                and node.name == "GaussianNoiseSource"
+            )
+            or (
+                isinstance(node, ast.FunctionDef)
+                and node.name == "synchronized_random_seed"
+            )
+        ]
+        namespace = {"__name__": "gpmeep_stochastic_source_contract", "np": np}
+        exec(
+            compile(ast.Module(body=definitions, type_ignores=[]), str(target), "exec"),
+            namespace,
+        )
+        return namespace
+
+    def test_random_callback_owns_a_preconstructed_generator(self) -> None:
+        definitions = self._load_random_source_definitions()
+        callback_class = definitions["GaussianNoiseSource"]
+        callback = callback_class(np.random.default_rng(8675309))
+        expected = np.random.default_rng(8675309).standard_normal()
+        self.assertEqual(callback(0.0), expected)
+        self.assertEqual(callback.calls, 1)
+
+    def test_unseeded_root_seed_is_legacy_controlled_and_broadcast(self) -> None:
+        definitions = self._load_random_source_definitions()
+        synchronized_seed = definitions["synchronized_random_seed"]
+
+        class Communicator:
+            def __init__(self, rank, broadcast_value=None):
+                self.rank = rank
+                self.broadcast_value = broadcast_value
+                self.sent = []
+
+            def Get_rank(self):
+                return self.rank
+
+            def bcast(self, value, root):
+                self.sent.append((value, root))
+                return value if self.rank == root else self.broadcast_value
+
+        random_state = np.random.get_state()
+        try:
+            np.random.seed(1729)
+            expected = int(
+                np.random.randint(
+                    0, np.iinfo(np.uint32).max, dtype=np.uint32
+                )
+            )
+            np.random.seed(1729)
+            root = Communicator(0)
+            mpi_module = mock.Mock(COMM_WORLD=root)
+            with mock.patch.dict(sys.modules, {"mpi4py": mock.Mock(MPI=mpi_module)}):
+                observed = synchronized_seed()
+            self.assertEqual(observed, expected)
+            self.assertEqual(root.sent, [(expected, 0)])
+
+            worker = Communicator(1, broadcast_value=expected)
+            mpi_module.COMM_WORLD = worker
+            with mock.patch.dict(sys.modules, {"mpi4py": mock.Mock(MPI=mpi_module)}):
+                self.assertEqual(synchronized_seed(), expected)
+            self.assertEqual(worker.sent, [(None, 0)])
+        finally:
+            np.random.set_state(random_state)
+
     def test_target_simulations_reset_in_finally(self) -> None:
         repo = WRAPPER_DIR.parents[1]
         targets = {

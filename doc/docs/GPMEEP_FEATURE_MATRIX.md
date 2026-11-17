@@ -18,7 +18,7 @@ task units, and every required CPU/CUDA/MPI comparison at source commit
 | Near2Far | 2D, 3D, cylindrical, cylindrical-to-Cartesian, Near2Far adjoint |
 | Adjoint/inverse design | Cartesian and cylindrical adjoint, full gradients, independent directional derivatives, MaterialGrid |
 | Distributed runtime | device ownership, pinned MPI, capability-gated CUDA-aware MPI, multi-rank, multi-GPU correctness and strong scaling |
-| Runtime policy/evidence | small/production automatic backend policy, long-horizon small-domain policy, durable resume replay |
+| Runtime policy/evidence | released v1.0.x automatic-policy evidence; v1.1.0 explicit CPU/CUDA recommendation guard with exact first-run acknowledgement and bounded process-local policy-scope reuse; durable resume replay |
 
 The five non-duplicate adjoint representatives are mode conversion,
 connectivity constraint, Near2Far epigraph, multilayer optimization, and
@@ -59,7 +59,24 @@ fallback.
   proof over every user callback, every parameter combination, or every
   upstream example/notebook.
 - CUDA launch and transfer overhead can make tiny problems slower. Production
-  evidence and automatic crossover policy, not a small self-check, determine
-  whether GPU execution is appropriate.
+  evidence and the v1.1.0 recommendation telemetry, not a small self-check,
+  determine whether GPU execution is appropriate; the user still selects the
+  backend.
+- The high-level recommendation guard covers `Simulation.run`, `run_k_point`,
+  `solve_cw`, and `solve_eigfreq`. Direct low-level `mp.fields` callers get
+  explicit all-or-nothing engine enforcement but must assess performance
+  suitability themselves because no `Simulation` workload metadata exists.
+- A backend mismatch acknowledgement is exact-state-bound even after
+  initialization. Ordered per-rank native fields and material-structure
+  manifests include monotonic mutation epochs and core solver state; native
+  stepping, reload/reset, material/source/component, DFT add/update/load/scale
+  or removal, boundary, and synchronization changes or a replaced native owner
+  invalidate the pending one-shot retry. Once that exact retry succeeds, the
+  default scope lets later runs of the same `Simulation` object reuse only its
+  unchanged recommendation-policy class. An explicit `scope="process"`
+  acknowledgement may cover later simulation objects in an intentionally
+  accepted equivalent batch. Neither mode replays an exact run capability;
+  both are bounded and fork-reset. MPI reuse retains an exact collective
+  workload fingerprint on every run to reject rank-divergent programs.
 - Universal pip wheels are not a v1 release gate because CUDA, MPI, parallel
   HDF5, MPB, and native ABI dependencies are installed as one Conda runtime.

@@ -120,6 +120,12 @@ class M3PairedMatrixTests(unittest.TestCase):
         self.assertEqual(command.count("--case"), 1)
         self.assertEqual(command[command.index("--case") + 1], task.case_path)
         self.assertEqual(command[command.index("--backend") + 1], "both")
+        self.assertEqual(
+            command[
+                command.index("--acknowledge-backend-mismatch-reason") + 1
+            ],
+            PAIRED.BACKEND_ACKNOWLEDGEMENT_REASON,
+        )
         self.assertNotIn("--concurrent-gpu-work", command)
 
     def test_gpu_and_argument_bounds_are_fail_closed(self) -> None:
@@ -179,6 +185,7 @@ class M3PairedMatrixTests(unittest.TestCase):
                 "build_input_id": "build-input",
                 "artifact_set_id": "artifacts",
                 "source_start": {"sha256": "1" * 64},
+                "git_head": "a" * 40,
             }
             args = PAIRED.argparse.Namespace(
                 plan_root=plan_root,
@@ -195,6 +202,10 @@ class M3PairedMatrixTests(unittest.TestCase):
             stables, code = PAIRED._stable_code_records(ROOT)
             try:
                 receipt_record = PAIRED._receipt_record(receipt_path, receipt)
+                invalid_receipt = dict(receipt)
+                invalid_receipt["git_head"] = "not-a-commit"
+                with self.assertRaisesRegex(Exception, "Git identity"):
+                    PAIRED._receipt_record(receipt_path, invalid_receipt)
                 nvidia = PAIRED.absolute_file_record(
                     pathlib.Path("/usr/bin/nvidia-smi"), "nvidia-smi"
                 )
@@ -255,9 +266,18 @@ class M3PairedMatrixTests(unittest.TestCase):
             }
             with mock.patch.object(
                 PAIRED.archive_validation, "verify_archive", return_value=complete
-            ) as verifier:
+            ), self.assertRaisesRegex(Exception, "observation barrier differs"):
+                PAIRED.derive_archive_record(task, output, contract)
+            with mock.patch.object(
+                PAIRED.archive_validation, "verify_archive", return_value=complete
+            ) as verifier, mock.patch.object(
+                PAIRED, "validate_child_observation"
+            ) as observation:
                 record = PAIRED.derive_archive_record(task, output, contract)
             verifier.assert_called_once_with(archive)
+            observation.assert_called_once_with(
+                task, passing_report(task)["results"][0]["runs"]["cuda"], output, contract
+            )
             self.assertEqual(record["receipt_id"], "receipt")
 
             failed = passing_report(task)
@@ -349,6 +369,7 @@ class M3PairedMatrixTests(unittest.TestCase):
                 "build_input_id": "build-input",
                 "artifact_set_id": "artifacts",
                 "source_start": {"sha256": "1" * 64},
+                "git_head": "a" * 40,
             }
             hardware = {"fixture": "hardware"}
             process_count = 0

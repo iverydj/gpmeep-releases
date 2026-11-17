@@ -427,8 +427,55 @@ In general, calculating the computational cost of an arbitrary simulation is cha
 Upstream Meep does not currently provide a GPU backend. This gpmeep fork adds
 an experimental FP32 NVIDIA CUDA backend covering the core FDTD step, sources,
 boundaries, dispersive polarizations, DFT accumulation, adjoint material
-gradients, and MPI execution. Use `MEEP_GPU_BACKEND=auto` for workload-aware
-CPU/CUDA selection or `MEEP_GPU_BACKEND=cuda` for strict CUDA qualification.
+gradients, and MPI execution. Released v1.0.x packages offer opt-in
+`MEEP_GPU_BACKEND=auto`; v1.1.0 instead requires the user to select `cpu` or
+`cuda` and uses a fail-before-run, exact first acknowledgement when that choice
+disagrees with its recommendation. It never switches the backend automatically.
+The guard covers `Simulation.run`, `run_k_point`, `solve_cw`, and
+`solve_eigfreq`; CUDA environment defects fail closed and cannot be
+acknowledged. Direct low-level `mp.fields` calls retain explicit all-or-nothing
+engine selection, but have no high-level workload metadata for a CPU/CUDA
+suitability recommendation. Mismatch acknowledgement is also available for an
+initialized `Simulation`: ordered per-rank native fields and material-structure
+manifests bind monotonic mutation epochs and core solver state, and any
+intervening field, material, DFT, or owner mutation invalidates the pending
+retry. The exact challenge is one-shot. After a successful unchanged retry,
+the default scope permits reuse only by the same `Simulation` object and only
+for its same bounded process-local policy class. An explicitly reviewed batch
+may pass `scope="process"` to let later simulation objects reuse that class;
+this opt-in remains bounded, process-local, and fork-reset. A backend direction,
+classification, MPI topology, policy version, or threshold-category change
+requires a fresh warning in either mode. Every MPI reuse also keeps the exact
+collective workload fingerprint so rank-divergent geometry, sources, and
+callbacks are rejected before solver mutation. The exact challenge binds
+callable globals, descriptor functions,
+annotations, classes/slots/bound owners, built-in subclass state, Simulation
+semantic inputs and input-file contents, and object alias/cycle topology.
+Unsupported opaque or nested-module state fails before solver initialization
+instead of falling back to a type or pointer identity.
+
+Ordinary Python `Simulation`, source, material, and DFT-monitor APIs keep their
+upstream spelling. gpmeep v1.1.0 does, however, make engine-owned raw SWIG
+members read-only: assigning fields of native DFT/monitor descriptors or the
+storage/configuration members of native `fields` and `structure` objects could
+bypass guard epochs and invalidate MPI/CUDA coherence. Use supported methods
+such as monitor construction, `scale_dfts`, `load_*`, `remove`, and the
+documented material/source/field operations. In particular,
+`structure.effort` is a readable engine-owned allocation rather than a
+replaceable Python buffer; direct replacement could create conflicting native
+owners. `fields.t` remains writable for
+the existing `Simulation` restart path and is included in the exact state
+manifest. The internal `fields.process_incoming_chunk_data` halo-transport
+routine is no longer exposed to Python; it was an engine implementation detail,
+not a supported user operation. The direct raw `flux_vol(fields, ...)` SWIG
+constructor is likewise hidden because it could attach itself without updating
+the owner's mutation epoch; use `Simulation.add_flux` or
+`fields.add_flux_vol`. Initialized Python `CustomSource` callables are bound by
+the same transitive bytecode/closure/global/descriptor fingerprint as run
+callbacks, so changing callback state invalidates a pending acknowledgement.
+The owning `src_time.next` link is readable but not assignable; native source
+cycles fail closed during manifest construction.
+
 See [Meep GPU Development](../../GPU_DEVELOPMENT.md) for the supported build,
 runtime, portability, numerical-validation, and remaining host-only feature
 boundaries. OpenCL and HIP backends are not implemented.

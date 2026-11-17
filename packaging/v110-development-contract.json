@@ -1,0 +1,298 @@
+{
+  "schema_version": 1,
+  "release_train": "1.1.0",
+  "base_release": {
+    "tag": "v1.0.3",
+    "commit": "b48c9b678f2316cefa95e48a661f7a877547a000",
+    "frozen": true
+  },
+  "scope": {
+    "python_interface": true,
+    "scheme_interface": false,
+    "fp32_cpu_and_cuda": true,
+    "mpi_multi_gpu": true,
+    "adjoint_inverse_design": true,
+    "broad_fdtd_feature_validation": true
+  },
+  "backend_policy": {
+    "allowed_user_choices": ["cpu", "cuda"],
+    "user_choice_is_authoritative": true,
+    "unspecified_backend_is_interpreted_as": "cpu",
+    "unspecified_backend_is_still_recommendation_guarded": true,
+    "automatic_backend_selection": false,
+    "runtime_backend_switching": false,
+    "silent_cpu_fallback": false,
+    "mismatch_first_attempt": "fail_before_simulation",
+    "mismatch_override_requires_acknowledgement": true,
+    "override_is_audited": true,
+    "acknowledgement": {
+      "scope": "exact_first_run_then_explicit_simulation_or_process_policy_scope",
+      "default_reuse_scope": "simulation",
+      "optional_reuse_scopes": ["process"],
+      "process_scope_requires_explicit_opt_in": true,
+      "required_digest_bindings": [
+        "selected_backend",
+        "recommended_backend",
+        "workload_fingerprint",
+        "recommendation_policy_version",
+        "mpi_topology_digest",
+        "native_state_digest",
+        "process_nonce",
+        "run_nonce"
+      ],
+      "reusable_scope_digest_bindings": [
+        "selected_backend",
+        "recommended_backend",
+        "reason_class",
+        "recommendation_confidence",
+        "recommendation_policy_version",
+        "mpi_topology_digest",
+        "policy_facts",
+        "policy_inputs"
+      ],
+      "maximum_simulation_scopes": 32,
+      "maximum_process_scopes": 32,
+      "reuse_is_process_local": true,
+      "fork_inheritance_is_forbidden": true,
+      "diagnostic_cache_disable_environment": "MEEP_GPU_DISABLE_BACKEND_ACK_SCOPE_CACHE",
+      "reason_min_utf8_bytes": 8,
+      "reason_max_utf8_bytes": 512,
+      "all_mpi_ranks_must_agree_on_digest": true,
+      "mpi_reuse_requires_exact_workload_consensus": true,
+      "consume_before_first_simulation_state_mutation": true,
+      "replay_is_forbidden": true,
+      "fail_closed_conditions": [
+        "missing_acknowledgement",
+        "empty_or_out_of_range_reason",
+        "stale_digest",
+        "changed_backend_recommendation_or_workload",
+        "changed_mpi_topology",
+        "rank_digest_mismatch",
+        "replayed_nonce"
+      ]
+    }
+  },
+  "performance_inversion_policy": {
+    "comparison_lanes": [
+      "upstream_meep_cpu",
+      "gpmeep_v110_cpu",
+      "gpmeep_v103_cuda_gpu1",
+      "gpmeep_v110_cuda_gpu1",
+      "gpmeep_v103_cuda_gpu2",
+      "gpmeep_v110_cuda_gpu2"
+    ],
+    "same_physics_precision_stopping_condition": true,
+    "unavailable_phase_representation": {
+      "available": false,
+      "measured_seconds": [null, null],
+      "mean_seconds": null,
+      "reason_code_required": true,
+      "basis_per_sample_required": true,
+      "native_sinks_per_sample_required": true,
+      "cycle_indices": [1, 2]
+    },
+    "equal_work_plan": {
+      "path": "packaging/v110-m4-equal-work-plan.json",
+      "sha256": "a00267645358bde4f26ca7cca84886e1ec385c1f013c68c363efe560dd5bc183"
+    },
+    "required_decomposition": [
+      "initialization",
+      "fdtd_timestep",
+      "source",
+      "boundary",
+      "dispersive_ade",
+      "dft_reduction",
+      "host_device_transfer_and_sync",
+      "mpi",
+      "python_adjoint_mpb",
+      "io"
+    ],
+    "reason_classes": {
+      "hardware_crossover": {
+        "warning_may_be_terminal": true,
+        "requires_size_run_length_sweep_and_profiler_evidence": true
+      },
+      "engine_overhead": {
+        "warning_may_be_terminal": false,
+        "optimization_and_remeasurement_required": true,
+        "representative_high_impact_case_blocks_release": true
+      },
+      "environment": {
+        "warning_may_be_terminal": false,
+        "configuration_fix_or_fail_closed_required": true
+      },
+      "unknown": {
+        "warning_may_be_terminal": false,
+        "excluded_from_performance_claims": true,
+        "representative_high_impact_case_blocks_release": true
+      }
+    },
+    "required_telemetry": [
+      "selected_backend",
+      "recommended_backend",
+      "reason_class",
+      "recommendation_confidence",
+      "rank_local_cells",
+      "run_length",
+      "kernel_launch_count",
+      "transfer_bytes",
+      "monitor_count",
+      "mpi_gpu_topology",
+      "profiler_or_ablation_id",
+      "acknowledgement",
+      "acknowledgement_reason",
+      "acknowledgement_reused",
+      "acknowledgement_scope",
+      "acknowledgement_origin_cohort_digest",
+      "acknowledgement_scope_cache_enabled",
+      "acknowledgement_scope_digest",
+      "workload_fingerprint_evaluated",
+      "recommendation_policy_version"
+    ],
+    "registry": {
+      "schema": "packaging/v110-performance-inversion-record.schema.json",
+      "schema_sha256": "6f5bd0ea742ba6cc81dcc73af7020b5973205acf54e8865b0e0f24fa81effbaa",
+      "initial_inventory": "packaging/v110-performance-inversion-inventory.json",
+      "initial_inventory_sha256": "f0678a83b20974243fb944c4065f7f9dfbb00c0aecee928a4b340e4e7a2cc82b",
+      "records_directory": "performance-inversions/v1.1.0/records",
+      "release_gate_tool": "scripts/validate-v110-inversion-registry.py",
+      "one_primary_class_per_observed_inversion": true,
+      "all_observed_inversions_must_be_registered": true,
+      "representative_selection_requires_immutable_inventory_and_rationale": true,
+      "evidence_files_require_sha256": true,
+      "release_rejects_open_representative_engine_or_unknown": true,
+      "release_rejects_unregistered_observed_inversion": true
+    }
+  },
+  "performance_candidates": {
+    "c1_guarded_zero_state_lorentzian_drude_elision": "reapply_and_ablate",
+    "c2_aunp_canary": "measurement_not_independent_optimization",
+    "c3_resident_sparse_lorentzian_plan": "reapply_and_ablate",
+    "c4_a2_safe_static_material_initialization": "implement_and_ablate",
+    "adaptive_field_phase_batching": "small_domains_only",
+    "source_dft_batching_and_cuda_graph": "fail_closed_eligibility",
+    "multi_gpu_overlap": "profile_before_change",
+    "gpmeep_cpu_regression": "reproduce_on_equal_build_before_change"
+  },
+  "compatibility_target": {
+    "primary_platform": "linux-x86_64",
+    "maximum_glibc_floor": "2.35",
+    "required_native_test_environments": ["ubuntu-22.04", "one-newer-ubuntu"],
+    "non_linux_cuda_is_future_work": true
+  },
+  "development_isolation": {
+    "repository_relative_to_workspace": "gpmeep-v1.1.0-dev",
+    "required_branch": "dev/v1.1.0",
+    "origin_url": "git@github.com:iverydj/gpmeep.git",
+    "independent_git_object_store": true,
+    "git_alternates_forbidden": true,
+    "m0_commit_must_have_frozen_base_as_first_parent": true,
+    "builder_prefix_relative": ".envs/gpmeep-v1.1-builder",
+    "builder_lock": "environment/locks/package-builder-linux-64.lock",
+    "builder_lock_sha256": "6bd38eec7b6dcdd0278ebb660a778e66a53365dac64dd0779526000797257962",
+    "test_prefix_relative": ".envs/gpmeep-v1.1-test",
+    "test_lock": "environment/locks/gpmeep-runtime-linux-64.lock",
+    "test_lock_sha256": "d9b15db4145220d5897b384d329231f09ba7e6fafe386a429f144e8be7ad6b21",
+    "attestation_tool": "scripts/attest-v110-m0.py",
+    "attestation_must_be_external_mode_600": true,
+    "source_worktree_must_be_clean": true
+  },
+  "validation": {
+    "user_input_artifacts": [
+      {
+        "id": "hor_tm_60deg_saw_v6",
+        "workspace_relative_path": "meep_gpu/test_example/Hor_TM_60deg_saw_v6.py",
+        "type": "python",
+        "sha256": "4a14fb7a6770802aeefa116768dd28ea3d92900f36fb06e1f01b9de5706f8bef",
+        "release_gate_required": false,
+        "evaluation_status": "NOT_EVALUATED_USER_DEFERRED_LONG_RUNTIME",
+        "performance_claim_eligible": false
+      },
+      {
+        "id": "aunp_r4000_repro_20260807",
+        "workspace_relative_path": "meep_gpu/test_example/aunp_r4000_repro_20260807code.tar.gz",
+        "type": "tar.gz",
+        "sha256": "448e01dcf433435fc5e00ef40ef0cb260870b002a113f3340eacee84f205ff96",
+        "release_gate_required": true,
+        "evaluation_status": "REQUIRED",
+        "performance_claim_eligible": true,
+        "required_members": {
+          "aunp_r4000_repro/REPRODUCE.md": "39439d2cbdd24528952abb83a59ab5eb58e9b11dedad203c0a04912cd4da849b",
+          "aunp_r4000_repro/fdtd/sim_config.py": "f514896f51a5368ffe3f79d389425f4a271fc79bd1d8396278b6f8468c85b0a1",
+          "aunp_r4000_repro/fdtd/meep/run_production.py": "7ff087b40a6b4e96f2a2c72fdfa0536a666dd49999096fd60816b77a3988146a",
+          "aunp_r4000_repro/fdtd/meep/aunp_periodic_fdtd.py": "a56ade815e2689f037da547ca077fc41505c761364c27e58382b13da5f349cec"
+        }
+      }
+    ],
+    "aunp_contract": {
+      "artifact_id": "aunp_r4000_repro_20260807",
+      "polarization": "TM",
+      "minimum_run": 20,
+      "dft_field_decay": 5e-8,
+      "correctness_and_fixed_work_performance_are_separate": true
+    },
+    "performance_repetitions": 2,
+    "cpu_baseline_requires_physical_core_topology": true,
+    "deduplicate_examples_by_feature_coverage": true,
+    "adversarial_audit_after_every_milestone": true,
+    "retain_intermediate_timing_numerical_and_runtime_identity": true
+  },
+  "gate_integration": {
+    "static_validator": "scripts/validate-v110-development-contract.py",
+    "m0_attestation_tool": "scripts/attest-v110-m0.py",
+    "negative_tests": "scripts/tests/test_v110_development_contract.py",
+    "manual_no_email_actions_workflow": ".github/workflows/v110-contract.yml",
+    "package_builder": "scripts/build-conda-package.sh",
+    "installed_package_verifier": "scripts/verify-gpmeep-package.py",
+    "candidate_build_receipt_tool": "scripts/v110-release-gate-receipt.py",
+    "final_release_receipt_tool": "scripts/v110-final-release-receipt.py",
+    "release_evidence_generator": "scripts/v110-release-evidence.py",
+    "publication_controller": "scripts/publish-v110-release.sh",
+    "source_repository_slug": "iverydj/gpmeep",
+    "public_repository_slug": "iverydj/gpmeep-releases",
+    "private_source_authority_tool": "scripts/v110-release-only-receipt.py",
+    "public_source_verifier": "scripts/verify-public-source.py",
+    "public_publication_controller": "scripts/publish-v110-public.py",
+    "public_prior_tag": "v1.0.3",
+    "public_snapshot_method": "public-parent-preserved-runtime-source-v1",
+    "development_build_mode_flag": "--development-build",
+    "candidate_build_mode_flag": "--candidate-build",
+    "development_package_build_suffix": "_development",
+    "development_marker_suffix": ".NON_PUBLISHABLE",
+    "package_owned_candidate_receipt": "share/gpmeep/v110-candidate-build-receipt.json",
+    "package_owned_contract_directory": "share/gpmeep/packaging",
+    "candidate_requires_external_attestation": true,
+    "candidate_requires_exact_external_attestation_sha256": true,
+    "candidate_requires_closed_inversion_registry": true,
+    "candidate_receipt_never_authorizes_publication": true,
+    "final_release_receipt_is_external": true,
+    "final_release_receipt_binds_exact_package_sha256": true,
+    "publication_requires_final_release_receipt": true,
+    "publication_forbids_package_rebuild_or_mutation": true,
+    "public_target_is_public": true,
+    "public_target_actions_disabled": true,
+    "public_target_immutable_releases": true,
+    "public_forbids_build_or_package_mutation": true,
+    "public_forbids_development_history": true,
+    "public_package_must_be_byte_identical": true,
+    "public_requires_prior_ref_identity": true,
+    "public_requires_independent_publication_audit": true,
+    "public_prior_release_is_source_only": true,
+    "public_each_new_release_requires_signed_immutable_attestation": true,
+    "public_repository_id": 1372662716,
+    "public_repository_node_id": "R_kgDOUdErvA",
+    "public_artifact_inspector": "scripts/verify-public-artifacts.py"
+  },
+  "release_gates": {
+    "at_least_one_structural_optimization_has_repeatable_benefit": true,
+    "no_material_regression_on_large_positive_workloads": true,
+    "backend_guard_validated": true,
+    "broad_correctness_validated": true,
+    "multi_gpu_validated_on_real_hardware": true,
+    "packaging_and_provenance_validated": true,
+    "portability_matrix_validated": true,
+    "all_milestone_adversarial_audits_pass": true,
+    "no_unresolved_representative_engine_overhead": true,
+    "no_unclassified_representative_gpu_cpu_inversion": true
+  }
+}

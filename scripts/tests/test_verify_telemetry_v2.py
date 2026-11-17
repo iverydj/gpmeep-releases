@@ -7,10 +7,12 @@ import copy
 import hashlib
 import importlib.util
 import json
+import os
 import pathlib
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -269,6 +271,12 @@ class Fixture:
         return VERIFY.verify_pair(**values)
 
 
+def terminal_zombie() -> dict[str, object]:
+    record = process(42, 1, 100)
+    record.update({"state": "Z", "rss_bytes": 0})
+    return record
+
+
 class TelemetryReplayTests(unittest.TestCase):
     def with_fixture(self, uuids=("GPU-one",)):
         temporary = tempfile.TemporaryDirectory()
@@ -286,6 +294,73 @@ class TelemetryReplayTests(unittest.TestCase):
             ],
             0.99,
         )
+        self.assertFalse(report["host"]["terminal_root_zombie_observed"])
+
+    def test_exact_terminal_root_zombie_is_not_a_surviving_process(self) -> None:
+        fixture = self.with_fixture()
+        zombie = terminal_zombie()
+        terminal = fixture.host_records[-1]
+        terminal["processes"] = [zombie]
+        terminal["process_count"] = 1
+        terminal["process_rss_bytes"] = 0
+        fixture.refresh()
+
+        report = fixture.verify()
+        self.assertEqual(report["schema"], VERIFY.REPORT_SCHEMA)
+        self.assertEqual(report["host"]["schema"], VERIFY.HOST_REPLAY_SCHEMA)
+        self.assertTrue(report["host"]["terminal_root_zombie_observed"])
+        self.assertEqual(report["host"]["observed_process_pids"], [42, 43])
+        self.assertEqual(
+            report["host"]["sha256"], digest(fixture.host_stream.read_bytes())
+        )
+
+    def test_terminal_zombie_exception_is_exact_and_fail_closed(self) -> None:
+        mutations = {
+            "running": lambda item: item.update(state="R"),
+            "unknown-state": lambda item: item.update(state="X"),
+            "nonzero-rss": lambda item: item.update(rss_bytes=1),
+            "wrong-pid": lambda item: item.update(pid=41),
+            "wrong-start": lambda item: item.update(start_time_ticks=101),
+            "wrong-pgrp": lambda item: item.update(pgrp=41),
+            "wrong-ppid": lambda item: item.update(ppid=42),
+            "boolean-processor": lambda item: item.update(processor=False),
+            "empty-comm": lambda item: item.update(comm=""),
+            "extra-field": lambda item: item.update(extra="not-canonical"),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label):
+                fixture = self.with_fixture()
+                zombie = terminal_zombie()
+                mutate(zombie)
+                terminal = fixture.host_records[-1]
+                terminal["processes"] = [zombie]
+                terminal["process_count"] = 1
+                terminal["process_rss_bytes"] = zombie["rss_bytes"]
+                fixture.refresh()
+                with self.assertRaises(ValueError):
+                    fixture.verify()
+
+        fixture = self.with_fixture()
+        zombie = terminal_zombie()
+        child = process(43, 42, 101)
+        terminal = fixture.host_records[-1]
+        terminal["processes"] = [zombie, child]
+        terminal["process_count"] = 2
+        terminal["process_rss_bytes"] = child["rss_bytes"]
+        fixture.refresh()
+        with self.assertRaisesRegex(ValueError, "retains processes"):
+            fixture.verify()
+
+        fixture = self.with_fixture()
+        fixture.host_records.insert(1, host_sample(1, False))
+        fixture.host_records[-1]["sequence"] = 2
+        fixture.host_records[-1]["captured_unix_seconds"] = 14.0
+        fixture.refresh()
+        host_terminal = json.loads(fixture.host_terminal.read_text())
+        host_terminal["ended_unix_seconds"] = 14.1
+        fixture.host_terminal.write_text(json.dumps(host_terminal) + "\n")
+        with self.assertRaisesRegex(ValueError, "before the final sample"):
+            fixture.verify()
 
     def test_host_rss_mutation_is_rejected(self) -> None:
         fixture = self.with_fixture()
@@ -324,6 +399,80 @@ class TelemetryReplayTests(unittest.TestCase):
         fixture.gpu_terminal.write_text(json.dumps(terminal) + "\n")
         with self.assertRaisesRegex(ValueError, "SHA-256"):
             fixture.verify()
+
+    def test_stream_inode_replacement_during_replay_is_rejected(self) -> None:
+        fixture = self.with_fixture()
+        original = VERIFY._stable_read_bytes
+        replaced = False
+
+        def replace_after_initial_read(path, name):
+            nonlocal replaced
+            result = original(path, name)
+            absolute = pathlib.Path(os.path.abspath(os.fspath(path)))
+            if (
+                not replaced
+                and absolute == fixture.host_stream
+                and name == "host telemetry"
+            ):
+                replacement = fixture.root / "host-replacement.jsonl"
+                replacement.write_bytes(result[1])
+                os.replace(replacement, fixture.host_stream)
+                replaced = True
+            return result
+
+        with mock.patch.object(
+            VERIFY, "_stable_read_bytes", side_effect=replace_after_initial_read
+        ), self.assertRaisesRegex(ValueError, "changed during replay"):
+            fixture.verify()
+        self.assertTrue(replaced)
+
+    def test_pair_rechecks_host_after_gpu_validation(self) -> None:
+        fixture = self.with_fixture()
+        original = VERIFY._stable_read_bytes
+        changed = False
+
+        def change_host_while_gpu_is_read(path, name):
+            nonlocal changed
+            result = original(path, name)
+            if not changed and name == "GPU telemetry":
+                fixture.host_stream.write_bytes(
+                    fixture.host_stream.read_bytes() + b" "
+                )
+                changed = True
+            return result
+
+        with mock.patch.object(
+            VERIFY,
+            "_stable_read_bytes",
+            side_effect=change_host_while_gpu_is_read,
+        ), self.assertRaisesRegex(ValueError, "pair host telemetry changed"):
+            fixture.verify()
+        self.assertTrue(changed)
+
+    def test_pair_binds_verifier_source_before_validation(self) -> None:
+        fixture = self.with_fixture()
+        verifier_copy = fixture.root / "verify-telemetry-copy.py"
+        verifier_copy.write_bytes(SOURCE.read_bytes())
+        original = VERIFY._stable_read_bytes
+        changed = False
+
+        def change_verifier_while_gpu_is_read(path, name):
+            nonlocal changed
+            result = original(path, name)
+            if not changed and name == "GPU telemetry":
+                verifier_copy.write_bytes(verifier_copy.read_bytes() + b"\n")
+                changed = True
+            return result
+
+        with mock.patch.object(
+            VERIFY, "__file__", str(verifier_copy)
+        ), mock.patch.object(
+            VERIFY,
+            "_stable_read_bytes",
+            side_effect=change_verifier_while_gpu_is_read,
+        ), self.assertRaisesRegex(ValueError, "pair verifier source changed"):
+            fixture.verify()
+        self.assertTrue(changed)
 
     def test_terminal_time_bounds_are_replayed(self) -> None:
         fixture = self.with_fixture()
@@ -499,6 +648,25 @@ class TelemetryReplayTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "end-coverage"):
             fixture.verify(expected_process_ended_unix_seconds=20.0)
 
+    def test_gpu_end_coverage_allows_only_bounded_controller_bookkeeping_lag(
+        self,
+    ) -> None:
+        fixture = self.with_fixture()
+        # The final GPU sample at 12.5 already proves root_alive=false.  A
+        # controller can timestamp process completion shortly afterwards while
+        # it drains the final pipe bytes, even after the monitor terminal at
+        # 12.6 was written.
+        report = fixture.verify(expected_process_ended_unix_seconds=12.61)
+        coverage = report["gpu"]["process_coverage"]
+        self.assertEqual(coverage["outcome"], "PASS")
+        self.assertAlmostEqual(coverage["end_tail_seconds"], -0.11)
+        self.assertEqual(coverage["maximum_allowed_gap_seconds"], 5.0)
+
+        # The allowance remains exactly bound to the sealed sampling cadence.
+        fixture.verify(expected_process_ended_unix_seconds=17.5)
+        with self.assertRaisesRegex(ValueError, "end-coverage"):
+            fixture.verify(expected_process_ended_unix_seconds=17.500001)
+
     def test_capture_interval_must_overlap(self) -> None:
         fixture = self.with_fixture()
         for record in fixture.gpu_records:
@@ -526,6 +694,37 @@ class TelemetryReplayTests(unittest.TestCase):
             expected_host_monitor_sha256=digest(fixture.host_monitor.read_bytes()),
         )
         self.assertIsNone(report["gpu"])
+        with self.assertRaisesRegex(ValueError, "idle proof requires"):
+            VERIFY.verify_pair(
+                host_stream=fixture.host_stream,
+                host_terminal=fixture.host_terminal,
+                gpu_stream=None,
+                gpu_terminal=None,
+                expected_root_pid=42,
+                expected_label="fixture",
+                expected_host_monitor_sha256=digest(
+                    fixture.host_monitor.read_bytes()
+                ),
+                expected_workload_gpu_idle=True,
+            )
+
+    def test_gpu_idle_mode_proves_cpu_workload_created_no_compute_app(self) -> None:
+        fixture = self.with_fixture(("GPU-one", "GPU-two"))
+        fixture.gpu_records[0]["compute_applications"] = []
+        fixture.refresh()
+        report = fixture.verify(expected_workload_gpu_idle=True)
+        self.assertTrue(report["gpu"]["expected_workload_gpu_idle"])
+        fixture.gpu_records[0]["compute_applications"] = [
+            {
+                "gpu_uuid": "GPU-one",
+                "pid": 43,
+                "process_name": "unexpected-cpu-helper",
+                "used_gpu_memory_mib": metric(1.0, "1"),
+            }
+        ]
+        fixture.refresh()
+        with self.assertRaisesRegex(ValueError, "GPU-idle workload"):
+            fixture.verify(expected_workload_gpu_idle=True)
 
     def test_report_publication_is_atomic_exclusive_and_symlink_safe(self) -> None:
         fixture = self.with_fixture()

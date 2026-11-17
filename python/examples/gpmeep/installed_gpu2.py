@@ -5,6 +5,12 @@ import json
 
 from mpi4py import MPI
 import meep as mp
+from meep.backend_policy import BackendRecommendationMismatch
+
+
+ACKNOWLEDGEMENT_REASON = (
+    "Installed two-GPU example intentionally demonstrates CUDA below crossover"
+)
 
 
 communicator = MPI.COMM_WORLD
@@ -25,7 +31,15 @@ simulation = mp.Simulation(
     ],
 )
 communicator.Barrier()
-simulation.run(until=12)
+try:
+    simulation.run(until=12)
+except BackendRecommendationMismatch as mismatch:
+    # This is a quick topology smoke, not a speed claim. Each rank confirms
+    # the same exact mismatch challenge before retrying the unchanged run.
+    mp.gpu.acknowledge_backend_mismatch(
+        mismatch.challenge, ACKNOWLEDGEMENT_REASON
+    )
+    simulation.run(until=12)
 local = {
     "rank": communicator.rank,
     "active_backend": mp.gpu.active_backend,
@@ -33,6 +47,7 @@ local = {
     "cuda_execution_selected": bool(
         simulation.fields.gpu_cuda_execution_selected()
     ),
+    "backend_recommendation": mp.gpu.recommendation,
     "statistics": mp.gpu.statistics(),
 }
 records = communicator.gather(local, root=0)

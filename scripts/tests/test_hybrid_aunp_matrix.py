@@ -38,6 +38,7 @@ def fake_build():
             "receipt_id": "receipt",
             "build_input_id": "build-input",
             "artifact_set_id": "artifacts",
+            "git_head": "a" * 40,
         },
     )
 
@@ -79,10 +80,14 @@ class HybridAuNPContractTests(unittest.TestCase):
                 "build_input_id": "build-input",
                 "artifact_set_id": "artifacts",
                 "source_sha256": "source-snapshot",
+                "git_head": "a" * 40,
             },
             "cpu_ranks": 8,
             "gpu_devices": list(devices),
             "performance_repeats": 2,
+            "backend_acknowledgement_reason": (
+                HYBRID.AUNP_BACKEND_ACKNOWLEDGEMENT_REASON
+            ),
             "qualification_profile": HYBRID.aunp_qualification_profile(),
             "fixed_window_meep_time": HYBRID.performance_adapter.FIXED_WINDOW_MEEP_TIME,
             "minimum_timesteps_per_phase": (
@@ -133,6 +138,17 @@ class HybridAuNPContractTests(unittest.TestCase):
         )
         self.assertTrue(all(task.counts_toward_performance for task in tasks[4:]))
         self.assertFalse(any(task.counts_toward_performance for task in tasks[:4]))
+
+    def test_build_contract_requires_exact_git_commit(self) -> None:
+        build = fake_build()
+        with mock.patch.object(
+            HYBRID.matrix, "_source_identity", return_value="b" * 64
+        ):
+            record = HYBRID.build_contract_record(build)
+            self.assertEqual(record["git_head"], "a" * 40)
+            build.receipt["git_head"] = "invalid"
+            with self.assertRaisesRegex(Exception, "Git identity"):
+                HYBRID.build_contract_record(build)
 
     def test_two_directional_exact_comparisons_are_mandatory(self) -> None:
         self.assertEqual(

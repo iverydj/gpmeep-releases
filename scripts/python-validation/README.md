@@ -5,16 +5,57 @@ while deliberately excluding Scheme. It runs selected cases in fresh working
 directories against the same FP32 gpmeep build with `MEEP_GPU_BACKEND=cpu` and
 `MEEP_GPU_BACKEND=cuda`.
 
-The current terminal scope uses 70 deduplicated paired CPU/CUDA units, four
-host-compatibility units, and five specialized correctness/topology units.
-The specialized set includes MPI Python, one- and two-GPU examples, and
-Near2Far-adjoint validation, but no repeated example-speed benchmark. Official
-example timings are diagnostic only. Release performance is measured only by
-the AuNP controller, with exactly two CPU8/GPU1/GPU2 executions and ratios of
-arithmetic-mean times. `run_current_scope_release.py` combines that AuNP
-terminal and its adversarial audit with the 79 physical example units and the
-explicit Hor_TM user-deferral receipt. The older M1--M3 aggregation and
-repeated-performance scripts remain solely for historical evidence replay.
+The retained v1.0.x terminal scope used 70 deduplicated paired CPU/CUDA units,
+four host-compatibility units, and five specialized correctness/topology units.
+Those older M1--M3 aggregation and repeated-performance scripts remain solely
+for historical evidence replay; in particular, their automatic-backend lanes,
+five-repeat policy, TERS lane, and AuNP-only release gate are not v1.1.0
+authority. The v1.1.0 campaign uses explicit CPU/CUDA selection, exactly two
+accepted performance repetitions, the current inversion registry, and the two
+checksum-bound user inputs in the development contract.
+
+Historical evidence with a reviewed mismatch uses a separate, non-release
+receipt. `seal_evidence_only_adversarial_audit.py prepare` copies the exact M3
+terminal, checkpoint, journal, report, audit draft and review, the original
+task-56 MISMATCH report and process record, both CPU/CUDA stdout files, the
+one-rule adjudication and its two independent reviews, the historical
+manifest/comparator/wrapper Git blobs, and the verifier itself into one
+relative-path bundle. The bundled verifier independently parses the retained
+CPU/CUDA stdout, re-applies the single reviewed tolerance change, and
+recomputes all 5,904 metric comparisons plus their canonical metric/key and
+comparison-record digests; it does not import or trust the historical
+adjudicator to reproduce the numerical verdict. It also cross-checks all 70
+report/checkpoint/journal task records and binds the audit draft, full review,
+source label, evidence-root label, and original task-56 argv. The verifier can
+replay the directory after it is relocated and requires no private original
+file or importable historical gpmeep package. Its only valid verdict is
+`paired_evidence=GO`, `candidate_release=BLOCKED`, with
+`release_authorized=false`; it cannot be supplied where a normal milestone
+release receipt is required. The native exit-3 MISMATCH and
+`new_meep_execution=false` remain explicit and cannot be relabelled as an
+ordinary PASS.
+
+The v1.1.0 inversion campaign compares the same FP32 physics against an
+authoritative upstream-Meep CPU build. Spatial cases use eight CPU ranks. The
+zero-dimensional `material-dispersion.py` case contains one grid point and
+therefore uses one CPU rank in both upstream Meep and gpmeep; attempting to
+split it over eight ranks is a physical topology error, not a performance
+result. The isolated validation harness also excludes Open MPI's `osc_ucx`
+one-sided component because this campaign uses no MPI windows and the local
+component fails during its pre-user-code query. This changes neither
+gpmeep's user runtime defaults nor its point-to-point and collective MPI
+transports.
+
+The `near2far_3d_validation.py` workload keeps its 8% directional-derivative
+qualification limit for every normal gpmeep CPU/CUDA validation.  The sealed
+upstream timing runner passes the sole explicit
+`--gpmeep-upstream-performance-capture` example argument because the
+unmodified upstream FP32 adjoint result does not satisfy that gpmeep
+correctness gate.  Capture mode does not change the forward, adjoint, or
+finite-difference work: it completes all ten `Simulation.run` calls and emits
+the observed derivative errors for the M3 record instead of terminating at
+the first known upstream discrepancy.  No generic manifest option may inject
+the argument, and it is never used by a gpmeep lane.
 
 The CUDA selection is strict in gpmeep: unsupported stepping must fail. A
 process-local `sitecustomize.py` hook captures the imported package path,
@@ -129,8 +170,15 @@ This adds `concurrency_detected` to the invalidity reasons. Release performance
 measurements use dedicated warm-up, isolation, and repeated-run benchmarks.
 Strict CUDA is intentionally used here to prove coverage even for tiny
 launch-latency-dominated fixtures. Their process times must not be reported as
-speedups; normal `auto` policy keeps rank-local domains below the calibrated
-cell threshold on the CPU.
+speedups. In v1.1.0 the user still selects the backend; the recommendation
+guard may advise CPU and requires a reason-bearing one-shot acknowledgement
+before the first nonrecommended CUDA policy scope, but it never switches
+backends. The M4 performance-qualification wrapper explicitly acknowledges its
+reviewed batch with `scope="process"`, so later simulation objects may carry
+audited reuse only while the complete policy class and MPI/GPU topology are
+unchanged. The general validation wrapper and normal API callers retain the
+safer `scope="simulation"` default, under which a separate simulation receives
+its own warning.
 
 Run the harness self-tests without Meep or a GPU:
 
@@ -139,10 +187,13 @@ Run the harness self-tests without Meep or a GPU:
   -s scripts/python-validation/tests -p 'test_*.py' -v
 ```
 
-The release-candidate hardening regression is 291/291 tests. The separate
-source, provenance, packaging, and benchmark-tool regression is 1173/1173
-under `scripts/tests`. Both counts are tied to the exact candidate commit and
-must match the sealed release evidence.
+The current validation-harness hardening regression is 334/334 tests. The
+separate source, provenance, packaging, and benchmark-tool regression under
+`scripts/tests` currently discovers 1640 tests: 1638 pass in the pre-package
+phase and two are explicitly deferred until the real frozen-v1.0.3 authority
+and the exact rebuilt v1.1.0 package are supplied. Release sealing requires a
+final rerun with those inputs and no skips. Both counts are tied to the exact
+candidate commit and must match the sealed release evidence.
 
 `aggregate_validation.py` can seal exact, disjoint `(case_id, backend)` batch
 assignments and later aggregate their completed runner directories. It
@@ -161,15 +212,15 @@ line modes which retain the scientific operators while bounding repeated
 parameter sweeps; each script's published defaults remain available. The raw
 CPU/strict-CUDA logs, timings, hashes, retained fail-closed attempts, and
 compact measurements are stored in
-private raw-evidence storage and are not included in public source snapshots.
+`artifacts/python-validation/m9-feature-expansion-b2-20260806/`.
 
 These generic process times remain diagnostics. In this batch the 320k-cell
 absorbed-power case was 3.575x faster and the stochastic case 1.390x faster in
 single probes, while the small 1D, LDOS, cylindrical, and symmetry-reduced
 force profiles were slower or near parity under forced CUDA. Those small cases
-are strict-CUDA coverage tests; the normal automatic policy is expected to
-keep sub-threshold rank-local domains on CPU. Only the later receipt-bound,
-interleaved benchmark can publish performance claims.
+are strict-CUDA coverage tests. In v1.1.0 the recommendation guard may advise
+CPU for sub-threshold rank-local domains, but it does not choose the backend.
+Only a receipt-bound, interleaved benchmark can publish performance claims.
 
 The fourth M9 feature-expansion batch adds material phasing plus a static
 negative control, densely sampled Absorber/PML ringdown, all three antenna
@@ -178,7 +229,8 @@ taper sweep against an independent FP64 reference, and analytic signed-order
 dispersion closure for normal/oblique diffraction. It compares 182,556 metrics
 and keeps complete material/field grids or complete order/field/coefficient
 arrays wherever the observable has a fixed physical gauge. Raw development
-evidence is retained privately and is not included in public source snapshots.
+evidence is in
+`artifacts/python-validation/m9-feature-expansion-b4-20260807/`.
 
 The Absorber/PML oracle keeps both complete 4096-sample complex ringdown traces
 verdict-bearing. Its signed weighted trace checksum is diagnostic-only: that
@@ -220,9 +272,10 @@ normalized forward/backward reciprocity residual is 3.693% relative L2 with a
 flattened metrics pass with no CPU fallback. Direct observations are 1,497.55
 seconds on CPU and 804.55 seconds on one RTX 3090 Ti, a diagnostic 1.861x
 ratio. These cold-process correctness observations are not release benchmark
-claims. The conservative `auto` policy still selects CPU for these small
-rank-local domains; explicit CUDA is faster for their long time horizons, so
-workload-aware automatic promotion remains a policy-tuning item.
+claims. The current recommendation calibration may still advise CPU for these
+small rank-local domains even though explicit CUDA can win over a long time
+horizon; v1.1.0 tracks this as recommendation evidence debt without ever
+choosing a backend for the user.
 `extraction_eff_ldos.py` is classified as covered by the stricter existing
 `test_ldos_ext_eff` cylindrical/3D equivalence test. Raw logs and their
 comparison receipt are retained under `gpmeep-evidence-notes/dev-tools/m9-b9-*`

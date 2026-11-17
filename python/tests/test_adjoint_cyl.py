@@ -1,3 +1,5 @@
+import os
+
 import meep as mp
 
 try:
@@ -11,8 +13,8 @@ from enum import Enum
 import numpy as np
 from autograd import numpy as npa
 from autograd import tensor_jacobian_product
+from adjoint_cyl_fixed_work_contract import fixed_work_metrics_payload
 from utils import ApproxComparisonTestCase
-import parameterized
 
 rng = np.random.RandomState(2)
 resolution = 20
@@ -43,6 +45,41 @@ p = 0.5 * rng.rand(Nr * Nz)
 ## random epsilon perturbation for design region
 deps = 1e-5
 dp = deps * rng.rand(Nr * Nz)
+
+# This tuple is consumed both by the four explicit unittest wrappers below and
+# by the M4 import-only preflight.  Keep it limited to JSON-like scalar data so
+# the preflight can prove the exact numerical cases without running a
+# simulation or depending on a third-party test decorator.
+GPMEEP_ADJOINT_CYL_TEST_CASES = (
+    (0, (5, 0, 20)),
+    (0, (4, 0, 28)),
+    (-1, (5, 0, 20)),
+    (1.2, (5, 0, 20)),
+)
+
+GPMEEP_ADJOINT_CYL_FIXED_WORK_ENV = "GPMEEP_ADJOINT_CYL_FIXED_WORK"
+GPMEEP_ADJOINT_CYL_METRICS_PREFIX = "gpmeep-adjoint-cyl-metrics:"
+
+
+def _fixed_work_requested():
+    value = os.environ.get(GPMEEP_ADJOINT_CYL_FIXED_WORK_ENV)
+    if value not in (None, "1"):
+        raise RuntimeError(
+            f"{GPMEEP_ADJOINT_CYL_FIXED_WORK_ENV} must be absent or exactly '1'"
+        )
+    return value == "1"
+
+
+GPMEEP_ADJOINT_CYL_FIXED_WORK = _fixed_work_requested()
+
+
+def _fixed_work_metrics_payload(rows, *, is_master):
+    return fixed_work_metrics_payload(
+        rows,
+        is_master=is_master,
+        expected_case_count=len(GPMEEP_ADJOINT_CYL_TEST_CASES),
+        prefix=GPMEEP_ADJOINT_CYL_METRICS_PREFIX,
+    )
 
 
 def get_source(m):
@@ -158,6 +195,15 @@ def adjoint_solver(design_params, m, far_x):
     def J(alpha):
         return npa.abs(alpha[0, 0, 0]) ** 2
 
+    fixed_work = (
+        {
+            "decay_by": 0.0,
+            "minimum_run_time": 1200,
+            "maximum_run_time": 1200,
+        }
+        if GPMEEP_ADJOINT_CYL_FIXED_WORK
+        else {"maximum_run_time": 1200}
+    )
     opt = mpa.OptimizationProblem(
         simulation=sim,
         objective_functions=J,
@@ -166,7 +212,7 @@ def adjoint_solver(design_params, m, far_x):
         fcen=fcen,
         df=0,
         nf=1,
-        maximum_run_time=1200,
+        **fixed_work,
     )
 
     f, dJ_du = opt([design_params])
@@ -176,15 +222,24 @@ def adjoint_solver(design_params, m, far_x):
 
 
 class TestAdjointSolver(ApproxComparisonTestCase):
-    @parameterized.parameterized.expand(
-        [
-            (0, [mp.Vector3(5, 0, 20)]),
-            (0, [mp.Vector3(4, 0, 28)]),
-            (-1, [mp.Vector3(5, 0, 20)]),
-            (1.2, [mp.Vector3(5, 0, 20)]),
-        ]
-    )
-    def test_adjoint_solver_cyl_n2f_fields(self, m, far_x):
+    fixed_work_metrics = []
+
+    @classmethod
+    def setUpClass(cls):
+        cls.fixed_work_metrics = []
+
+    @classmethod
+    def tearDownClass(cls):
+        if not GPMEEP_ADJOINT_CYL_FIXED_WORK:
+            return
+        payload = _fixed_work_metrics_payload(
+            cls.fixed_work_metrics,
+            is_master=not hasattr(mp, "am_master") or mp.am_master(),
+        )
+        if payload is not None:
+            print(payload)
+
+    def _check_adjoint_solver_cyl_n2f_fields(self, m, far_x):
         print("*** TESTING CYLINDRICAL Near2Far ADJOINT FEATURES ***")
         print(f"Current test: m={m}, far_x={far_x}")
         adjsol_obj, adjsol_grad = adjoint_solver(p, m, far_x)
@@ -208,8 +263,69 @@ class TestAdjointSolver(ApproxComparisonTestCase):
         adj_scale = (dp[None, :] @ adjsol_grad).flatten()
         fd_grad = S12_perturbed - S12_unperturbed
         print(f"Directional derivative -- adjoint solver: {adj_scale}, FD: {fd_grad}")
+        if GPMEEP_ADJOINT_CYL_FIXED_WORK:
+            case_index = len(self.fixed_work_metrics)
+            expected_m, expected_far_point = GPMEEP_ADJOINT_CYL_TEST_CASES[
+                case_index
+            ]
+            observed_far_point = [
+                float(far_x[0].x),
+                float(far_x[0].y),
+                float(far_x[0].z),
+            ]
+            if float(m) != float(expected_m) or observed_far_point != [
+                float(value) for value in expected_far_point
+            ]:
+                raise RuntimeError("fixed-work cylindrical adjoint case order differs")
+            adjoint_directional_derivative = float(np.asarray(adj_scale).reshape(-1)[0])
+            finite_difference_derivative = float(fd_grad)
+            derivative_scale = max(
+                abs(adjoint_directional_derivative),
+                abs(finite_difference_derivative),
+                1.0e-30,
+            )
+            self.fixed_work_metrics.append(
+                {
+                    "case_index": case_index,
+                    "m": float(m),
+                    "far_point": observed_far_point,
+                    "adjoint_objective": float(np.asarray(adjsol_obj).reshape(-1)[0]),
+                    "forward_objective": float(S12_unperturbed),
+                    "perturbed_forward_objective": float(S12_perturbed),
+                    "adjoint_directional_derivative": adjoint_directional_derivative,
+                    "finite_difference_derivative": finite_difference_derivative,
+                    "relative_derivative_error": abs(
+                        adjoint_directional_derivative
+                        - finite_difference_derivative
+                    )
+                    / derivative_scale,
+                }
+            )
         tol = 0.6 if m == 0 else 0.4
         self.assertClose(adj_scale, fd_grad, epsilon=tol)
+
+    def _check_case(self, case_index):
+        m, far_point = GPMEEP_ADJOINT_CYL_TEST_CASES[case_index]
+        self._check_adjoint_solver_cyl_n2f_fields(
+            m, [mp.Vector3(*far_point)]
+        )
+
+    # Keep the four stable unittest identities historically generated by
+    # parameterized.expand while making this numerical validation runnable
+    # from an installed gpmeep environment.  ``parameterized`` is a developer
+    # test-runner dependency, not a Meep runtime dependency, and neither the
+    # frozen v1.0.3 package nor a normal v1.1.0 installation provides it.
+    def test_adjoint_solver_cyl_n2f_fields_0(self):
+        self._check_case(0)
+
+    def test_adjoint_solver_cyl_n2f_fields_1(self):
+        self._check_case(1)
+
+    def test_adjoint_solver_cyl_n2f_fields_2(self):
+        self._check_case(2)
+
+    def test_adjoint_solver_cyl_n2f_fields_3(self):
+        self._check_case(3)
 
 
 if __name__ == "__main__":

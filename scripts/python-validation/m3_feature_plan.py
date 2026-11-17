@@ -28,8 +28,8 @@ SCHEMA = "gpmeep-m3-feature-plan-v1"
 REQUIREMENTS_NAME = "M3_GPU_FEATURE_REQUIREMENTS_DRAFT.tsv"
 EVIDENCE_NAME = "M3_GPU_FEATURE_EVIDENCE_PLAN_DRAFT.tsv"
 EXPECTED_SHA256 = {
-    REQUIREMENTS_NAME: "45f3ac7511f7b38b78a6bbd63d4cc09a78073fe72b2da1bb002c569a1cef44ba",
-    EVIDENCE_NAME: "2912cb14a24cb9709a98a530c182532355b5bb2ae1093cf5fdf80e91abd74a55",
+    REQUIREMENTS_NAME: "9b089723f3f9a15c9f1b1cb472f95d96d4b47fcddac7cddd55698f29d9115ef5",
+    EVIDENCE_NAME: "62fa8af0836bffc597b8793fa36ede72b6eff096ea26f4a66caad511e65991c0",
 }
 REQUIREMENT_FIELDS = (
     "feature_id",
@@ -58,6 +58,15 @@ STATUS_BY_FEATURE = {
 }
 MILESTONES = {"milestone:M2-AuNP", "milestone:M3-example-matrix"}
 FEATURE_ID = re.compile(r"[a-z][a-z0-9_]*(?:\.[a-z0-9_]+)+\Z")
+POLICY_FEATURE_IDS = (
+    "policy.recommend_cpu",
+    "policy.recommend_cuda",
+    "policy.long_horizon_small",
+)
+FORBIDDEN_BACKEND_SELECTION = re.compile(
+    r"(?<![a-z0-9])(?:auto1?|automatic)(?![a-z0-9])",
+    re.IGNORECASE,
+)
 
 
 class PlanError(RuntimeError):
@@ -139,9 +148,24 @@ def _tokens(value: str, label: str, *, allow_milestone: bool) -> list[str]:
     return tokens
 
 
+def _reject_forbidden_backend_selection(
+    rows: list[dict[str, str]], label: str
+) -> None:
+    for row_index, row in enumerate(rows, start=1):
+        for field, value in row.items():
+            match = FORBIDDEN_BACKEND_SELECTION.search(value)
+            if match is not None:
+                raise PlanError(
+                    f"{label} row {row_index} field {field} contains forbidden "
+                    f"backend-selection token: {match.group(0)!r}"
+                )
+
+
 def parse_contract(requirements: bytes, evidence: bytes) -> list[dict[str, Any]]:
     requirement_rows = _rows(requirements, REQUIREMENT_FIELDS, REQUIREMENTS_NAME)
     evidence_rows = _rows(evidence, EVIDENCE_FIELDS, EVIDENCE_NAME)
+    _reject_forbidden_backend_selection(requirement_rows, REQUIREMENTS_NAME)
+    _reject_forbidden_backend_selection(evidence_rows, EVIDENCE_NAME)
     requirement_ids = [row["feature_id"] for row in requirement_rows]
     evidence_ids = [row["feature_id"] for row in evidence_rows]
     if (
@@ -150,6 +174,13 @@ def parse_contract(requirements: bytes, evidence: bytes) -> list[dict[str, Any]]
         or any(FEATURE_ID.fullmatch(value) is None for value in requirement_ids)
     ):
         raise PlanError("M3 feature ID inventory differs")
+    policy_ids = tuple(
+        feature_id
+        for feature_id in requirement_ids
+        if feature_id.startswith("policy.")
+    )
+    if policy_ids != POLICY_FEATURE_IDS:
+        raise PlanError("M3 explicit recommendation policy feature inventory differs")
     family_counts = {
         family: sum(row["family"] == family for row in requirement_rows)
         for family in FAMILY_COUNTS

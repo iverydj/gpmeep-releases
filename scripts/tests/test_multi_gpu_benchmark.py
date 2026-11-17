@@ -229,6 +229,11 @@ class StrictRecordTests(unittest.TestCase):
                 "mixed-version",
             ),
             (
+                stdout + 'gpmeep-structured-curl-graph-v2:{}\n',
+                "",
+                "mixed-version",
+            ),
+            (
                 stdout,
                 'gpmeep-initial-condition-v1:{"profile":"trigonometric-v1"}\n',
                 "stderr",

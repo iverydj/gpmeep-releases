@@ -1,5 +1,6 @@
 #include "meep/gpu.hpp"
 #include "meep/meep-config.h"
+#include "gpu_backend_internal.hpp"
 #include "gpu_grid_index.hpp"
 #include "meep_cuda/detail/index_space.hpp"
 
@@ -25,6 +26,11 @@ void require(bool condition, const char *message) {
     std::cerr << "FAIL: " << message << '\n';
     std::exit(1);
   }
+}
+
+void require_cuda_active_hot_view(bool expected, const char *message) {
+  for (int iteration = 0; iteration < 1024; ++iteration)
+    require(meep::gpu::detail::cuda_active() == expected, message);
 }
 
 void check_structured_grid_indices() {
@@ -260,13 +266,83 @@ void check_fields_tile_base_lifecycle() {
   }
 }
 
+void check_sourcedata_manifest() {
+  meep::sourcedata data;
+  data.near_fd_comp = meep::Ez;
+  data.idx_arr = {3, 7, 11};
+  data.fc_idx = 2;
+  data.amp_arr = {{1.0, -2.0}, {3.5, 4.25}};
+  const std::string baseline = data.gpmeep_manifest();
+  require(baseline.find("\"schema\":\"gpmeep-sourcedata-v1\"") !=
+              std::string::npos,
+          "sourcedata manifest must expose its schema");
+  require(baseline.find("\"index_count\":3") != std::string::npos &&
+              baseline.find("\"amplitude_count\":2") != std::string::npos,
+          "sourcedata manifest must expose exact vector lengths");
+  require(meep::sourcedata(data).gpmeep_manifest() == baseline,
+          "identical sourcedata values must produce a stable manifest");
+
+  meep::sourcedata changed = data;
+  changed.idx_arr[1] += 1;
+  require(changed.gpmeep_manifest() != baseline,
+          "sourcedata index mutation must change the manifest");
+  changed = data;
+  changed.amp_arr[0] += std::complex<double>(0.0, 0.25);
+  require(changed.gpmeep_manifest() != baseline,
+          "sourcedata amplitude mutation must change the manifest");
+  changed = data;
+  changed.fc_idx += 1;
+  require(changed.gpmeep_manifest() != baseline,
+          "sourcedata chunk mutation must change the manifest");
+  changed = data;
+  changed.near_fd_comp = meep::Ex;
+  require(changed.gpmeep_manifest() != baseline,
+          "sourcedata component mutation must change the manifest");
+}
+
+double unit_permittivity(const meep::vec &) { return 1.0; }
+
+void check_native_source_cycle_manifest_rejection() {
+  const meep::grid_volume gv = meep::vol2d(1.0, 1.0, 4.0);
+  meep::structure structure(gv, unit_permittivity, meep::no_pml());
+  meep::fields fields(&structure);
+  meep::src_time *source = new meep::src_time();
+  fields.sources = source;
+  source->next = source;
+  bool rejected = false;
+  try {
+    (void)fields.gpmeep_state_manifest();
+  }
+  catch (const std::runtime_error &) {
+    rejected = true;
+  }
+  // Restore unique ownership before either object is destroyed.
+  source->next = nullptr;
+  fields.sources = nullptr;
+  delete source;
+  require(rejected,
+          "native fields manifest must reject an owning source-list cycle");
+}
+
 } // namespace
 
-int main() {
+int main(int argc, char **argv) {
+  // Keep the pure host validation ahead of MPI initialization.  Several
+  // cases deliberately feed malformed tile partitions to APIs whose
+  // single-process contract is to throw.  Once MPI is initialized those
+  // same diagnostics correctly become collective MPI_Abort failures, which
+  // would terminate Automake's ordinary two-rank test runner before the
+  // rejection assertions can observe them.
   check_structured_grid_indices();
+  check_sourcedata_manifest();
   check_rank_device_mapping();
   check_linear_tile_validation();
   check_fields_tile_base_lifecycle();
+
+  // The native fields/source ownership regression needs an initialized Meep
+  // MPI lifetime, including when the test is launched through RUNCODE.
+  meep::initialize mpi(argc, argv);
+  check_native_source_cycle_manifest_rejection();
   require(meep::gpu::backend_compiled() == (MEEP_HAVE_CUDA != 0),
           "public compile-time macro and runtime backend state disagree");
 
@@ -277,37 +353,40 @@ int main() {
   const bool had_original_backend = original_backend != nullptr;
   const std::string saved_backend = original_backend ? original_backend : "";
   setenv("MEEP_GPU_BACKEND", "invalid-test-value", 1);
-  bool invalid_environment_threw = false;
-  try {
-    (void)meep::gpu::requested_backend();
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    bool invalid_environment_threw = false;
+    try {
+      (void)meep::gpu::detail::cuda_active();
+    }
+    catch (const std::invalid_argument &) {
+      invalid_environment_threw = true;
+    }
+    require(invalid_environment_threw,
+            "invalid lazy MEEP_GPU_BACKEND query must remain failed "
+            "transactionally");
   }
-  catch (const std::invalid_argument &) {
-    invalid_environment_threw = true;
-  }
-  if (had_original_backend)
-    setenv("MEEP_GPU_BACKEND", saved_backend.c_str(), 1);
-  else
-    unsetenv("MEEP_GPU_BACKEND");
-  require(invalid_environment_threw, "invalid MEEP_GPU_BACKEND must fail clearly");
 
   if (!available) {
     setenv("MEEP_GPU_BACKEND", "cuda", 1);
     for (int attempt = 0; attempt < 2; ++attempt) {
       bool unavailable_environment_threw = false;
       try {
-        (void)meep::gpu::requested_backend();
+        (void)meep::gpu::detail::cuda_active();
       }
       catch (const std::runtime_error &) {
         unavailable_environment_threw = true;
       }
       require(unavailable_environment_threw,
-              "failed environment CUDA initialization must remain failed transactionally");
+              "failed lazy CUDA query must remain failed transactionally");
     }
-    if (had_original_backend)
-      setenv("MEEP_GPU_BACKEND", saved_backend.c_str(), 1);
-    else
-      unsetenv("MEEP_GPU_BACKEND");
   }
+  setenv("MEEP_GPU_BACKEND", "cpu", 1);
+  require_cuda_active_hot_view(
+      false, "successful lazy CPU configuration must publish a false hot view");
+  if (had_original_backend)
+    setenv("MEEP_GPU_BACKEND", saved_backend.c_str(), 1);
+  else
+    unsetenv("MEEP_GPU_BACKEND");
 
 #if MEEP_HAVE_CUDA
   require(meep::gpu::compiled_architectures() != "none",
@@ -343,17 +422,23 @@ int main() {
           "set_backend(cpu) must update the requested backend");
   require(meep::gpu::active_backend() == meep::gpu::backend_mode::cpu,
           "set_backend(cpu) must keep CPU active");
+  require_cuda_active_hot_view(
+      false, "set_backend(cpu) must publish a false hot view");
 
 #if MEEP_HAVE_CUDA
-  const auto require_rejected_automatic_configuration =
+  const auto require_rejected_cuda_configuration =
       [](const char *name, const char *value, const char *message) {
         const char *original = std::getenv(name);
         const bool had_original = original != nullptr;
         const std::string saved = original ? original : "";
+        const std::uint64_t generation_before =
+            meep::gpu::detail::backend_generation();
+        const std::string diagnostic_before =
+            meep::gpu::backend_diagnostic();
         setenv(name, value, 1);
         bool rejected = false;
         try {
-          meep::gpu::set_backend(meep::gpu::backend_mode::automatic);
+          meep::gpu::set_backend(meep::gpu::backend_mode::cuda);
         }
         catch (const std::exception &) {
           rejected = true;
@@ -368,18 +453,69 @@ int main() {
                     meep::gpu::backend_mode::cpu &&
                 meep::gpu::active_backend() ==
                     meep::gpu::backend_mode::cpu,
-            "failed automatic configuration must preserve the CPU transaction");
+            "failed CUDA configuration must preserve the CPU transaction");
+        require_cuda_active_hot_view(
+            false,
+            "failed CUDA configuration must republish the CPU hot view");
+        require(meep::gpu::detail::backend_generation() == generation_before &&
+                    meep::gpu::backend_diagnostic() == diagnostic_before,
+                "failed CUDA configuration must preserve generation and "
+                "diagnostic state");
       };
-  require_rejected_automatic_configuration(
+  require_rejected_cuda_configuration(
       "MEEP_GPU_DEVICE", "invalid",
-      "automatic mode must reject a malformed explicit CUDA device");
-  require_rejected_automatic_configuration(
+      "CUDA mode must reject a malformed explicit CUDA device");
+  require_rejected_cuda_configuration(
       "MEEP_GPU_DEVICE", "2147483647",
-      "automatic mode must reject an unavailable explicit CUDA device");
-  require_rejected_automatic_configuration(
+      "CUDA mode must reject an unavailable explicit CUDA device");
+  require_rejected_cuda_configuration(
       "MEEP_GPU_ALLOW_OVERSUBSCRIBE", "invalid",
-      "automatic mode must reject malformed oversubscription policy");
+      "CUDA mode must reject malformed oversubscription policy");
 #endif
+
+  int cpu_pin_owner = 0;
+  meep::gpu::detail::pin_backend_for_owner(
+      &cpu_pin_owner, meep::gpu::backend_mode::cpu);
+  const std::uint64_t cpu_pin_generation =
+      meep::gpu::detail::backend_generation();
+  const std::string cpu_pin_diagnostic = meep::gpu::backend_diagnostic();
+  bool pinned_backend_change_rejected = false;
+  try {
+    meep::gpu::set_backend(meep::gpu::backend_mode::cuda);
+  }
+  catch (const std::runtime_error &) {
+    pinned_backend_change_rejected = true;
+  }
+  require(pinned_backend_change_rejected,
+          "a CPU-pinned owner must reject a CUDA backend transition");
+#if MEEP_HAVE_CUDA
+  bool pinned_device_change_rejected = false;
+  try {
+    meep::gpu::select_device(0);
+  }
+  catch (const std::runtime_error &) {
+    pinned_device_change_rejected = true;
+  }
+  require(pinned_device_change_rejected,
+          "a CPU-pinned owner must reject a CUDA device transition");
+#endif
+  bool pinned_owner_activation_rejected = false;
+  try {
+    meep::gpu::detail::activate_backend_for_owner(
+        meep::gpu::backend_mode::cuda, "test invalid owner activation");
+  }
+  catch (const std::logic_error &) {
+    pinned_owner_activation_rejected = true;
+  }
+  require(pinned_owner_activation_rejected,
+          "an explicit CPU request must reject owner CUDA activation");
+  require_cuda_active_hot_view(
+      false, "rejected CPU-pinned transitions must preserve the CPU hot view");
+  require(meep::gpu::detail::backend_generation() == cpu_pin_generation &&
+              meep::gpu::backend_diagnostic() == cpu_pin_diagnostic,
+          "rejected CPU-pinned transitions must preserve generation and "
+          "diagnostic state");
+  meep::gpu::detail::unpin_backend_for_owner(&cpu_pin_owner);
 
   meep::gpu::reset_dispatch_statistics();
   const auto empty_statistics = meep::gpu::get_dispatch_statistics();
@@ -407,6 +543,24 @@ int main() {
               empty_polarization_statistics.cuda_update_calls == 0 &&
               empty_polarization_statistics.cuda_update_points == 0,
           "reset dispatch statistics must clear polarization counters");
+  const auto sparse_generation_before =
+      meep::gpu::get_sparse_lorentzian_statistics().reset_generation;
+  meep::gpu::reset_sparse_lorentzian_statistics();
+  const auto empty_sparse_statistics =
+      meep::gpu::get_sparse_lorentzian_statistics();
+  require(empty_sparse_statistics.opt_in_calls == 0 &&
+              empty_sparse_statistics.plan_build_attempts == 0 &&
+              empty_sparse_statistics.device_guard_scan_calls == 0 &&
+              empty_sparse_statistics.device_sparse_update_calls == 0 &&
+              empty_sparse_statistics.live_plans == 0 &&
+              empty_sparse_statistics.live_guards == 0 &&
+              empty_sparse_statistics.retained_index_bytes == 0 &&
+              empty_sparse_statistics.reset_generation ==
+                  sparse_generation_before + 1 &&
+              !empty_sparse_statistics.counter_overflow &&
+              !empty_sparse_statistics.teardown_incomplete,
+          "checked sparse Lorentzian statistics reset must preserve an empty "
+          "and monotonic public state");
   const auto empty_source_statistics = meep::gpu::get_source_statistics();
   require(empty_source_statistics.cpu_update_calls == 0 &&
               empty_source_statistics.cpu_update_points == 0 &&
@@ -438,17 +592,21 @@ int main() {
               empty_mpi_completion_statistics.waitall_executions == 0,
           "reset dispatch statistics must clear MPI completion counters");
 
-  meep::gpu::set_backend(meep::gpu::backend_mode::automatic);
-  require(meep::gpu::requested_backend() == meep::gpu::backend_mode::automatic,
-          "set_backend(auto) must update the requested backend");
-  require(meep::gpu::active_backend() == meep::gpu::backend_mode::cpu,
-          "automatic backend touched CUDA before fields workload preflight");
-  const auto lazy_runtime_statistics =
-      meep::gpu::get_runtime_touch_statistics();
-  require(lazy_runtime_statistics.availability_probes == 0 &&
-              lazy_runtime_statistics.device_enumerations == 0 &&
-              lazy_runtime_statistics.device_selections == 0,
-          "automatic backend request eagerly touched the CUDA runtime");
+  bool automatic_rejected = false;
+  try {
+    meep::gpu::set_backend(
+        static_cast<meep::gpu::backend_mode>(1));
+  }
+  catch (const std::invalid_argument &) {
+    automatic_rejected = true;
+  }
+  require(automatic_rejected,
+          "gpmeep v1.1.0 must reject automatic backend selection");
+  require(meep::gpu::requested_backend() == meep::gpu::backend_mode::cpu &&
+              meep::gpu::active_backend() == meep::gpu::backend_mode::cpu,
+          "rejected automatic selection changed the CPU transaction");
+  require_cuda_active_hot_view(
+      false, "rejected automatic selection must preserve the CPU hot view");
   require(!meep::gpu::backend_diagnostic().empty(),
           "resolved backend must expose a diagnostic");
 
@@ -456,6 +614,149 @@ int main() {
     meep::gpu::set_backend(meep::gpu::backend_mode::cuda);
     require(meep::gpu::active_backend() == meep::gpu::backend_mode::cuda,
             "required CUDA backend must become active");
+    require_cuda_active_hot_view(
+        true, "set_backend(cuda) must publish a true hot view");
+
+    const int selected_ordinal = meep::gpu::selected_device();
+    const std::string selected_identifier =
+        meep::gpu::selected_device_identifier();
+    const std::uint64_t generation_before_same_device =
+        meep::gpu::detail::backend_generation();
+    meep::gpu::select_device(selected_ordinal);
+    require_cuda_active_hot_view(
+        true, "successful CUDA device selection must republish a true hot view");
+    require(meep::gpu::selected_device() == selected_ordinal &&
+                meep::gpu::selected_device_identifier() == selected_identifier,
+            "same-device selection must preserve CUDA identity");
+    require(meep::gpu::detail::backend_generation() ==
+                generation_before_same_device + 1,
+            "successful CUDA device selection must advance generation once");
+
+    const std::uint64_t generation_before_invalid_device =
+        meep::gpu::detail::backend_generation();
+    const std::string diagnostic_before_invalid_device =
+        meep::gpu::backend_diagnostic();
+    bool invalid_device_rejected = false;
+    try {
+      meep::gpu::select_device(std::numeric_limits<int>::max());
+    }
+    catch (const std::exception &) {
+      invalid_device_rejected = true;
+    }
+    require(invalid_device_rejected,
+            "invalid CUDA device selection must fail transactionally");
+    require_cuda_active_hot_view(
+        true, "failed CUDA device selection must republish a true hot view");
+    require(meep::gpu::selected_device() == selected_ordinal &&
+                meep::gpu::selected_device_identifier() == selected_identifier,
+            "failed CUDA device selection must preserve CUDA identity");
+    require(meep::gpu::detail::backend_generation() ==
+                    generation_before_invalid_device &&
+                meep::gpu::backend_diagnostic() ==
+                    diagnostic_before_invalid_device,
+            "failed CUDA device selection must preserve generation and "
+            "diagnostic state");
+
+    const char *original_device = std::getenv("MEEP_GPU_DEVICE");
+    const bool had_original_device = original_device != nullptr;
+    const std::string saved_device = original_device ? original_device : "";
+    std::string equivalent_device = "0" + std::to_string(selected_ordinal);
+    if (had_original_device && equivalent_device == saved_device)
+      equivalent_device.insert(equivalent_device.begin(), '0');
+    setenv("MEEP_GPU_DEVICE", equivalent_device.c_str(), 1);
+    auto refresh_status =
+        meep::gpu::detail::probe_backend_for_distributed_step();
+    require(refresh_status.configuration_ok && refresh_status.cuda_active &&
+                refresh_status.cuda_required,
+            "equivalent CUDA environment refresh must succeed");
+    require_cuda_active_hot_view(
+        true, "successful CUDA environment refresh must publish a true hot view");
+
+    const std::uint64_t generation_before_invalid_refresh =
+        meep::gpu::detail::backend_generation();
+    const std::string diagnostic_before_invalid_refresh =
+        meep::gpu::backend_diagnostic();
+    setenv("MEEP_GPU_DEVICE", "invalid", 1);
+    refresh_status = meep::gpu::detail::probe_backend_for_distributed_step();
+    require(!refresh_status.configuration_ok,
+            "malformed CUDA environment refresh must fail");
+    require_cuda_active_hot_view(
+        true, "failed CUDA environment refresh must republish the old hot view");
+    require(meep::gpu::selected_device() == selected_ordinal &&
+                meep::gpu::selected_device_identifier() == selected_identifier,
+            "failed CUDA environment refresh must preserve CUDA identity");
+    require(meep::gpu::detail::backend_generation() ==
+                    generation_before_invalid_refresh &&
+                meep::gpu::backend_diagnostic() ==
+                    diagnostic_before_invalid_refresh,
+            "failed CUDA environment refresh must preserve generation and "
+            "diagnostic state");
+
+    setenv("MEEP_GPU_DEVICE", equivalent_device.c_str(), 1);
+    refresh_status = meep::gpu::detail::probe_backend_for_distributed_step();
+    require(refresh_status.configuration_ok && refresh_status.cuda_active,
+            "restoring the valid CUDA environment must recover the probe");
+    if (had_original_device)
+      setenv("MEEP_GPU_DEVICE", saved_device.c_str(), 1);
+    else
+      unsetenv("MEEP_GPU_DEVICE");
+    refresh_status = meep::gpu::detail::probe_backend_for_distributed_step();
+    require(refresh_status.configuration_ok && refresh_status.cuda_active,
+            "restoring the caller CUDA environment must refresh successfully");
+    require_cuda_active_hot_view(
+        true, "restored CUDA environment must retain a true hot view");
+
+    int cuda_pin_owner = 0;
+    meep::gpu::detail::pin_backend_for_owner(
+        &cuda_pin_owner, meep::gpu::backend_mode::cuda);
+    const std::uint64_t cuda_pin_generation =
+        meep::gpu::detail::backend_generation();
+    const std::string cuda_pin_diagnostic = meep::gpu::backend_diagnostic();
+    bool pinned_cpu_change_rejected = false;
+    try {
+      meep::gpu::set_backend(meep::gpu::backend_mode::cpu);
+    }
+    catch (const std::runtime_error &) {
+      pinned_cpu_change_rejected = true;
+    }
+    require(pinned_cpu_change_rejected,
+            "a CUDA-pinned owner must reject a CPU backend transition");
+    bool pinned_invalid_device_rejected = false;
+    try {
+      meep::gpu::select_device(std::numeric_limits<int>::max());
+    }
+    catch (const std::runtime_error &) {
+      pinned_invalid_device_rejected = true;
+    }
+    require(pinned_invalid_device_rejected,
+            "a CUDA-pinned owner must reject a device transition");
+    bool pinned_cpu_activation_rejected = false;
+    try {
+      meep::gpu::detail::activate_backend_for_owner(
+          meep::gpu::backend_mode::cpu, "test invalid owner activation");
+    }
+    catch (const std::logic_error &) {
+      pinned_cpu_activation_rejected = true;
+    }
+    require(pinned_cpu_activation_rejected,
+            "an explicit CUDA request must reject owner CPU activation");
+    require_cuda_active_hot_view(
+        true, "rejected CUDA-pinned transitions must preserve the CUDA hot view");
+    require(meep::gpu::detail::backend_generation() == cuda_pin_generation &&
+                meep::gpu::backend_diagnostic() == cuda_pin_diagnostic,
+            "rejected CUDA-pinned transitions must preserve generation and "
+            "diagnostic state");
+    meep::gpu::detail::unpin_backend_for_owner(&cuda_pin_owner);
+
+    const std::uint64_t generation_before_cuda_activation =
+        meep::gpu::detail::backend_generation();
+    meep::gpu::detail::activate_backend_for_owner(
+        meep::gpu::backend_mode::cuda, "test valid CUDA owner activation");
+    require_cuda_active_hot_view(
+        true, "valid CUDA owner activation must retain the CUDA hot view");
+    require(meep::gpu::detail::backend_generation() ==
+                generation_before_cuda_activation,
+            "diagnostic-only CUDA owner activation must not advance generation");
   }
   else {
     bool threw = false;
@@ -466,10 +767,21 @@ int main() {
       threw = true;
     }
     require(threw, "required CUDA backend must reject an unavailable runtime");
-    require(meep::gpu::requested_backend() == meep::gpu::backend_mode::automatic,
+    require(meep::gpu::requested_backend() == meep::gpu::backend_mode::cpu,
             "failed backend selection must preserve the previous configuration");
+    require_cuda_active_hot_view(
+        false, "failed unavailable CUDA selection must preserve the CPU hot view");
   }
   meep::gpu::set_backend(meep::gpu::backend_mode::cpu);
+  const std::uint64_t generation_before_cpu_activation =
+      meep::gpu::detail::backend_generation();
+  meep::gpu::detail::activate_backend_for_owner(
+      meep::gpu::backend_mode::cpu, "test valid CPU owner activation");
+  require_cuda_active_hot_view(
+      false, "final CPU activation must publish a false hot view");
+  require(meep::gpu::detail::backend_generation() ==
+              generation_before_cpu_activation,
+          "diagnostic-only CPU owner activation must not advance generation");
 
   std::cout << "PASS: Meep GPU backend API compiled=" << meep::gpu::backend_compiled()
             << " runtime_available=" << available

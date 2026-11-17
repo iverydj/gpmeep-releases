@@ -99,6 +99,9 @@ complex<double> *dft_ldos::J() const {
 }
 
 void dft_ldos::update(fields &f) {
+  // update is a public SWIG entry point as well as a Simulation step
+  // callback. Publish its accumulator mutation for exact-run receipts.
+  f.gpmeep_note_state_mutation();
   complex<double> EJ = 0.0; // integral E * J*
   complex<double> HJ = 0.0; // integral H * J* for magnetic currents
 

@@ -34,6 +34,7 @@ from common import (  # noqa: E402
     WorkloadError,
     atomic_write_json,
     atomic_write_text,
+    durable_publish_terminal,
     file_record,
 )
 
@@ -222,18 +223,30 @@ def validate_eps_result(metrics: Any) -> dict[str, Any]:
 
 def run_mpb_suite(target: pathlib.Path, stdout: BoundedText) -> dict[str, Any]:
     module_name = "gpmeep_m3_test_mpb"
+    target_parent = str(target.resolve(strict=True).parent)
     spec = importlib.util.spec_from_file_location(module_name, target)
     if spec is None or spec.loader is None:
         raise WorkloadError("could not load the MPB regression suite")
     module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
+    missing_module = object()
+    previous_module = sys.modules.get(module_name, missing_module)
+    previous_path = sys.path
+    previous_path_contents = list(previous_path)
     try:
+        previous_path.insert(0, target_parent)
+        sys.modules[module_name] = module
         with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stdout):
             spec.loader.exec_module(module)
             suite = unittest.defaultTestLoader.loadTestsFromModule(module)
             result = unittest.TextTestRunner(stream=stdout, verbosity=2).run(suite)
     finally:
-        sys.modules.pop(module_name, None)
+        if sys.path is not previous_path:
+            sys.path = previous_path
+        previous_path[:] = previous_path_contents
+        if previous_module is missing_module:
+            sys.modules.pop(module_name, None)
+        else:
+            sys.modules[module_name] = previous_module
     if (
         not result.wasSuccessful()
         or result.testsRun != 47
@@ -852,7 +865,7 @@ def main(argv: list[str] | None = None) -> int:
             expected_manifest_sha256=args.expected_producer_manifest_sha256,
             expected_receipt_id=args.expected_receipt_id,
         )
-        os.replace(output / "PENDING_COMPLETE", output / "COMPLETE")
+        durable_publish_terminal(output / "PENDING_COMPLETE", output / "COMPLETE")
         return 0
     finally:
         target_stable.close(verify=False)

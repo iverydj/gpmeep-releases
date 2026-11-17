@@ -32,11 +32,13 @@ using namespace std;
 namespace meep {
 
 void structure::set_output_directory(const char *name) {
+  gpmeep_note_state_mutation();
   outdir = name; /* fixme: make a copy */
   if (verbosity > 0) master_printf("Using output directory %s/\n", name);
 }
 
 void fields::set_output_directory(const char *name) {
+  gpmeep_note_state_mutation();
   delete[] outdir;
   outdir = new char[strlen(name) + 1];
   strcpy(outdir, name);

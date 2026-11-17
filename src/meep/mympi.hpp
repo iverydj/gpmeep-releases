@@ -19,6 +19,7 @@
 #define MEEP_MY_MPI_H
 
 #include <complex>
+#include <cstdint>
 #include <stddef.h>
 #include <stdexcept>
 
@@ -86,6 +87,14 @@ inline int am_master() { return my_rank() == 0; }
 bool with_mpi();
 
 void send(int from, int to, double *data, int size = 1);
+#ifndef SWIG
+// Gather one equal-width byte record from every active Meep rank. The caller
+// owns an output buffer of count_processors() * size bytes. This stays out of
+// the public SWIG surface; gpmeep's guarded Python binding adds its own
+// sequence, rank, length, and checksum envelope before calling it.
+std::uint64_t next_fixed_gather_sequence();
+void all_gather_fixed_bytes(const char *local, char *gathered, int size);
+#endif
 void broadcast(int from, float *data, int size);
 void broadcast(int from, double *data, int size);
 void broadcast(int from, char *data, int size);

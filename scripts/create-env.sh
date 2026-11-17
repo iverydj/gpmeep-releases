@@ -9,6 +9,7 @@ fi
 SCRIPT_DIR="$(cd "$(/usr/bin/dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 PROFILE="${1:-cpu}"
+LOCK_PROFILE="${PROFILE}"
 RECREATE="${2:-}"
 MAMBA="${REPO_ROOT}/.tools/micromamba"
 MAMBA_ROOT="${REPO_ROOT}/.micromamba"
@@ -22,14 +23,22 @@ case "${PROFILE}" in
   package-builder)
     PREFIX="${REPO_ROOT}/.envs/gpmeep-package-builder"
     ;;
+  v110-builder)
+    PREFIX="${REPO_ROOT}/.envs/gpmeep-v1.1-builder"
+    LOCK_PROFILE="package-builder"
+    ;;
+  v110-test)
+    PREFIX="${REPO_ROOT}/.envs/gpmeep-v1.1-test"
+    LOCK_PROFILE="gpmeep-runtime"
+    ;;
   *)
-    echo "usage: $0 [cpu|cuda|cuda-mpi|package-builder] [--recreate]" >&2
+    echo "usage: $0 [cpu|cuda|cuda-mpi|package-builder|v110-builder|v110-test] [--recreate]" >&2
     exit 2
     ;;
 esac
 
 if [[ -n "${RECREATE}" && "${RECREATE}" != "--recreate" ]]; then
-  echo "usage: $0 [cpu|cuda|cuda-mpi|package-builder] [--recreate]" >&2
+  echo "usage: $0 [cpu|cuda|cuda-mpi|package-builder|v110-builder|v110-test] [--recreate]" >&2
   exit 2
 fi
 
@@ -41,8 +50,8 @@ export MAMBA_ROOT_PREFIX="${MAMBA_ROOT}"
 export CONDA_PKGS_DIRS="${MAMBA_PACKAGES}"
 export PYTHONDONTWRITEBYTECODE=1
 
-LOCK="${REPO_ROOT}/environment/locks/${PROFILE}-linux-64.lock"
-YAML_SPEC="${REPO_ROOT}/environment/${PROFILE}.yml"
+LOCK="${REPO_ROOT}/environment/locks/${LOCK_PROFILE}-linux-64.lock"
+YAML_SPEC="${REPO_ROOT}/environment/${LOCK_PROFILE}.yml"
 if [[ "$(/usr/bin/uname -s)" == "Linux" && "$(/usr/bin/uname -m)" == "x86_64" && -f "${LOCK}" ]]; then
   SPEC="${LOCK}"
   EXACT_LOCK=1

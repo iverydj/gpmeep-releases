@@ -7,6 +7,7 @@ are evaluated as one batch so a strict CUDA run must exercise the resident
 """
 
 import json
+import sys
 
 from autograd import numpy as npa
 import meep as mp
@@ -25,6 +26,26 @@ DESIGN_SHAPE = (5, 5, 5)
 RUN_TIME = 18.0
 FINITE_DIFFERENCE_STEPS = (2.0e-3, 1.0e-3)
 MAX_DERIVATIVE_ERROR = 0.08
+UPSTREAM_PERFORMANCE_CAPTURE_ARGUMENT = "--gpmeep-upstream-performance-capture"
+
+
+def upstream_performance_capture_requested(argv: list[str]) -> bool:
+    """Accept only the sealed upstream timing adapter argument.
+
+    The default qualification remains fail-closed at
+    ``MAX_DERIVATIVE_ERROR``.  The separately built, unmodified upstream
+    Meep baseline is known to miss that gpmeep correctness threshold.  M3
+    timing still needs the complete forward/adjoint/finite-difference work,
+    so its runner passes one explicit argument which records every numerical
+    metric without treating that already-observed upstream discrepancy as a
+    process failure.
+    """
+
+    if not argv:
+        return False
+    if argv == [UPSTREAM_PERFORMANCE_CAPTURE_ARGUMENT]:
+        return True
+    raise RuntimeError(f"unsupported near2far validation arguments: {argv!r}")
 
 
 def near2far_box(half_width: float) -> list[mp.Near2FarRegion]:
@@ -63,7 +84,7 @@ def near2far_box(half_width: float) -> list[mp.Near2FarRegion]:
     ]
 
 
-def main() -> None:
+def main(*, capture_upstream_performance: bool = False) -> None:
     low = mp.Medium(index=1.0)
     high = mp.Medium(index=2.1)
     background_weight = 0.5
@@ -171,6 +192,7 @@ def main() -> None:
         ("dense_non_axis", dense_direction),
     )
     derivative_checks = []
+    derivative_failures = []
     for direction_index, (direction_name, direction) in enumerate(directions):
         directional_derivative = float(np.dot(gradient, direction))
         if not np.isfinite(directional_derivative) or directional_derivative == 0:
@@ -215,12 +237,7 @@ def main() -> None:
             }
             derivative_checks.append(check)
             if relative_derivative_error > MAX_DERIVATIVE_ERROR:
-                raise RuntimeError(
-                    "3D Near2Far adjoint directional derivative disagrees "
-                    f"with central difference: {check}, "
-                    f"objective={objective_value:.12g}, "
-                    f"gradient_l2={gradient_l2:.12g}"
-                )
+                derivative_failures.append(check)
 
     metrics = {
         "schema_version": 1,
@@ -251,7 +268,18 @@ def main() -> None:
         ),
     }
     print("gpmeep-near2far-3d-adjoint-metrics:" + json.dumps(metrics, sort_keys=True))
+    if derivative_failures and not capture_upstream_performance:
+        raise RuntimeError(
+            "3D Near2Far adjoint directional derivative disagrees "
+            f"with central difference: {derivative_failures[0]}, "
+            f"objective={objective_value:.12g}, "
+            f"gradient_l2={gradient_l2:.12g}"
+        )
 
 
 if __name__ == "__main__":
-    main()
+    main(
+        capture_upstream_performance=upstream_performance_capture_requested(
+            sys.argv[1:]
+        )
+    )

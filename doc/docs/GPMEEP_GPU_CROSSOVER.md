@@ -5,6 +5,117 @@ simulation. CUDA can win when each rank has enough parallel work per launch to
 repay device dispatch, synchronization, and MPI costs. A small spatial domain
 can remain launch dominated even when it executes millions of timesteps.
 
+## v1.1.0 explicit-choice contract
+
+v1.1.0 accepts only `cpu` and `cuda`. The user chooses; gpmeep never switches
+that choice, silently falls back, or selects a backend automatically. An omitted
+choice retains Meep-compatible CPU default behavior but is still evaluated by
+the recommendation guard.
+
+```python
+import meep as mp
+from meep import backend_policy
+
+mp.gpu.set_backend("cuda")
+sim = mp.Simulation(...)
+
+try:
+    sim.run(until=100)
+except backend_policy.BackendRecommendationMismatch as mismatch:
+    print(mismatch.telemetry)
+    mp.gpu.acknowledge_backend_mismatch(
+        mismatch.challenge,
+        "measured production comparison intentionally selects CUDA",
+    )
+    sim.run(until=100)
+```
+
+The first mismatch stops before initialization or field mutation. The
+acknowledgement is reason-bearing, MPI-collective, exact-workload-bound, and
+one-shot. With the default `scope="simulation"`, an unchanged retry succeeds
+and later runs of only that `Simulation` object may reuse its unchanged policy
+scope; a different simulation receives its own warning. A user who has
+separately accepted a batch of equivalent policy decisions may instead pass
+`scope="process"`:
+
+```python
+mp.gpu.acknowledge_backend_mismatch(
+    mismatch.challenge,
+    "measured batch intentionally selects CUDA",
+    scope="process",
+)
+```
+
+That explicit opt-in permits later `Simulation` objects in the same process to
+reuse only the same bounded policy class: backend pair, recommendation reason
+and confidence, policy version, MPI topology, and threshold-category facts.
+Both caches are limited to 32 entries, are reset after a fork, and always
+recheck environment and device-mapping failures. Neither mode is a persistent
+backend preference or automatic selection. MPI reuse still performs the exact
+collective workload fingerprint on every run, so rank-divergent geometry,
+sources, or callbacks cannot inherit either scope. A one-rank reuse path may
+skip that rank-consistency work. For an initialized simulation, a
+pending exact challenge additionally binds ordered per-rank native fields
+and material-structure manifests. Their monotonic mutation epochs and core
+solver state make an unchanged immediate retry possible while invalidating that
+pending challenge after stepping, reload/reset, material/source/component changes, DFT
+add/update/load/scale/removal, boundary changes, synchronization, or
+native-owner replacement. Inspect
+`mp.gpu.pending_recommendation` before acknowledgement and
+`mp.gpu.recommendation` after an accepted decision. Telemetry includes the
+selected/recommended backend, reason class and confidence, rank-local cells,
+run-length estimate, source/monitor structure, launch and transfer estimates,
+actual MPI/GPU topology, policy/evidence identifier, and acknowledgement audit.
+
+The guard covers the high-level `Simulation.run`, `run_k_point`, `solve_cw`,
+and `solve_eigfreq` entry points before they mutate solver state. Environment
+and device-mapping failures raise `BackendEnvironmentError` and are never
+acknowledgeable. Direct low-level `mp.fields` use still receives the engine's
+explicit, all-or-nothing CPU/CUDA enforcement, but it has no high-level
+`Simulation` workload metadata from which to issue a suitability recommendation.
+
+Callback fingerprints cover transitive Python-function and descriptor
+dependencies, function attributes and annotations, mutable globals, statically
+accessed module attributes, iterator/generator state, bound built-in owners,
+instance dictionaries and MRO slots, mutable class/base-class state, and
+built-in subclass state. Stable traversal reference numbers preserve aliases,
+shared subgraphs, and cycles without embedding process-local addresses.
+Simulation semantic instance state is included, and checkpoint/material input
+files are content-hashed. Adjoint-generated SWIG `sourcedata` combines its
+native content SHA-256 manifest with Python proxy attributes. A module nested
+in a container/object, opaque extension state, or any other graph that cannot
+be bound exactly is rejected before initialization; a type/name-only token is
+never accepted as authority for a mismatch acknowledgement. Native derived
+runtime caches are excluded only for the exact Meep `Simulation` type and
+never remove a same-named user field. Package-owned class exclusions require
+both the imported class identity and its original member descriptor identity;
+spoofed module names and monkey-patched Meep methods receive full transitive
+user-code canonicalization.
+
+The current conservative policy recommends CPU for small rank-local grids,
+short known runs, and monitor-heavy small workloads. A sufficiently large and
+long workload is recommended for CUDA only when every rank has a compatible,
+uniquely mapped device with adequate memory. Missing or duplicate devices and
+inconsistent distributed state are environment failures, not hardware
+crossover. A dynamic stopping predicate lowers confidence because its future
+duration is unknown. Thresholds are release-policy inputs calibrated by the
+versioned profiler/ablation evidence and must not be copied into application
+logic.
+
+| Workload shape | v1.1.0 starting choice | Expected guard advice |
+|---|---|---|
+| Large rank-local grid with sustained FDTD work | `cuda` | CUDA when device mapping and memory pass |
+| Small 1D/2D grid or short run | `cpu` | CPU hardware/workload crossover |
+| Many tiny monitors on a small grid | `cpu`, then measure | CPU hardware/workload crossover |
+| Multi-GPU with small rank-local partitions | fewer ranks/GPUs, then select explicitly | CPU for the over-decomposed topology |
+| Invalid, duplicate, or memory-inadequate GPU mapping | fix configuration before retrying | terminal `BackendEnvironmentError`; acknowledgement is forbidden |
+| Adjoint/optimization | select from end-to-end measurement | confidence reflects only characterized FDTD inputs; host work still matters |
+
+## Released v1.0.x historical automatic mode
+
+The remainder of this page documents the released v1.0.x `auto` behavior for
+existing users. It is not available in v1.1.0.
+
 The default backend remains CPU. To ask gpmeep to make its existing bounded
 owner-level choice, start with the opt-in automatic backend and verify the
 result for the workload:

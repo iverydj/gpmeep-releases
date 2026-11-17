@@ -335,6 +335,7 @@ static void src_vol_chunkloop(fields_chunk *fc, int ichunk, component c, ivec is
 
 void fields::add_srcdata(struct sourcedata cur_data, src_time *src, size_t n,
                          std::complex<double> *amp_arr, bool needs_boundary_fix) {
+  gpmeep_note_state_mutation();
   if (n == 0) {
     n = cur_data.idx_arr.size();
     assert(amp_arr == NULL);
@@ -397,6 +398,7 @@ complex<double> amp_file_func(const vec &p) {
 }
 
 void fields::register_src_time(src_time *src) {
+  gpmeep_note_state_mutation();
   sources = src->add_to(sources, &src);
   if (src->id == 0) { // doesn't have an ID yet
     size_t max_id = 0;
@@ -483,6 +485,7 @@ void fields::add_volume_source(component c, const src_time &src, const volume &w
 
 void fields::add_volume_source(component c, const src_time &src, const volume &where_,
                                complex<double> A(const vec &), complex<double> amp) {
+  gpmeep_note_state_mutation();
   volume where(where_); // make a copy to adjust size if necessary
   if (gv.dim != where.dim)
     meep::abort("incorrect source grid_volume dimensionality in add_volume_source");

@@ -48,6 +48,32 @@ namespace meep {
 
 namespace {
 
+// This first reuse path accepts only stable nondispersive coefficient storage.
+// Structural copy-on-write, allocation, nonlinear/ADE state, conductivity and
+// PML retain the original full synchronization/invalidation path.
+bool stable_phasing_coefficients(
+    const fields_chunk *chunk, std::vector<const void *> *pointers) {
+  const structure_chunk *current = chunk->s;
+  const structure_chunk *target = chunk->new_s;
+  if (!current || !target || current->refcount != 1) return false;
+  FOR_FIELD_TYPES(ft)
+    if (current->chiP[ft] || target->chiP[ft]) return false;
+  FOR_DIRECTIONS(d)
+    if (current->sig[d] || current->kap[d] || current->siginv[d] ||
+        target->sig[d] || target->kap[d] || target->siginv[d]) return false;
+  FOR_COMPONENTS(c) {
+    if (current->chi2[c] || current->chi3[c] ||
+        target->chi2[c] || target->chi3[c]) return false;
+    FOR_DIRECTIONS(d) {
+      if (current->conductivity[c][d] || target->conductivity[c][d] ||
+          current->condinv[c][d] || target->condinv[c][d]) return false;
+      if (target->chi1inv[c][d] && !current->chi1inv[c][d]) return false;
+      if (current->chi1inv[c][d]) pointers->push_back(current->chi1inv[c][d]);
+    }
+  }
+  return true;
+}
+
 void append_owner_environment_value(
     std::string *signature, const char *name) {
   const char *value = std::getenv(name);
@@ -69,8 +95,6 @@ std::string gpu_owner_environment_signature() {
   append_owner_environment_value(&signature, "MEEP_GPU_DEVICE");
   append_owner_environment_value(
       &signature, "MEEP_GPU_ALLOW_OVERSUBSCRIBE");
-  append_owner_environment_value(
-      &signature, "MEEP_GPU_AUTO_MIN_CELLS");
   append_owner_environment_value(
       &signature, "MEEP_GPU_MPI_TRANSPORT");
   append_owner_environment_value(
@@ -171,6 +195,26 @@ void boundary_callback_test_delay() {
 } // namespace
 
 #if MEEP_HAVE_CUDA
+// Scope guards preserve exception accounting without changing CUDA fencing.
+struct local_boundary_observation {
+  gpu::detail::local_boundary_path path = gpu::detail::local_boundary_path::failed;
+  ~local_boundary_observation() noexcept {
+    gpu::detail::record_local_boundary_path(path);
+  }
+};
+
+struct boundary_prepare_observation {
+  std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
+  std::uint64_t arrays = 0;
+  bool succeeded = false;
+  ~boundary_prepare_observation() noexcept {
+    const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - started).count();
+    gpu::detail::record_boundary_prepare(
+        arrays, elapsed > 0 ? static_cast<std::uint64_t>(elapsed) : 0, succeeded);
+  }
+};
+
 struct boundary_array_span {
   std::uintptr_t begin;
   std::uintptr_t end;
@@ -178,6 +222,7 @@ struct boundary_array_span {
 
 static std::vector<boundary_array_span> prepare_boundary_arrays(
     fields_chunk *chunk, gpu::detail::resident_cache *cache) {
+  boundary_prepare_observation observation;
   if (!chunk || !cache)
     throw std::invalid_argument(
         "Meep CUDA boundary chunk and cache must be non-null");
@@ -246,6 +291,7 @@ static std::vector<boundary_array_span> prepare_boundary_arrays(
     if (bytes > std::numeric_limits<std::uintptr_t>::max() - begin)
       throw std::overflow_error("Meep CUDA boundary array address overflow");
     gpu::detail::resident_ensure_span_fp32(cache, base, ntot);
+    ++observation.arrays;
     spans.push_back({begin, begin + bytes});
   }
   std::sort(
@@ -254,6 +300,7 @@ static std::vector<boundary_array_span> prepare_boundary_arrays(
          const boundary_array_span &right) {
         return left.begin < right.begin;
       });
+  observation.succeeded = true;
   return spans;
 }
 
@@ -552,26 +599,54 @@ void fields::cache_gpu_backend_preflight(
     feature_signature = gpu_step_preflight_signature(this);
   gpu_boundary_topology_registry &registry =
       gpu_boundary_topology_registry_instance();
-  std::lock_guard<std::mutex> lock(registry.mutex);
-  gpu_boundary_topology_registry::owner_state &state =
-      registry.owners[this];
-  state.validated_backend_generation = generation;
-  state.validated_backend_environment_signature =
-      environment_signature;
-  state.execution_backend = execution_backend;
-  state.execution_diagnostic = diagnostic;
-  state.cpu_feature_fallback =
-      execution_backend == gpu::backend_mode::cpu && feature_fallback;
-  if (state.cpu_feature_fallback)
-    state.feature_fallback_signature.swap(feature_signature);
-  else
-    state.feature_fallback_signature.clear();
-  if (execution_backend == gpu::backend_mode::cpu) {
-    state.validated_step_backend_generation =
-        std::numeric_limits<std::uint64_t>::max();
-    state.validated_step_signature.clear();
+  {
+    std::lock_guard<std::mutex> lock(registry.mutex);
+    gpu_boundary_topology_registry::owner_state &state =
+        registry.owners[this];
+    state.validated_backend_generation = generation;
+    state.validated_backend_environment_signature =
+        environment_signature;
+    state.execution_backend = execution_backend;
+    state.execution_diagnostic = diagnostic;
+    state.cpu_feature_fallback =
+        execution_backend == gpu::backend_mode::cpu && feature_fallback;
+    if (state.cpu_feature_fallback)
+      state.feature_fallback_signature.swap(feature_signature);
+    else
+      state.feature_fallback_signature.clear();
+    if (execution_backend == gpu::backend_mode::cpu) {
+      state.validated_step_backend_generation =
+          std::numeric_limits<std::uint64_t>::max();
+      state.validated_step_signature.clear();
+    }
+    state.step_preflight_consensus = false;
   }
-  state.step_preflight_consensus = false;
+  if (gpmeep_backend_operation_depth_ > 0) {
+    gpu::detail::pin_backend_for_owner(this, execution_backend);
+    gpmeep_backend_pinned_ = true;
+    gpmeep_cpu_backend_fast_path_ =
+        execution_backend == gpu::backend_mode::cpu;
+  }
+  else {
+    gpmeep_backend_pinned_ = false;
+    gpmeep_cpu_backend_fast_path_ = false;
+  }
+}
+
+void fields::gpmeep_begin_backend_operation() const {
+  if (gpmeep_backend_operation_depth_ ==
+      std::numeric_limits<unsigned int>::max())
+    throw std::overflow_error(
+        "gpmeep backend operation nesting depth overflow");
+  ++gpmeep_backend_operation_depth_;
+  if (gpmeep_backend_operation_depth_ > 1) return;
+  try {
+    cuda_backend_preflight();
+  }
+  catch (...) {
+    gpmeep_release_backend_pin();
+    throw;
+  }
 }
 
 bool fields::gpu_cuda_execution_selected() const {
@@ -607,21 +682,9 @@ const char *fields::gpu_execution_diagnostic() const {
                         environment_signature
                 ? std::string(
                       "fields owner backend decision was invalidated by a "
-                      "process backend, device, or automatic-policy change")
+                    "process backend or device change")
                 : owner->second.execution_diagnostic;
   return diagnostic.c_str();
-}
-
-void fields::prepare_gpu_owner_for_cpu() const {
-  for (int i = 0; i < num_chunks; ++i)
-    if (chunks[i]->is_mine()) {
-      // Publish this owner's authoritative device state transactionally
-      // before the noexcept destruction path releases its mirrors.  Never
-      // synchronize or invalidate another live fields owner's cache merely
-      // because this owner selected CPU.
-      gpu::detail::sync_resident_cache_for_owner(chunks[i]);
-      gpu::detail::destroy_resident_cache_for_owner(chunks[i]);
-    }
 }
 
 bool fields::gpu_step_preflight_is_cached() const {
@@ -774,6 +837,11 @@ void fields::step() {
     throw;
   }
 
+  // Preflight failures are state-atomic.  Once they have all succeeded this
+  // call may mutate fields, ADE state, DFT accumulators, sources, and time, so
+  // invalidate any outstanding exact-run acknowledgement before proceeding.
+  gpmeep_note_state_mutation();
+
   // however many times the fields have been synched, we want to restore now
   int save_synchronized_magnetic_fields = synchronized_magnetic_fields;
   if (synchronized_magnetic_fields) {
@@ -783,10 +851,48 @@ void fields::step() {
 
   am_now_working_on(Stepping);
 
-  // Structure phasing/material replacement mutates host-side coefficient
-  // arrays. Preserve device-authoritative fields, then invalidate all mirrors
-  // before those coefficients can be reused by a later CUDA kernel.
-  if (gpu::detail::cuda_active() && (changed_materials || is_phasing()))
+  const bool persistent_cuda_step =
+      gpu::detail::cuda_active() && !fluxes;
+  std::vector<std::unique_ptr<gpu::detail::resident_curl_session> >
+      resident_step_sessions;
+  const auto begin_step_sessions = [&]() {
+    resident_step_sessions.reserve(num_chunks);
+    for (int i = 0; i < num_chunks; ++i)
+      if (chunks[i]->is_mine())
+        resident_step_sessions.emplace_back(
+            new gpu::detail::resident_curl_session(chunks[i], true));
+  };
+
+  bool reuse_phasing_mirrors = false;
+  if (gpu::detail::cuda_active() && is_phasing()) {
+    const bool disabled =
+        std::getenv("MEEP_GPU_DISABLE_PHASE_MATERIAL_MIRROR_REUSE") != nullptr;
+    reuse_phasing_mirrors = !disabled && persistent_cuda_step &&
+                            !changed_materials && count_processors() == 1;
+    std::vector<std::vector<const void *> > coefficient_pointers;
+    if (reuse_phasing_mirrors) coefficient_pointers.resize(num_chunks);
+    for (int i = 0; i < num_chunks && reuse_phasing_mirrors; ++i)
+      if (chunks[i]->is_mine())
+        reuse_phasing_mirrors =
+            stable_phasing_coefficients(chunks[i], &coefficient_pointers[i]);
+    if (reuse_phasing_mirrors) {
+      // Publish host coefficient writes before any resident phase starts.
+      // Fields remain device-authoritative; only these clean mirrors refresh.
+      for (int i = 0; i < num_chunks; ++i)
+        if (chunks[i]->is_mine())
+          gpu::detail::prepare_resident_host_writes_for_owner(
+              chunks[i], coefficient_pointers[i].data(), coefficient_pointers[i].size());
+      // Include phase_material's H/E updates and boundary exchanges in the
+      // same session. An inner finish(true) must not flush resident fields.
+      begin_step_sessions();
+    }
+    gpu::detail::record_material_phasing(reuse_phasing_mirrors, disabled);
+  }
+
+  // Arbitrary material replacement and unsupported phasing retain the full
+  // synchronization/invalidation path, including the first phasing step.
+  if (gpu::detail::cuda_active() && (changed_materials || is_phasing()) &&
+      !reuse_phasing_mirrors)
     for (int i = 0; i < num_chunks; ++i)
       if (chunks[i]->is_mine()) {
         gpu::detail::sync_resident_cache_for_owner(chunks[i]);
@@ -812,17 +918,8 @@ void fields::step() {
   for (int i = 0; i < num_chunks; i++)
     chunks[i]->s->update_condinv();
 
-  const bool persistent_cuda_step =
-      gpu::detail::cuda_active() && !fluxes;
-  std::vector<std::unique_ptr<gpu::detail::resident_curl_session> >
-      resident_step_sessions;
-  if (persistent_cuda_step) {
-    resident_step_sessions.reserve(num_chunks);
-    for (int i = 0; i < num_chunks; ++i)
-      if (chunks[i]->is_mine())
-        resident_step_sessions.emplace_back(
-            new gpu::detail::resident_curl_session(chunks[i], true));
-  }
+  if (persistent_cuda_step && !reuse_phasing_mirrors)
+    begin_step_sessions();
 
   calc_sources(time()); // for B sources
   {
@@ -842,12 +939,12 @@ void fields::step() {
   }
   {
     auto step_timer = with_timing_scope(BoundarySteppingWH);
-    step_boundaries(WH_stuff);
+    (void)step_boundaries_impl(WH_stuff, boundary_eh_overlap::none);
   }
   update_pols(H_stuff);
   {
     auto step_timer = with_timing_scope(BoundarySteppingPH);
-    step_boundaries(PH_stuff);
+    (void)step_boundaries_impl(PH_stuff, boundary_eh_overlap::none);
   }
   bool d_curl_completed = false;
   {
@@ -856,7 +953,7 @@ void fields::step() {
         step_boundaries_impl(H_stuff, boundary_eh_overlap::D_curl);
   }
 
-  if (fluxes) fluxes->update_half();
+  if (fluxes) fluxes->update_half_impl();
 
   calc_sources(time() + 0.5 * dt); // for D sources
   if (!d_curl_completed) {
@@ -876,19 +973,19 @@ void fields::step() {
   }
   {
     auto step_timer = with_timing_scope(BoundarySteppingWE);
-    step_boundaries(WE_stuff);
+    (void)step_boundaries_impl(WE_stuff, boundary_eh_overlap::none);
   }
   update_pols(E_stuff);
   {
     auto step_timer = with_timing_scope(BoundarySteppingPE);
-    step_boundaries(PE_stuff);
+    (void)step_boundaries_impl(PE_stuff, boundary_eh_overlap::none);
   }
   {
     auto step_timer = with_timing_scope(BoundarySteppingE);
-    step_boundaries(E_stuff);
+    (void)step_boundaries_impl(E_stuff, boundary_eh_overlap::none);
   }
 
-  if (fluxes) fluxes->update();
+  if (fluxes) fluxes->update_impl();
   t += 1;
   update_dfts();
 
@@ -964,10 +1061,10 @@ void fields::phase_material() {
     if (changed_mpi) {
       calc_sources(time() + 0.5 * dt); // for integrated H sources
       update_eh(H_stuff);              // ensure H = 1/mu * B
-      step_boundaries(H_stuff);
+      (void)step_boundaries_impl(H_stuff, boundary_eh_overlap::none);
       calc_sources(time() + dt); // for integrated E sources
       update_eh(E_stuff);        // ensure E = 1/eps * D
-      step_boundaries(E_stuff);
+      (void)step_boundaries_impl(E_stuff, boundary_eh_overlap::none);
     }
   }
 }
@@ -980,6 +1077,12 @@ void fields_chunk::phase_material(int phasein_time) {
 }
 
 void fields::process_incoming_chunk_data(field_type ft, const chunk_pair &comm_pair) {
+  gpmeep_note_state_mutation();
+  process_incoming_chunk_data_impl(ft, comm_pair);
+}
+
+void fields::process_incoming_chunk_data_impl(field_type ft,
+                                              const chunk_pair &comm_pair) {
   am_now_working_on(Boundaries);
   int this_chunk_idx = comm_pair.second;
   const int pair_idx = chunk_pair_to_index(comm_pair);
@@ -1065,6 +1168,10 @@ bool fields::cuda_whole_update_eh_overlap_eligible(
 }
 
 void fields::step_boundaries(field_type ft) {
+  // The public low-level API can be invoked independently of step(). Internal
+  // timestep paths call step_boundaries_impl after step() has already advanced
+  // the epoch, avoiding an increment for every boundary phase.
+  gpmeep_note_state_mutation();
   (void)step_boundaries_impl(ft, boundary_eh_overlap::none);
 }
 
@@ -1133,8 +1240,9 @@ bool fields::step_boundaries_impl(field_type ft,
   local_cuda_eligible = local_cuda_eligible && have_local_chunk;
 
   std::vector<std::unique_ptr<gpu::detail::resident_curl_session> >
-      sessions(static_cast<std::size_t>(num_chunks));
+      sessions;
   if (local_cuda_eligible) {
+    sessions.resize(static_cast<std::size_t>(num_chunks));
     try {
       for (int i = 0; i < num_chunks; ++i)
         if (chunks[i]->is_mine())
@@ -1167,44 +1275,51 @@ bool fields::step_boundaries_impl(field_type ft,
       // Re-launch those resident plans directly instead of rebuilding and
       // validating hundreds of thousands of host pointer operations on every
       // time step.
-      if (count_processors() == 1 &&
-          std::getenv("MEEP_GPU_DISABLE_BOUNDARY_PLAN_REPLAY") == nullptr &&
-          gpu::detail::resident_boundary_plan_ready(
-              this, zero_plan_token) &&
-          gpu::detail::resident_boundary_plan_ready(
-              this, copy_plan_token)) {
-        // Re-establish every boundary-capable mirror before replay. Other
-        // field phases can create a new mirror or make a clean host array
-        // authoritative without changing the connected-boundary topology.
-        // Skipping this preparation can therefore replay valid descriptors
-        // against stale device contents.
-        for (int i = 0; i < num_chunks; ++i)
-          if (chunks[i]->is_mine())
-            (void)prepare_boundary_arrays(
-                chunks[i],
-                sessions[static_cast<std::size_t>(i)]->cache());
+      if (count_processors() == 1) {
+        local_boundary_observation observation;
+        if (std::getenv("MEEP_GPU_DISABLE_BOUNDARY_PLAN_REPLAY") != nullptr)
+          observation.path = gpu::detail::local_boundary_path::disabled;
+        else if (!gpu::detail::resident_boundary_plan_ready(this, zero_plan_token) ||
+                 !gpu::detail::resident_boundary_plan_ready(this, copy_plan_token))
+          observation.path = gpu::detail::local_boundary_path::unready;
+        else {
+          // Re-establish every boundary-capable mirror before replay. Other
+          // field phases can create a new mirror or make a clean host array
+          // authoritative without changing the connected-boundary topology.
+          // Skipping this preparation can therefore replay valid descriptors
+          // against stale device contents.
+          for (int i = 0; i < num_chunks; ++i)
+            if (chunks[i]->is_mine())
+              (void)prepare_boundary_arrays(
+                  chunks[i],
+                  sessions[static_cast<std::size_t>(i)]->cache());
 
-        // Preparation can allocate a mirror and invalidate the descriptor
-        // addresses. In that case fall through to the full rebuild below.
-        if (gpu::detail::resident_boundary_plan_ready(
-                this, zero_plan_token) &&
-            gpu::detail::resident_boundary_plan_ready(
-                this, copy_plan_token)) {
-          boundary_launch_started =
-              gpu::detail::resident_launch_boundary_plan(
-                  this, zero_plan_token);
-          boundary_launch_started =
-              gpu::detail::resident_launch_boundary_plan(
-                  this, copy_plan_token) ||
-              boundary_launch_started;
-          for (auto &session : sessions)
-            if (session) session->finish();
-          if (!overlap_classified) {
-            record_overlap_no_remote();
-            overlap_classified = true;
+          // Preparation can allocate a mirror and invalidate the descriptor
+          // addresses. In that case fall through to the full rebuild below.
+          if (gpu::detail::resident_boundary_plan_ready(
+                  this, zero_plan_token) &&
+              gpu::detail::resident_boundary_plan_ready(
+                  this, copy_plan_token)) {
+            boundary_launch_started =
+                gpu::detail::resident_launch_boundary_plan(
+                    this, zero_plan_token);
+            boundary_launch_started =
+                gpu::detail::resident_launch_boundary_plan(
+                    this, copy_plan_token) ||
+                boundary_launch_started;
+            for (auto &session : sessions)
+              if (session) session->finish();
+            if (!overlap_classified) {
+              record_overlap_no_remote();
+              overlap_classified = true;
+            }
+            finished_working();
+            observation.path = boundary_launch_started
+                ? gpu::detail::local_boundary_path::replay_work
+                : gpu::detail::local_boundary_path::replay_empty;
+            return false;
           }
-          finished_working();
-          return false;
+          observation.path = gpu::detail::local_boundary_path::prepare_invalidated;
         }
       }
 
@@ -1591,6 +1706,9 @@ bool fields::step_boundaries_impl(field_type ft,
         record_overlap_cold_topology();
         overlap_classified = true;
       }
+
+      if (count_processors() == 1)
+        gpu::detail::record_local_boundary_rebuild_attempt();
 
       std::vector<gpu::detail::boundary_operation_fp32> zero_operations;
       std::vector<gpu::detail::boundary_operation_fp32> copy_operations;
@@ -2199,7 +2317,7 @@ bool fields::step_boundaries_impl(field_type ft,
       if (chunks[op.other_chunk_idx]->is_mine()) { continue; }
       chunk_pair comm_pair{op.other_chunk_idx, op.my_chunk_idx};
       comms_manager::receive_callback cb = [this, ft, comm_pair]() {
-        process_incoming_chunk_data(ft, comm_pair);
+        process_incoming_chunk_data_impl(ft, comm_pair);
       };
       manager->receive_real_async(comm_blocks[ft][op.pair_idx], static_cast<int>(op.transfer_size),
                                   op.other_proc_id, op.tag, cb);
@@ -2238,7 +2356,8 @@ bool fields::step_boundaries_impl(field_type ft,
     // Process local transfers, which do not depend on a communication mechanism across nodes.
     for (const comms_operation &op : sequence.receive_ops) {
       if (chunks[op.other_chunk_idx]->is_mine()) {
-        process_incoming_chunk_data(ft, {op.other_chunk_idx, op.my_chunk_idx});
+        process_incoming_chunk_data_impl(
+            ft, {op.other_chunk_idx, op.my_chunk_idx});
       }
     }
     finished_working();
@@ -2275,8 +2394,8 @@ void fields_chunk::step_source(field_type ft, bool including_integrated) {
   if (doing_solve_cw && !including_integrated) return;
   const bool cuda_phase_eligible =
       gpu::detail::cuda_active() && sizeof(realnum) == sizeof(float);
-  gpu::detail::resident_curl_session cuda_session(this,
-                                                   cuda_phase_eligible);
+  gpu::detail::conditional_resident_curl_session cuda_session(
+      this, cuda_phase_eligible);
   for (const src_vol &sv : sources[ft]) {
     component c = direction_component(first_field_component(ft), component_direction(sv.c));
     const realnum *cndinv = s->condinv[c][component_direction(sv.c)];

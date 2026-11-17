@@ -13,6 +13,9 @@ from unittest import mock
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "scripts" / "tests"))
+from backend_guard_test_fixture import evidence as guard_evidence  # noqa: E402
+
 SOURCE = ROOT / "scripts" / "python-validation" / "run_m3_auto_example_case.py"
 SPEC = importlib.util.spec_from_file_location("gpmeep_m3_auto_example_case", SOURCE)
 assert SPEC is not None and SPEC.loader is not None
@@ -21,7 +24,7 @@ sys.modules[SPEC.name] = CASE
 SPEC.loader.exec_module(CASE)
 
 
-GPU = "GPU-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+GPU = "GPU-00000000-0000-0000-0000-000000009001"
 
 
 def run_record(
@@ -30,6 +33,15 @@ def run_record(
     requested_backend: str = "auto",
 ) -> dict[str, object]:
     other = "cuda" if backend == "cpu" else "cpu"
+    explicit_guard = None
+    if requested_backend in {"cpu", "cuda"}:
+        explicit_guard = guard_evidence(
+            CASE.backend_guard_contract,
+            backend,
+            backend,
+            reason="M3 explicit backend fixture reason",
+            execution_wall_seconds=wall_seconds,
+        )
     return {
         "timestep": 10,
         "timestep_delta": 10,
@@ -47,10 +59,79 @@ def run_record(
         },
         "run_phase_calls": {backend: 2, other: 0},
         "measurement_phase_calls": {"cpu": 0, "cuda": 0},
+        "statistics_delta": {"dispatch": {"cpu_step_calls": 2}},
+        "field_timing_delta": {
+            "time_stepping": {
+                "per_rank_seconds": [wall_seconds],
+                "maximum_seconds": wall_seconds,
+                "mean_seconds": wall_seconds,
+            }
+        },
+        "backend_guard": {
+            "attempts": 1,
+            "acknowledgements": 0,
+            "warning_wall_seconds": 0.0,
+            "warning_telemetry": None,
+            "final_telemetry": None,
+        },
+        "explicit_backend_guard": explicit_guard,
     }
 
 
 class M3AutoExampleCaseTests(unittest.TestCase):
+    def test_lane_environment_is_output_bound_and_ambient_independent(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            output = pathlib.Path(raw).resolve() / "evidence"
+            (output / "lane" / "work").mkdir(parents=True)
+            python = pathlib.Path(sys.executable).resolve(strict=True)
+            paths = {
+                "python": python,
+                "build_python": output / "build-python",
+            }
+            lane = CASE.mpi_example.Lane(CASE.LANE_NAME, "cpu", 1, ())
+            with mock.patch.object(
+                CASE.mpi_example,
+                "clean_environment",
+                return_value={
+                    "MEEP_GPU_BACKEND": "cpu",
+                    "GPMEEP_VALIDATION_STRICT_CUDA": "1",
+                },
+            ) as cleaner, mock.patch.object(
+                CASE.validation,
+                "isolated_process_environment",
+                side_effect=AssertionError("verifier ambient must not be sampled"),
+            ):
+                first = CASE.lane_environment(output, lane, paths, {}, "nonce")
+                with mock.patch.dict(
+                    CASE.os.environ,
+                    {
+                        "LANG": "hostile",
+                        "LC_ALL": "hostile",
+                        "TMPDIR": "/hostile",
+                        "TERM": "hostile",
+                    },
+                    clear=True,
+                ):
+                    second = CASE.lane_environment(
+                        output, lane, paths, {}, "nonce"
+                    )
+            expected = {
+                "PATH": f"{python.parent}:/usr/bin:/bin",
+                "TMPDIR": str(output / "lane" / "work"),
+                "LC_ALL": "C",
+                "LANG": "C",
+            }
+            self.assertEqual(
+                cleaner.call_args_list[0].kwargs["producer_safe_ambient"], expected
+            )
+            self.assertEqual(
+                cleaner.call_args_list[1].kwargs["producer_safe_ambient"], expected
+            )
+            self.assertEqual(first, second)
+            self.assertEqual(first["MEEP_GPU_BACKEND"], "auto")
+            self.assertNotIn("GPMEEP_VALIDATION_STRICT_CUDA", first)
+            self.assertEqual(lane.name, CASE.LANE_NAME)
+
     def test_v1_auto_routes_all_have_sealed_policies(self) -> None:
         coverage = json.loads(
             (
@@ -176,6 +257,66 @@ class M3AutoExampleCaseTests(unittest.TestCase):
             self.assertEqual(CASE.audit_runs(stdout, "cpu")[0]["timestep"], 10)
             with self.assertRaisesRegex(Exception, "requested backend"):
                 CASE.audit_runs(stdout, "bogus")
+
+            legacy = run_record("cuda", 0.25, "cuda")
+            legacy["explicit_backend_guard"] = None
+            stdout.write_text(
+                CASE.oracle.AUDIT_PREFIX
+                + json.dumps({"runs": [legacy]})
+                + "\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                CASE.audit_runs(
+                    stdout, "cuda", frozen_v103_baseline=True
+                )[0]["active_backend"],
+                "cuda",
+            )
+            legacy["run_phase_calls"] = {"cpu": 1, "cuda": 2}
+            stdout.write_text(
+                CASE.oracle.AUDIT_PREFIX
+                + json.dumps({"runs": [legacy]})
+                + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(Exception, "strict backend"):
+                CASE.audit_runs(
+                    stdout, "cuda", frozen_v103_baseline=True
+                )
+
+            upstream = run_record("cpu", 0.25, "cpu")
+            upstream.update(
+                {
+                    "execution_diagnostic": "upstream-meep-cpu-baseline",
+                    "runtime_counters": {},
+                    "run_phase_calls": {"cpu": 0, "cuda": 0},
+                    "statistics_delta": {},
+                    "explicit_backend_guard": None,
+                }
+            )
+            stdout.write_text(
+                CASE.oracle.AUDIT_PREFIX
+                + json.dumps({"runs": [upstream]})
+                + "\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                CASE.audit_runs(
+                    stdout, "cpu", upstream_cpu_baseline=True
+                )[0]["active_backend"],
+                "cpu",
+            )
+            upstream["runtime_counters"] = {"unexpected": 1}
+            stdout.write_text(
+                CASE.oracle.AUDIT_PREFIX
+                + json.dumps({"runs": [upstream]})
+                + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(Exception, "runtime audit"):
+                CASE.audit_runs(
+                    stdout, "cpu", upstream_cpu_baseline=True
+                )
 
     def test_rank_bundle_enforces_automatic_cpu_runtime_neutrality(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

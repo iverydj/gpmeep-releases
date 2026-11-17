@@ -2133,6 +2133,10 @@ class Simulation:
         return stats
 
     def _init_structure(self, k=False):
+        # File-backed epsilon/structure/fields inputs can be materialized by
+        # public initialization and monitor APIs before Simulation.run. Seal
+        # their exact bytes collectively before the first native mutation.
+        mp.gpu._seal_simulation_file_inputs(self)
         if verbosity.meep > 0:
             print("-" * 11)
             print("Initializing structure...")
@@ -2259,6 +2263,9 @@ class Simulation:
             self.load_structure(
                 self.load_structure_file, self.load_single_parallel_file
             )
+        mp.gpu._bind_simulation_file_input_owners(
+            self, ("epsilon_input_file", "load_structure_file")
+        )
 
     def _is_outer_boundary(self, vol: Volume, direction: int, side: int):
 
@@ -2647,6 +2654,9 @@ class Simulation:
 
         if self.load_fields_file:
             self.load_fields(self.load_fields_file, self.load_single_parallel_file)
+        mp.gpu._bind_simulation_file_input_owners(
+            self, ("load_fields_file",)
+        )
 
     def using_real_fields(self):
         cond1 = self.is_cylindrical and self.m != 0
@@ -2668,7 +2678,12 @@ class Simulation:
         """
         if self.fields is None:
             self.init_sim()
-        self.fields.initialize_field(cmpnt, amp_func)
+        operation_fields = self.fields
+        operation_fields.gpmeep_begin_backend_operation()
+        try:
+            operation_fields.initialize_field(cmpnt, amp_func)
+        finally:
+            self._release_backend_pin_after_operation(operation_fields)
 
     def require_dimensions(self):
         if self.structure is None:
@@ -3052,12 +3067,24 @@ class Simulation:
 
         if not components or fmin > fmax:
             raise ValueError("Running with k_points requires a 'GaussianSource' source")
-
-        self.change_k_point(k)
-        self.restart_fields()
+        if t is None:
+            raise ValueError("run_k_point requires an after-sources duration")
 
         h = Harminv(components[0], pts[0], 0.5 * (fmin + fmax), fmax - fmin)
-        self.run(after_sources(h), until_after_sources=t)
+        step_function = after_sources(h)
+        # run_k_point historically changed k and zeroed the fields before
+        # entering Simulation.run. Guard the target operation first so a
+        # recommendation mismatch cannot mutate either state.
+        mp.gpu._guard_run(
+            self,
+            None,
+            t,
+            (step_function,),
+            {"entrypoint": "run_k_point", "target_k": k},
+        )
+        self.change_k_point(k)
+        self.restart_fields()
+        self._run_after_backend_guard((step_function,), None, t)
 
         return h
 
@@ -3981,8 +4008,25 @@ class Simulation:
     def solve_cw(self, tol=1e-8, maxiters=10000, L=2):
         if self.fields is None:
             raise RuntimeError("Fields must be initialized before using solve_cw")
-        self._evaluate_dft_objects()
-        return self.fields.solve_cw(tol, maxiters, L)
+        mp.gpu._guard_run(
+            self,
+            None,
+            None,
+            (),
+            {
+                "entrypoint": "solve_cw",
+                "tol": tol,
+                "maxiters": maxiters,
+                "L": L,
+            },
+        )
+        operation_fields = self.fields
+        operation_fields.gpmeep_begin_backend_operation()
+        try:
+            self._evaluate_dft_objects()
+            return operation_fields.solve_cw(tol, maxiters, L)
+        finally:
+            self._release_backend_pin_after_operation(operation_fields)
 
     def solve_eigfreq(
         self, tol=1e-7, maxiters=100, guessfreq=None, cwtol=None, cwmaxiters=10000, L=10
@@ -3993,22 +4037,42 @@ class Simulation:
             cwtol = (
                 tol * 1e-3
             )  # solve CW problems much more accurately than eigenvalue tolerance
-        self._evaluate_dft_objects()
-        eigfreq = np.array(0, dtype=np.complex128)
-        if guessfreq is None:
-            converged = self.fields.solve_cw(
-                cwtol, cwmaxiters, L, eigfreq, tol, maxiters
-            )
-        else:
-            converged = self.fields.solve_cw(
-                cwtol, cwmaxiters, guessfreq, L, eigfreq, tol, maxiters
-            )
-        if not converged:
-            raise RuntimeError(
-                "solve_eigfreq failed because a shift-and-invert CW solve "
-                "did not converge"
-            )
-        return eigfreq.item()
+        mp.gpu._guard_run(
+            self,
+            None,
+            None,
+            (),
+            {
+                "entrypoint": "solve_eigfreq",
+                "tol": tol,
+                "maxiters": maxiters,
+                "guessfreq": guessfreq,
+                "cwtol": cwtol,
+                "cwmaxiters": cwmaxiters,
+                "L": L,
+            },
+        )
+        operation_fields = self.fields
+        operation_fields.gpmeep_begin_backend_operation()
+        try:
+            self._evaluate_dft_objects()
+            eigfreq = np.array(0, dtype=np.complex128)
+            if guessfreq is None:
+                converged = operation_fields.solve_cw(
+                    cwtol, cwmaxiters, L, eigfreq, tol, maxiters
+                )
+            else:
+                converged = operation_fields.solve_cw(
+                    cwtol, cwmaxiters, guessfreq, L, eigfreq, tol, maxiters
+                )
+            if not converged:
+                raise RuntimeError(
+                    "solve_eigfreq failed because a shift-and-invert CW solve "
+                    "did not converge"
+                )
+            return eigfreq.item()
+        finally:
+            self._release_backend_pin_after_operation(operation_fields)
 
     def _add_fluxish_stuff(
         self, add_dft_stuff, freq, stufflist, decimation_factor, *args
@@ -4738,6 +4802,7 @@ class Simulation:
         attributes have been modified internally, they are reset to their original
         values passed in at instantiation.
         """
+        mp.gpu._clear_simulation_file_input_seals(self)
         self.fields = None
         self.structure = None
         self.geps = None
@@ -4769,6 +4834,36 @@ class Simulation:
 
         self.dft_objects = []
 
+    def _release_backend_pin_after_operation(self, operation_fields):
+        """Release an internal native backend-consistency operation scope."""
+        operation_fields.gpmeep_release_backend_pin()
+
+    def _run_after_backend_guard(self, step_funcs, until, until_after_sources):
+        """Execute a run whose exact workload already passed the backend guard."""
+        operation_fields = None
+        try:
+            if self.fields is None:
+                self.init_sim()
+            operation_fields = self.fields
+            operation_fields.gpmeep_begin_backend_operation()
+
+            self._evaluate_dft_objects()
+            self._check_material_frequencies()
+
+            if until_after_sources is not None:
+                self._run_sources_until(until_after_sources, step_funcs)
+            else:
+                self._run_until(until, step_funcs)
+        finally:
+            # A native fields owner pins the explicit process backend after
+            # its first distributed preflight. Keep that invariant for the
+            # complete run (including user callbacks), then release it here.
+            # Simulation wrappers intentionally retain fields between runs,
+            # so relying on fields destruction would make a later explicit
+            # CPU/CUDA choice impossible from ordinary Python code.
+            if operation_fields is not None:
+                self._release_backend_pin_after_operation(operation_fields)
+
     def run(self, *step_funcs, **kwargs):
         """
         `run(step_functions..., until=condition/time)`  ##sig-keep
@@ -4793,21 +4888,24 @@ class Simulation:
         until = kwargs.pop("until", None)
         until_after_sources = kwargs.pop("until_after_sources", None)
 
-        if self.fields is None:
-            self.init_sim()
-
-        self._evaluate_dft_objects()
-        self._check_material_frequencies()
-
         if kwargs:
             raise ValueError(f"Unrecognized keyword arguments: {kwargs.keys()}")
-
-        if until_after_sources is not None:
-            self._run_sources_until(until_after_sources, step_funcs)
-        elif until is not None:
-            self._run_until(until, step_funcs)
-        else:
+        if until_after_sources is None and until is None:
             raise ValueError("Invalid run configuration")
+
+        # gpmeep v1.1.0 never chooses a backend.  It fingerprints and guards
+        # the user's explicit CPU/CUDA choice before init_sim, DFT creation,
+        # or the first field mutation. A mismatched recommendation requires a
+        # reason-bearing acknowledgement for the exact first run. Later runs
+        # may reuse its bounded Simulation-owned policy scope when unchanged.
+        mp.gpu._guard_run(
+            self,
+            until,
+            until_after_sources,
+            step_funcs,
+            {"entrypoint": "run"},
+        )
+        self._run_after_backend_guard(step_funcs, until, until_after_sources)
 
     def print_times(self):
         """
@@ -5294,7 +5392,11 @@ def _eval_step_func(sim, func, todo):
     num_args = get_num_args(func)
 
     if num_args != 1 and num_args != 2:
-        raise ValueError(f"Step function '{func.__name__}'' requires 1 or 2 arguments")
+        raise ValueError(
+            "Step function '{}'' requires 1 or 2 arguments".format(
+                func.__name__
+            )
+        )
     elif num_args == 1:
         if todo == "step":
             func(sim)
@@ -5875,9 +5977,9 @@ def display_progress(t0, t, dt):
 def data_to_str(d):
     if type(d) is complex:
         sign = "+" if d.imag >= 0 else ""
-        return f"{d.real}{sign}{d.imag}i"
+        return "{}{}{}i".format(d.real, sign, d.imag)
     else:
-        return str(d)
+        return "{}".format(d)
 
 
 def display_run_data(sim, data_name, data):

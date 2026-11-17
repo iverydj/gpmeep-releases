@@ -62,6 +62,7 @@ public:
   virtual void set_frequency(std::complex<double> f) { freq = f; }
   virtual double get_fwidth() const { return fwidth; };
   virtual void set_fwidth(double fw) { fwidth = fw; }
+  virtual void *gpmeep_external_state() const { return func; }
 
 private:
   PyObject *func;

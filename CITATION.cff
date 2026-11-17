@@ -4,8 +4,7 @@ message: >-
   Meep paper listed in the references.
 title: "gpmeep: CUDA-accelerated, multi-GPU Meep distribution"
 type: software
-version: 1.0.3
-date-released: 2026-09-03
+version: 1.1.0-dev
 authors:
   - family-names: Yi
     given-names: Dong-Joon

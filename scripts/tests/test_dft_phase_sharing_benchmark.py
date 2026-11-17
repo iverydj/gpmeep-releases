@@ -108,6 +108,7 @@ def sample_output(*, workload: str, condition: str) -> str:
             prefixed(BENCHMARK.GRAPH_PREFIX, graph),
             prefixed(BENCHMARK.EAGER_PREFIX, eager),
             prefixed(BENCHMARK.PINGPONG_PREFIX, pingpong),
+            prefixed(BENCHMARK.STRUCTURED_CURL_GRAPH_PREFIX, {}),
             prefixed(BENCHMARK.DFT_PREFIX, dft),
             prefixed(BENCHMARK.DFT_MULTI_PREFIX, dft_multi),
             prefixed(BENCHMARK.BENCHMARK_PREFIX, benchmark),
@@ -361,6 +362,7 @@ class DftRecordTests(unittest.TestCase):
         for marker in (
             'gpmeep-initial-condition-v2:{"profile":"trigonometric-v1"}\n',
             'gpmeep-multi-benchmark-v3:{"schema_version":3}\n',
+            'gpmeep-structured-curl-graph-v2:{}\n',
         ):
             with self.subTest(marker=marker):
                 with self.assertRaisesRegex(RuntimeError, "mixed-version"):

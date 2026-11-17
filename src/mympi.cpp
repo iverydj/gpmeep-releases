@@ -21,6 +21,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <limits>
 #include <map>
 #include <memory>
 #include <stdarg.h>
@@ -91,6 +92,9 @@ std::atomic<std::uint64_t> eager_cuda_receive_start_calls(0);
 std::atomic<std::uint64_t> eager_cuda_send_start_calls(0);
 std::atomic<std::uint64_t> eager_cuda_receive_requests(0);
 std::atomic<std::uint64_t> eager_cuda_send_requests(0);
+std::uint64_t fixed_gather_sequence = 0;
+
+void reset_fixed_gather_sequence() { fixed_gather_sequence = 0; }
 
 #ifdef HAVE_MPI
 MPI_Comm mycomm = MPI_COMM_WORLD;
@@ -1025,6 +1029,31 @@ void send(int from, int to, double *data, int size) {
 #endif
 }
 
+std::uint64_t next_fixed_gather_sequence() {
+  if (fixed_gather_sequence == std::numeric_limits<std::uint64_t>::max())
+    throw std::overflow_error("fixed-byte allgather sequence overflowed");
+  return ++fixed_gather_sequence;
+}
+
+void all_gather_fixed_bytes(const char *local, char *gathered, int size) {
+  if (!local || !gathered)
+    throw std::invalid_argument("fixed-byte allgather buffer is null");
+  if (size < 0)
+    throw std::invalid_argument("fixed-byte allgather size is negative");
+  if (size == 0) return;
+#ifdef HAVE_MPI
+  if (count_processors() == 1) {
+    std::memcpy(gathered, local, static_cast<std::size_t>(size));
+    return;
+  }
+  if (MPI_Allgather(local, size, MPI_BYTE, gathered, size, MPI_BYTE, mycomm) !=
+      MPI_SUCCESS)
+    throw std::runtime_error("fixed-byte MPI_Allgather failed");
+#else
+  std::memcpy(gathered, local, static_cast<std::size_t>(size));
+#endif
+}
+
 void broadcast(int from, float *data, int size) {
 #ifdef HAVE_MPI
   if (size == 0) return;
@@ -1808,6 +1837,7 @@ int divide_parallel_processes(int numgroups) {
   if (numgroups > count_processors()) meep::abort("numgroups > count_processors");
   int mygroup = (my_rank() * numgroups) / count_processors();
   MPI_Comm_split(MPI_COMM_WORLD, mygroup, my_rank(), &mycomm);
+  reset_fixed_gather_sequence();
   return mygroup;
 #else
   if (numgroups != 1) meep::abort("cannot divide processes in non-MPI mode");
@@ -1823,6 +1853,7 @@ void begin_global_communications(void) {
 #ifdef HAVE_MPI
   mycomm_save = mycomm;
   mycomm = MPI_COMM_WORLD;
+  reset_fixed_gather_sequence();
 #endif
 }
 
@@ -1830,6 +1861,7 @@ void end_global_communications(void) {
 #ifdef HAVE_MPI
   mycomm = mycomm_save;
   mycomm_save = MPI_COMM_WORLD;
+  reset_fixed_gather_sequence();
 #endif
 }
 
@@ -1838,6 +1870,7 @@ void end_divide_parallel(void) {
   if (mycomm != MPI_COMM_WORLD) MPI_Comm_free(&mycomm);
   if (mycomm_save != MPI_COMM_WORLD) MPI_Comm_free(&mycomm_save);
   mycomm = mycomm_save = MPI_COMM_WORLD;
+  reset_fixed_gather_sequence();
 #endif
 }
 

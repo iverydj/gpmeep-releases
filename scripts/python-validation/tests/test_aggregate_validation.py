@@ -212,6 +212,8 @@ class Fixture:
         environment = {"MEEP_GPU_BACKEND": backend}
         return {
             "backend": backend,
+            "backend_acknowledgement_requested": False,
+            "backend_acknowledgement_reason": None,
             "command": ["python", "-m", "unittest"],
             "cwd": f"runs/{safe_case}/{backend}/work",
             "evidence_case_directory": safe_case,

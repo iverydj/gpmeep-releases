@@ -46,10 +46,17 @@ class PerturbationBranchMatrixTests(unittest.TestCase):
             example.touch()
             args = WRAPPER.parse_args([str(example), "--resolution", "20"])
             previous_argv = sys.argv
+            previous_contents = list(previous_argv)
+
+            def identity_run_path(path: str, *, run_name: str):
+                self.assertIs(sys.argv, previous_argv)
+                return self.fake_run_path(path, run_name=run_name)
+
             result = WRAPPER.run_branch_matrix(
-                args, run_path=self.fake_run_path
+                args, run_path=identity_run_path
             )
         self.assertIs(sys.argv, previous_argv)
+        self.assertEqual(sys.argv, previous_contents)
         np.testing.assert_array_equal(result["branch_polarizations"], [0, 1])
         self.assertEqual(result["branch_perturbation_frequencies"].shape, (2, 2))
         self.assertEqual(result["branch_perturbation_derivatives"].shape, (2, 2))
@@ -89,6 +96,67 @@ class PerturbationBranchMatrixTests(unittest.TestCase):
 
             with self.assertRaisesRegex(RuntimeError, "inaccurate Harminv mode"):
                 WRAPPER.run_branch_matrix(args, run_path=bad_run_path)
+
+    def test_exception_restores_exact_argv_object_and_contents(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            example = pathlib.Path(directory) / "perturbation.py"
+            example.touch()
+            args = WRAPPER.parse_args([str(example), "--resolution", "20"])
+            previous_argv = sys.argv
+            previous_contents = list(previous_argv)
+
+            def failing_run_path(_path: str, *, run_name: str):
+                self.assertEqual(run_name, "__main__")
+                self.assertIs(sys.argv, previous_argv)
+                raise RuntimeError("synthetic nested failure")
+
+            with self.assertRaisesRegex(RuntimeError, "synthetic nested failure"):
+                WRAPPER.run_branch_matrix(args, run_path=failing_run_path)
+        self.assertIs(sys.argv, previous_argv)
+        self.assertEqual(sys.argv, previous_contents)
+
+    def test_each_branch_restores_argv_after_nested_rebinding(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            example = pathlib.Path(directory) / "perturbation.py"
+            example.touch()
+            args = WRAPPER.parse_args([str(example), "--resolution", "20"])
+            previous_argv = sys.argv
+            previous_contents = list(previous_argv)
+            calls = 0
+
+            def rebinding_run_path(path: str, *, run_name: str):
+                nonlocal calls
+                self.assertIs(sys.argv, previous_argv)
+                namespace = self.fake_run_path(path, run_name=run_name)
+                calls += 1
+                sys.argv = ["nested-rebind"]
+                return namespace
+
+            result = WRAPPER.run_branch_matrix(
+                args, run_path=rebinding_run_path
+            )
+        self.assertEqual(calls, 2)
+        self.assertIs(sys.argv, previous_argv)
+        self.assertEqual(sys.argv, previous_contents)
+        np.testing.assert_array_equal(result["branch_polarizations"], [0, 1])
+
+    def test_nested_rebinding_exception_restores_argv_immediately(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            example = pathlib.Path(directory) / "perturbation.py"
+            example.touch()
+            args = WRAPPER.parse_args([str(example), "--resolution", "20"])
+            previous_argv = sys.argv
+            previous_contents = list(previous_argv)
+
+            def failing_run_path(_path: str, *, run_name: str):
+                self.assertEqual(run_name, "__main__")
+                sys.argv = ["nested-rebind"]
+                raise RuntimeError("nested rebind failure")
+
+            with self.assertRaisesRegex(RuntimeError, "nested rebind failure"):
+                WRAPPER.run_branch_matrix(args, run_path=failing_run_path)
+        self.assertIs(sys.argv, previous_argv)
+        self.assertEqual(sys.argv, previous_contents)
 
 
 if __name__ == "__main__":

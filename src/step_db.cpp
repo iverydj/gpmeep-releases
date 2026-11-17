@@ -32,6 +32,7 @@
 #include <limits>
 #include <cstdint>
 #include <cstring>
+#include <new>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -42,6 +43,42 @@ using namespace std;
 
 namespace meep {
 namespace {
+
+#if MEEP_HAVE_CUDA
+struct cuda_index_space_matrix {
+  std::vector<gpu::detail::index_space_fp32>
+      spaces[NUM_FIELD_COMPONENTS][2];
+};
+
+// The 40-vector descriptor matrix is only consumed by an active CUDA
+// resident session. Keep its stack storage, but do not construct or destroy
+// those vectors for the CPU path. Default-initialization here matches the
+// original array and avoids a redundant aggregate zero-fill on CUDA.
+class conditional_cuda_index_space_matrix {
+public:
+  explicit conditional_cuda_index_space_matrix(bool enabled)
+      : matrix_(enabled
+                    ? ::new (static_cast<void *>(storage_))
+                          cuda_index_space_matrix
+                    : nullptr) {}
+
+  ~conditional_cuda_index_space_matrix() {
+    if (matrix_) matrix_->~cuda_index_space_matrix();
+  }
+
+  cuda_index_space_matrix *get() noexcept { return matrix_; }
+
+  conditional_cuda_index_space_matrix(
+      const conditional_cuda_index_space_matrix &) = delete;
+  conditional_cuda_index_space_matrix &operator=(
+      const conditional_cuda_index_space_matrix &) = delete;
+
+private:
+  alignas(cuda_index_space_matrix)
+      unsigned char storage_[sizeof(cuda_index_space_matrix)];
+  cuda_index_space_matrix *matrix_;
+};
+#endif
 
 std::uint64_t curl_phase_hash_mix(std::uint64_t hash,
                                   std::uint64_t value) noexcept {
@@ -80,8 +117,28 @@ struct curl_phase_replay_topology {
   bool replay_supported;
 };
 
+// Reject topologies which necessarily interleave an ordinary Cartesian curl
+// with a dependent direct correction before constructing the comparatively
+// expensive phase fingerprint or enabling collection.  Those corrections
+// flush the pending prefix in original order, so a graph could never cover the
+// complete phase.  Discovering that fact after every individual operation is
+// particularly costly for long beta/BFAST runs.
+bool curl_phase_replay_is_supported(const fields &owner) noexcept {
+  for (int chunk_index = 0; chunk_index < owner.num_chunks;
+       ++chunk_index) {
+    const fields_chunk *chunk = owner.chunks[chunk_index];
+    if (!chunk || !chunk->is_mine()) continue;
+    bool uses_bfast = chunk->bfast_scaled_k.size() != 3;
+    for (double value : chunk->bfast_scaled_k)
+      uses_bfast = uses_bfast || value != 0.0;
+    if (chunk->gv.dim == Dcyl || chunk->beta != 0.0 || uses_bfast)
+      return false;
+  }
+  return true;
+}
+
 curl_phase_replay_topology current_curl_phase_replay_topology(
-    fields &owner, field_type ft) {
+    fields &owner, field_type ft, bool replay_supported) {
   std::uint64_t hash = UINT64_C(0xcbf29ce484222325);
   hash = curl_phase_hash_mix(hash, static_cast<std::uint64_t>(ft));
   hash = curl_phase_hash_mix(
@@ -99,7 +156,6 @@ curl_phase_replay_topology current_curl_phase_replay_topology(
   hash = curl_phase_hash_mix(hash, tile_coalescing_disabled ? 1u : 0u);
   hash = curl_phase_hash_mix(hash, batched_tiles_disabled ? 1u : 0u);
 
-  bool replay_supported = true;
   for (int chunk_index = 0; chunk_index < owner.num_chunks;
        ++chunk_index) {
     fields_chunk *chunk = owner.chunks[chunk_index];
@@ -123,17 +179,8 @@ curl_phase_replay_topology current_curl_phase_replay_topology(
     hash = curl_phase_hash_mix(
         hash, chunk->zero_fields_near_cylorigin ? 1u : 0u);
     hash = curl_phase_hash_mix(hash, chunk->bfast_scaled_k.size());
-    bool uses_bfast = chunk->bfast_scaled_k.size() != 3;
-    for (double value : chunk->bfast_scaled_k) {
+    for (double value : chunk->bfast_scaled_k)
       hash = curl_phase_hash_double(hash, value);
-      uses_bfast = uses_bfast || value != 0.0;
-    }
-    // Cartesian material curls are the only phases covered by this replay
-    // plan. The direct beta/BFAST/cylindrical corrections must be observed
-    // by the ordinary chunk walk on every invocation.
-    if (chunk->gv.dim == Dcyl || chunk->beta != 0.0 || uses_bfast)
-      replay_supported = false;
-
     hash = curl_phase_hash_pointer(hash, chunk->s);
     hash = curl_phase_hash_mix(hash, chunk->gvs_tiled.size());
     for (const grid_volume &sub_gv : chunk->gvs_tiled) {
@@ -313,38 +360,6 @@ size_t halo_curl_minimum_interior_points() {
   return static_cast<size_t>(parsed);
 }
 
-bool automatic_cuda_minimum_cells_override(size_t *minimum_cells) {
-  if (!minimum_cells)
-    throw std::invalid_argument(
-        "automatic CUDA minimum output must be non-null");
-  const char *value = std::getenv("MEEP_GPU_AUTO_MIN_CELLS");
-  if (!value || !*value) return false;
-  for (const char *digit = value; *digit; ++digit)
-    if (*digit < '0' || *digit > '9')
-      throw std::invalid_argument(
-          "MEEP_GPU_AUTO_MIN_CELLS must be a non-negative integer");
-  errno = 0;
-  char *end = NULL;
-  const unsigned long long parsed = std::strtoull(value, &end, 10);
-  if (errno || !end || *end != '\0' ||
-      parsed > std::numeric_limits<size_t>::max())
-    throw std::invalid_argument(
-        "MEEP_GPU_AUTO_MIN_CELLS must be a non-negative integer");
-  *minimum_cells = static_cast<size_t>(parsed);
-  return true;
-}
-
-std::uint64_t automatic_policy_cpu_threads() {
-  // The core CPU Yee curl, constitutive update, and polarization loops in
-  // this build are serial within one MPI rank. OMP_NUM_THREADS affects some
-  // auxiliary host routines but does not create concurrent FDTD stencil
-  // workers. Creating an empty OpenMP probe team here would therefore
-  // overstate the CPU alternative and can strand a production owner on one
-  // CPU core. MPI parallelism is already represented by each rank's smaller
-  // local_cells value, so one rank contributes one actual CPU FDTD worker.
-  return 1u;
-}
-
 std::string first_collective_failure_diagnostic(
     bool local_failure, const std::string &local_diagnostic) {
   const int no_failure = count_processors();
@@ -362,17 +377,6 @@ std::string first_collective_failure_diagnostic(
     std::snprintf(diagnostic, sizeof(diagnostic), "%s",
                   local_diagnostic.c_str());
   broadcast(source_rank, diagnostic, diagnostic_capacity);
-  return std::string(diagnostic);
-}
-
-std::string rank_zero_collective_diagnostic(
-    const std::string &local_diagnostic) {
-  constexpr int diagnostic_capacity = 4096;
-  char diagnostic[diagnostic_capacity] = {};
-  if (my_rank() == 0)
-    std::snprintf(diagnostic, sizeof(diagnostic), "%s",
-                  local_diagnostic.c_str());
-  broadcast(0, diagnostic, diagnostic_capacity);
   return std::string(diagnostic);
 }
 
@@ -540,7 +544,18 @@ gpu::detail::validate_curl_partition_for_testing(
 }
 
 void fields::cuda_backend_preflight() const {
-  if (gpu_backend_preflight_is_cached()) return;
+  if (gpmeep_cpu_backend_fast_path_) return;
+  if (gpu_backend_preflight_is_cached()) {
+    if (gpmeep_backend_operation_depth_ > 0) {
+      const bool cuda_execution = gpu_cuda_execution_selected();
+      gpu::detail::pin_backend_for_owner(
+          this, cuda_execution ? gpu::backend_mode::cuda
+                               : gpu::backend_mode::cpu);
+      gpmeep_backend_pinned_ = true;
+      gpmeep_cpu_backend_fast_path_ = !cuda_execution;
+    }
+    return;
+  }
   gpu::detail::backend_preflight_status local =
       gpu::detail::probe_backend_for_distributed_step();
   const bool any_configuration_error =
@@ -560,11 +575,8 @@ void fields::cuda_backend_preflight() const {
   }
 
   const bool every_cpu_requested = and_to_all(local.cpu_requested);
-  const bool every_automatic_requested =
-      and_to_all(local.automatic_requested);
   const bool every_cuda_required = and_to_all(local.cuda_required);
   if (static_cast<int>(every_cpu_requested) +
-          static_cast<int>(every_automatic_requested) +
           static_cast<int>(every_cuda_required) !=
       1)
     throw std::runtime_error(
@@ -578,204 +590,19 @@ void fields::cuda_backend_preflight() const {
     return;
   }
 
-  size_t local_cells = 0;
-  size_t explicit_minimum_cells = 0;
-  bool explicit_minimum = false;
-  std::uint64_t cpu_threads = 1;
-  if (every_automatic_requested) {
-    bool local_policy_valid = true;
-    std::string local_policy_error;
-    try {
-      explicit_minimum = automatic_cuda_minimum_cells_override(
-          &explicit_minimum_cells);
-      for (int i = 0; i < num_chunks; ++i)
-        if (chunks[i]->is_mine()) {
-          const size_t chunk_cells = chunks[i]->gv.ntot();
-          if (chunk_cells >
-              std::numeric_limits<size_t>::max() - local_cells)
-            throw std::overflow_error(
-                "automatic CUDA local cell count overflow");
-          local_cells += chunk_cells;
-        }
-      cpu_threads = automatic_policy_cpu_threads();
-      if (cpu_threads == 0)
-        throw std::runtime_error(
-            "automatic CUDA CPU-team observation returned zero threads");
-    }
-    catch (const std::exception &error) {
-      local_policy_valid = false;
-      local_policy_error = error.what();
-    }
-    if (or_to_all(!local_policy_valid)) {
-      const std::string collective_diagnostic =
-          first_collective_failure_diagnostic(
-              !local_policy_valid, local_policy_error);
-      std::ostringstream message;
-      message << "distributed automatic CUDA workload policy failed";
-      if (!collective_diagnostic.empty())
-        message << ": " << collective_diagnostic;
-      throw std::runtime_error(message.str());
-    }
-
-    const bool root_explicit_minimum = broadcast(0, explicit_minimum);
-    size_t root_explicit_minimum_cells = explicit_minimum_cells;
-    broadcast(0, &root_explicit_minimum_cells, 1);
-    const bool local_minimum_mismatch =
-        explicit_minimum != root_explicit_minimum ||
-        (explicit_minimum &&
-         explicit_minimum_cells != root_explicit_minimum_cells);
-    if (or_to_all(local_minimum_mismatch))
-      throw std::runtime_error(
-          "MEEP_GPU_AUTO_MIN_CELLS differs across MPI ranks");
-
-    // This first-stage floor uses only the observed CPU team and workload.
-    // If any rank is below it, every rank chooses CPU without querying the
-    // CUDA runtime.  The second-stage device policy can only raise this
-    // conservative floor for a slower GPU.
-    const std::uint64_t host_only_minimum =
-        explicit_minimum
-            ? static_cast<std::uint64_t>(explicit_minimum_cells)
-            : gpu::detail::automatic_cuda_host_only_minimum_cells(
-                  cpu_threads);
-    const bool local_can_reach_cuda =
-        static_cast<std::uint64_t>(local_cells) >= host_only_minimum;
-    if (!and_to_all(local_can_reach_cuda)) {
-      std::ostringstream local_diagnostic;
-      local_diagnostic
-          << "automatic fields owner selected CPU before CUDA runtime: "
-          << "local_cells=" << local_cells
-          << ", host_only_minimum_cells=" << host_only_minimum
-          << ", cpu_fdtd_workers_per_rank=" << cpu_threads
-          << ", policy="
-          << (explicit_minimum ? "explicit-minimum" : "host-floor-v2");
-      const std::string diagnostic =
-          first_collective_failure_diagnostic(
-              !local_can_reach_cuda, local_diagnostic.str());
-      prepare_gpu_owner_for_cpu();
-      gpu::detail::activate_backend_for_owner(
-          gpu::backend_mode::cpu, diagnostic);
-      cache_gpu_backend_preflight(false, diagnostic);
-      return;
-    }
-
-    // Only owners which survived the host-only floor are allowed to discover
-    // and select a CUDA device.
-    local = gpu::detail::prepare_cuda_candidate_for_distributed_step();
-    if (or_to_all(!local.configuration_ok)) {
-      const std::string collective_diagnostic =
-          first_collective_failure_diagnostic(
-              !local.configuration_ok, local.diagnostic);
-      std::ostringstream message;
-      message << "distributed automatic CUDA candidate configuration failed";
-      if (!collective_diagnostic.empty())
-        message << ": " << collective_diagnostic;
-      throw std::runtime_error(message.str());
-    }
-  }
-
-  const bool any_explicit_device_requested =
-      or_to_all(local.explicit_device_requested);
   const bool any_cuda_active = or_to_all(local.cuda_active);
   const bool every_cuda_active = and_to_all(local.cuda_active);
   if (any_cuda_active != every_cuda_active) {
-    if (every_cuda_required)
-      throw std::runtime_error(
-          "distributed CUDA preflight found inconsistent active backends");
-    const std::string diagnostic =
-        "automatic fields owner selected CPU because CUDA availability "
-        "differs across MPI ranks";
-    prepare_gpu_owner_for_cpu();
-    gpu::detail::activate_backend_for_owner(
-        gpu::backend_mode::cpu, diagnostic);
-    cache_gpu_backend_preflight(false, diagnostic);
-    return;
+    throw std::runtime_error(
+        "distributed CUDA preflight found inconsistent active backends");
   }
   if (!any_cuda_active) {
-    if (every_cuda_required)
-      throw std::runtime_error(
-          "required CUDA backend has no compatible active device");
-    const std::string diagnostic =
-        "automatic fields owner selected CPU because CUDA is unavailable";
-    prepare_gpu_owner_for_cpu();
-    gpu::detail::activate_backend_for_owner(
-        gpu::backend_mode::cpu, diagnostic);
-    cache_gpu_backend_preflight(false, diagnostic);
-    return;
+    throw std::runtime_error(
+        "required CUDA backend has no compatible active device");
   }
 
-  std::string decision_diagnostic =
+  const std::string decision_diagnostic =
       "required CUDA fields owner passed backend preflight";
-  if (every_automatic_requested) {
-    bool local_policy_valid = true;
-    std::string local_policy_error;
-    gpu::detail::automatic_cuda_policy_decision decision{};
-    try {
-      decision = gpu::detail::evaluate_automatic_cuda_policy(
-          {static_cast<std::uint64_t>(local_cells),
-           cpu_threads,
-           gpu::detail::selected_automatic_device_policy_facts(),
-           explicit_minimum,
-           static_cast<std::uint64_t>(explicit_minimum_cells)});
-    }
-    catch (const std::exception &error) {
-      local_policy_valid = false;
-      local_policy_error = error.what();
-    }
-    if (or_to_all(!local_policy_valid)) {
-      const std::string collective_diagnostic =
-          first_collective_failure_diagnostic(
-              !local_policy_valid, local_policy_error);
-      std::ostringstream message;
-      message << "distributed automatic CUDA workload policy failed";
-      if (!collective_diagnostic.empty())
-        message << ": " << collective_diagnostic;
-      throw std::runtime_error(message.str());
-    }
-    if (!and_to_all(decision.use_cuda)) {
-      std::ostringstream diagnostic;
-      diagnostic
-          << "automatic fields owner selected CPU: local_cells="
-          << decision.local_cells << ", minimum_cells="
-          << decision.minimum_cells << ", cpu_fdtd_workers_per_rank="
-          << decision.cpu_threads << ", device_bandwidth_Bps="
-          << decision.device.memory_bandwidth_bytes_per_second
-          << ", estimated_device_memory_B="
-          << decision.estimated_required_memory_bytes
-          << ", available_device_memory_after_reserve_B="
-          << decision.memory_available_after_reserve_bytes
-          << ", memory_eligible="
-          << (decision.memory_eligible ? "yes" : "no")
-          << ", policy="
-          << (decision.explicit_minimum ? "explicit-minimum"
-                                        : "host-device-memory-v3");
-      const std::string collective_diagnostic =
-          first_collective_failure_diagnostic(
-              !decision.use_cuda, diagnostic.str());
-      prepare_gpu_owner_for_cpu();
-      gpu::detail::activate_backend_for_owner(
-          gpu::backend_mode::cpu, collective_diagnostic);
-      cache_gpu_backend_preflight(false, collective_diagnostic);
-      return;
-    }
-    std::ostringstream diagnostic;
-    diagnostic << "automatic fields owner selected CUDA: local_cells="
-               << decision.local_cells << ", minimum_cells="
-               << decision.minimum_cells << ", cpu_fdtd_workers_per_rank="
-               << decision.cpu_threads << ", device_bandwidth_Bps="
-               << decision.device.memory_bandwidth_bytes_per_second
-               << ", estimated_device_memory_B="
-               << decision.estimated_required_memory_bytes
-               << ", available_device_memory_after_reserve_B="
-               << decision.memory_available_after_reserve_bytes
-               << ", memory_eligible="
-               << (decision.memory_eligible ? "yes" : "no")
-               << ", policy="
-               << (decision.explicit_minimum ? "explicit-minimum"
-                                             : "host-device-memory-v3");
-    decision_diagnostic =
-        rank_zero_collective_diagnostic(diagnostic.str());
-  }
-
   gpu::detail::activate_backend_for_owner(
       gpu::backend_mode::cuda, decision_diagnostic);
 
@@ -783,20 +610,7 @@ void fields::cuda_backend_preflight() const {
   // fallback. Fail every rank uniformly before any manager posts a request.
   validate_gpu_mpi_transport();
 
-  try {
-    validate_gpu_device_assignment();
-  }
-  catch (const std::exception &error) {
-    if (every_cuda_required || any_explicit_device_requested) throw;
-    const std::string diagnostic = rank_zero_collective_diagnostic(
-        std::string("automatic fields owner selected CPU after CUDA ") +
-        "device-assignment preflight failed: " + error.what());
-    prepare_gpu_owner_for_cpu();
-    gpu::detail::activate_backend_for_owner(
-        gpu::backend_mode::cpu, diagnostic);
-    cache_gpu_backend_preflight(false, diagnostic);
-    return;
-  }
+  validate_gpu_device_assignment();
   cache_gpu_backend_preflight(true, decision_diagnostic);
 }
 
@@ -889,15 +703,7 @@ void fields::cuda_step_preflight() const {
     std::ostringstream message;
     message << "distributed CUDA time-step feature preflight failed";
     if (!collective_reason.empty()) message << ": " << collective_reason;
-    if (gpu::detail::cuda_required())
-      throw std::runtime_error(message.str());
-    prepare_gpu_owner_for_cpu();
-    const std::string diagnostic =
-        "automatic fields owner selected CPU: " + message.str();
-    gpu::detail::activate_backend_for_owner(
-        gpu::backend_mode::cpu, diagnostic);
-    cache_gpu_backend_preflight(false, diagnostic, true);
-    return;
+    throw std::runtime_error(message.str());
   }
   cache_gpu_step_preflight();
 }
@@ -924,20 +730,36 @@ void fields::step_db(field_type ft) {
       gpu::detail::cuda_active()
           ? gpu::detail::phase_batched_curl_mode()
           : gpu::detail::phase_batch_mode::disabled;
+  bool structured_curl_graph =
+      gpu::detail::cuda_active() &&
+      gpu::detail::structured_curl_graph_opted_in();
   for (int i = 0;
        i < num_chunks &&
-       phase_batch_mode != gpu::detail::phase_batch_mode::disabled;
+       (phase_batch_mode != gpu::detail::phase_batch_mode::disabled ||
+        structured_curl_graph);
        ++i)
     if (chunks[i]->is_mine() &&
-        !gpu::detail::resident_phase_is_active_for_owner(chunks[i]))
+        !gpu::detail::resident_phase_is_active_for_owner(chunks[i])) {
       phase_batch_mode = gpu::detail::phase_batch_mode::disabled;
+      structured_curl_graph = false;
+    }
+  const bool need_replay_topology =
+      phase_batch_mode != gpu::detail::phase_batch_mode::disabled ||
+      structured_curl_graph;
+  const bool replay_supported =
+      need_replay_topology && curl_phase_replay_is_supported(*this);
+  if (structured_curl_graph && !replay_supported)
+    structured_curl_graph = false;
   const curl_phase_replay_topology replay_topology =
-      phase_batch_mode != gpu::detail::phase_batch_mode::disabled
-          ? current_curl_phase_replay_topology(*this, ft)
+      (phase_batch_mode != gpu::detail::phase_batch_mode::disabled ||
+       structured_curl_graph)
+          ? current_curl_phase_replay_topology(
+                *this, ft, replay_supported)
           : curl_phase_replay_topology{0, false};
   gpu::detail::resident_curl_phase_batch phase_batch(
       this, static_cast<int>(ft), phase_batch_mode,
-      replay_topology.fingerprint, replay_topology.replay_supported);
+      replay_topology.fingerprint, replay_topology.replay_supported,
+      structured_curl_graph);
 
   const bool replayed = phase_batch.replay_if_ready();
   if (!replayed)
@@ -1199,24 +1021,40 @@ void fields::step_db_cuda_region(field_type ft, cuda_curl_region region) {
       gpu::detail::cuda_active()
           ? gpu::detail::phase_batched_curl_mode()
           : gpu::detail::phase_batch_mode::disabled;
+  bool structured_curl_graph =
+      gpu::detail::cuda_active() &&
+      gpu::detail::structured_curl_graph_opted_in();
   for (int i = 0;
        i < num_chunks &&
-       phase_batch_mode != gpu::detail::phase_batch_mode::disabled;
+       (phase_batch_mode != gpu::detail::phase_batch_mode::disabled ||
+        structured_curl_graph);
        ++i)
     if (chunks[i]->is_mine() &&
-        !gpu::detail::resident_phase_is_active_for_owner(chunks[i]))
+        !gpu::detail::resident_phase_is_active_for_owner(chunks[i])) {
       phase_batch_mode = gpu::detail::phase_batch_mode::disabled;
+      structured_curl_graph = false;
+    }
+  const bool need_replay_topology =
+      phase_batch_mode != gpu::detail::phase_batch_mode::disabled ||
+      structured_curl_graph;
+  const bool replay_supported =
+      need_replay_topology && curl_phase_replay_is_supported(*this);
+  if (structured_curl_graph && !replay_supported)
+    structured_curl_graph = false;
   const int phase_key =
       (region == cuda_curl_region::interior ? NUM_FIELD_TYPES
                                             : 2 * NUM_FIELD_TYPES) +
       static_cast<int>(ft);
   const curl_phase_replay_topology replay_topology =
-      phase_batch_mode != gpu::detail::phase_batch_mode::disabled
-          ? current_curl_phase_replay_topology(*this, ft)
+      (phase_batch_mode != gpu::detail::phase_batch_mode::disabled ||
+       structured_curl_graph)
+          ? current_curl_phase_replay_topology(
+                *this, ft, replay_supported)
           : curl_phase_replay_topology{0, false};
   gpu::detail::resident_curl_phase_batch phase_batch(
       this, phase_key, phase_batch_mode,
-      replay_topology.fingerprint, replay_topology.replay_supported);
+      replay_topology.fingerprint, replay_topology.replay_supported,
+      structured_curl_graph);
   if (!phase_batch.replay_if_ready())
     for (int i = 0; i < num_chunks; ++i)
       if (chunks[i]->is_mine())
@@ -1231,13 +1069,18 @@ void fields::step_db_cuda_region(field_type ft, cuda_curl_region region) {
 bool fields_chunk::step_db(field_type ft) {
   bool allocated_u = false;
   const bool cuda_backend_active = gpu::detail::cuda_active();
-  std::string cuda_ineligible_reason;
-  const bool cuda_phase_eligible =
-      cuda_backend_active && cuda_step_db_eligible(ft, &cuda_ineligible_reason);
-  if (cuda_backend_active && !cuda_phase_eligible)
-    throw std::runtime_error("preflighted CUDA chunk curl is unsupported: " +
-                             cuda_ineligible_reason);
-  gpu::detail::resident_curl_session cuda_session(this, cuda_phase_eligible);
+  bool cuda_phase_eligible = false;
+  if (cuda_backend_active) {
+    std::string cuda_ineligible_reason;
+    cuda_phase_eligible =
+        cuda_step_db_eligible(ft, &cuda_ineligible_reason);
+    if (!cuda_phase_eligible)
+      throw std::runtime_error(
+          "preflighted CUDA chunk curl is unsupported: " +
+          cuda_ineligible_reason);
+  }
+  gpu::detail::conditional_resident_curl_session cuda_session(
+      this, cuda_phase_eligible);
 
   // CPU cache tiles partition one chunk's owned Yee points. They improve host
   // locality, but thousands of tiny CUDA descriptors make launch scheduling
@@ -1251,8 +1094,10 @@ bool fields_chunk::step_db(field_type ft) {
       coalesce_cuda_tiles ? 1 : gvs_tiled.size();
 #if MEEP_HAVE_CUDA
   bool recorded_tile_coalescing = false;
-  std::vector<gpu::detail::index_space_fp32>
-      cuda_index_spaces[NUM_FIELD_COMPONENTS][2];
+  conditional_cuda_index_space_matrix cuda_index_space_storage(
+      cuda_session.active());
+  cuda_index_space_matrix *const cuda_index_spaces =
+      cuda_index_space_storage.get();
 #endif
   for (size_t volume_index = 0; volume_index < execution_volume_count;
        ++volume_index) {
@@ -1391,8 +1236,9 @@ bool fields_chunk::step_db(field_type ft) {
                 static_cast<float>(Courant), material);
           }
           else {
+            assert(cuda_index_spaces);
             std::vector<gpu::detail::index_space_fp32> &component_spaces =
-                cuda_index_spaces[cc][cmp];
+                cuda_index_spaces->spaces[cc][cmp];
             component_spaces.push_back(index_space);
             if (!batch_tiles)
               gpu::detail::resident_step_curl_material_fp32(
@@ -1447,8 +1293,10 @@ bool fields_chunk::step_db(field_type ft) {
                 conductivity ? s->condinv[cc][d_c] : nullptr,
                 pml_f && conductivity ? f_cond[cc][cmp] : nullptr};
             if (batch_tiles) {
+              assert(cuda_index_spaces);
               const std::vector<gpu::detail::index_space_fp32>
-                  &component_spaces = cuda_index_spaces[cc][cmp];
+                  &component_spaces =
+                      cuda_index_spaces->spaces[cc][cmp];
               if (component_spaces.size() == execution_volume_count)
                 gpu::detail::resident_step_bfast_batched_fp32(
                     cuda_session.cache(), the_f, f_p, f_m,

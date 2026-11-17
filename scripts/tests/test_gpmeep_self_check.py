@@ -2,12 +2,16 @@ import copy
 import importlib.util
 import json
 import pathlib
+import sys
 import tempfile
 import unittest
 from unittest import mock
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "scripts" / "tests"))
+from backend_guard_test_fixture import evidence as guard_evidence  # noqa: E402
+
 SCRIPT = ROOT / "scripts" / "gpmeep-self-check.py"
 SPEC = importlib.util.spec_from_file_location("gpmeep_self_check", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
@@ -43,6 +47,15 @@ def statistics(backend="cpu", *, pinned=False, waitsome=False):
     }
 
 
+def backend_guard_record(backend):
+    return guard_evidence(
+        MODULE.backend_guard,
+        backend,
+        "cpu",
+        reason=MODULE.BACKEND_ACKNOWLEDGEMENT_REASON,
+    )
+
+
 def record(backend, rank=0, world_size=1, identifier="GPU-A"):
     return {
         "rank": rank,
@@ -53,6 +66,7 @@ def record(backend, rank=0, world_size=1, identifier="GPU-A"):
         "active_backend": backend,
         "cuda_execution_selected": backend == "cuda",
         "selected_device_identifier": identifier if backend == "cuda" else None,
+        "backend_guard": backend_guard_record(backend),
         "statistics": statistics(
             backend,
             pinned=world_size == 2,
@@ -149,6 +163,10 @@ class SelfCheckContractTests(unittest.TestCase):
     def test_cpu_and_gpu_contracts_reject_fallback(self):
         MODULE._validate_cpu_record(record("cpu"))
         MODULE._validate_cuda_record(record("cuda"))
+        guard_tampered = record("cuda")
+        guard_tampered["backend_guard"]["attempts"] = 3
+        with self.assertRaisesRegex(MODULE.SelfCheckError, "backend-guard"):
+            MODULE._validate_cuda_record(guard_tampered)
         bad = record("cuda")
         bad["statistics"]["dispatch"]["cpu_curl_points"] = 1
         with self.assertRaisesRegex(MODULE.SelfCheckError, "CPU fallback"):
@@ -156,7 +174,7 @@ class SelfCheckContractTests(unittest.TestCase):
 
     def test_two_gpu_contract_requires_distinct_devices_and_traffic(self):
         value = {
-            "schema_version": 1,
+            "schema_version": MODULE.SCHEMA_VERSION,
             "lane": "gpu2",
             "rank_records": [
                 record("cuda", 0, 2, "GPU-A"),

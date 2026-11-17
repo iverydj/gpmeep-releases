@@ -28,8 +28,8 @@ sys.modules[SPEC.name] = MATRIX
 SPEC.loader.exec_module(MATRIX)
 
 
-GPU0 = "GPU-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
-GPU1 = "GPU-11111111-2222-3333-4444-555555555555"
+GPU0 = "GPU-00000000-0000-0000-0000-000000009001"
+GPU1 = "GPU-00000000-0000-0000-0000-000000009002"
 
 
 def release_plan() -> dict[str, object]:

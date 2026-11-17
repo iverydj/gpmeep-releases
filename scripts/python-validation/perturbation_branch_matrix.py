@@ -57,38 +57,41 @@ def run_branch_matrix(
     mode_amplitudes = []
     mode_errors = []
     polarizations = []
-    previous_argv = sys.argv
-    try:
-        for perpendicular in (False, True):
-            sys.argv = [str(args.example), "-res", str(args.resolution)]
+    for perpendicular in (False, True):
+        previous_argv = sys.argv
+        previous_argv_contents = list(previous_argv)
+        try:
+            previous_argv[:] = [
+                str(args.example),
+                "-res",
+                str(args.resolution),
+            ]
             if perpendicular:
-                sys.argv.append("-perpendicular")
+                previous_argv.append("-perpendicular")
             namespace = run_path(str(args.example), run_name="__main__")
-            frequencies.append(_array(namespace, "perturbation_frequencies", (2,)))
-            derivatives.append(_array(namespace, "perturbation_derivatives", (2,)))
-            integrals.append(_array(namespace, "perturbation_integrals", (2,)))
-            relative_errors.append(
-                _array(namespace, "perturbation_relative_error", (1,))[0]
+        finally:
+            if sys.argv is not previous_argv:
+                sys.argv = previous_argv
+            previous_argv[:] = previous_argv_contents
+        frequencies.append(_array(namespace, "perturbation_frequencies", (2,)))
+        derivatives.append(_array(namespace, "perturbation_derivatives", (2,)))
+        integrals.append(_array(namespace, "perturbation_integrals", (2,)))
+        relative_errors.append(
+            _array(namespace, "perturbation_relative_error", (1,))[0]
+        )
+        mode_decays.append(_array(namespace, "perturbation_mode_decays", (2,)))
+        mode_q.append(_array(namespace, "perturbation_mode_q", (2,)))
+        mode_amplitudes.append(
+            _array(namespace, "perturbation_mode_amplitudes", (2,))
+        )
+        mode_errors.append(_array(namespace, "perturbation_mode_errors", (2,)))
+        polarization = _array(namespace, "perturbation_polarization", (1,))[0]
+        expected = 1 if perpendicular else 0
+        if int(polarization) != expected:
+            raise RuntimeError(
+                f"perturbation polarization marker {polarization} != {expected}"
             )
-            mode_decays.append(
-                _array(namespace, "perturbation_mode_decays", (2,))
-            )
-            mode_q.append(_array(namespace, "perturbation_mode_q", (2,)))
-            mode_amplitudes.append(
-                _array(namespace, "perturbation_mode_amplitudes", (2,))
-            )
-            mode_errors.append(
-                _array(namespace, "perturbation_mode_errors", (2,))
-            )
-            polarization = _array(namespace, "perturbation_polarization", (1,))[0]
-            expected = 1 if perpendicular else 0
-            if int(polarization) != expected:
-                raise RuntimeError(
-                    f"perturbation polarization marker {polarization} != {expected}"
-                )
-            polarizations.append(expected)
-    finally:
-        sys.argv = previous_argv
+        polarizations.append(expected)
 
     frequency_matrix = np.stack(frequencies)
     derivative_matrix = np.stack(derivatives)

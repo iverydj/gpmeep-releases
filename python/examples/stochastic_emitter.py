@@ -78,19 +78,30 @@ geometry = [
 class GaussianNoiseSource:
     """Per-dipole random source with independently auditable call count."""
 
-    def __init__(self, seed):
-        self.rng = np.random.default_rng(seed) if seed is not None else None
+    def __init__(self, rng):
+        self.rng = rng
         self.calls = 0
 
     def __call__(self, _time):
         self.calls += 1
-        if self.rng is None:
-            return np.random.randn()
         return self.rng.standard_normal()
 
 
 random_source_callbacks = []
 random_source_index = 0
+
+
+def synchronized_random_seed():
+    """Return one fresh legacy-stream seed shared by every MPI rank."""
+    from mpi4py import MPI
+
+    communicator = MPI.COMM_WORLD
+    root_seed = None
+    if communicator.Get_rank() == 0:
+        root_seed = int(
+            np.random.randint(0, np.iinfo(np.uint32).max, dtype=np.uint32)
+        )
+    return int(communicator.bcast(root_seed, root=0))
 
 if args.textured:
     geometry.append(
@@ -108,10 +119,12 @@ def compute_flux(m=1, n=0):
         callbacks = []
         for _ in range(ndipole):
             callback_seed = (
-                None if args.seed is None else args.seed + random_source_index
+                synchronized_random_seed()
+                if args.seed is None
+                else args.seed + random_source_index
             )
             random_source_index += 1
-            callback = GaussianNoiseSource(callback_seed)
+            callback = GaussianNoiseSource(np.random.default_rng(callback_seed))
             callbacks.append(callback)
             random_source_callbacks.append(callback)
         sources = [

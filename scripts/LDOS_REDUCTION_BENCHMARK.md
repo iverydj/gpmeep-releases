@@ -303,7 +303,7 @@ updated C++ worker is merged and a new authoritative receipt is created, use:
 ```sh
 DEVICE_UUIDS=GPU-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee
 DEVICE_UUIDS="${DEVICE_UUIDS},GPU-11111111-2222-3333-4444-555555555555"
-REPO=/absolute/path/to/gpmeep
+REPO=/path/to/workspace/workspace/meep-gpu-m19-cw
 NEW_RECEIPT_ID=replace_with_new_64_lowercase_hex_receipt_id
 CONTROLLER_PYTHON=/usr/bin/python3
 env -i HOME=/nonexistent LANG=C LC_ALL=C PATH=/usr/bin:/bin \

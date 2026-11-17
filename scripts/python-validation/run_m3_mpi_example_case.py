@@ -42,13 +42,19 @@ from common import (  # noqa: E402
     WorkloadError,
     absolute_file_record,
     atomic_write_json,
+    durable_publish_terminal,
     file_record,
 )
 
 
-SCHEMA = "gpmeep-m3-mpi-example-case-v1"
-COMPLETE_SCHEMA = "gpmeep-m3-mpi-example-case-complete-v1"
+SCHEMA = "gpmeep-m3-mpi-example-case-v3"
+COMPLETE_SCHEMA = "gpmeep-m3-mpi-example-case-complete-v3"
 TREE_SCHEMA = "gpmeep-m3-mpi-example-tree-v1"
+PRODUCER_AMBIENT_SCHEMA = "gpmeep-m3-producer-safe-ambient-v1"
+PRODUCER_AMBIENT_KEYS = ("PATH", "TMPDIR", "LC_ALL", "LANG")
+BACKEND_ACKNOWLEDGEMENT_REASON = (
+    "M3 MPI examples intentionally compare explicit CPU and CUDA"
+)
 LANE_ORDER = ("cpu-fp32-8r", "cuda-fp32-1g", "cuda-fp32-2g")
 MAX_TREE_FILES = 200_000
 MAX_TREE_BYTES = 256 * 1024**3
@@ -72,7 +78,9 @@ REPORT_KEYS = {
     "cpu_ranks",
     "gpu_devices",
     "receipt_id",
+    "backend_acknowledgement_reason",
     "paths",
+    "producer_safe_ambient",
     "runtime_snapshot",
     "lanes",
     "comparisons",
@@ -171,6 +179,8 @@ def clean_environment(
     build_python: pathlib.Path,
     runtime_contract: dict[str, Any],
     run_nonce: str,
+    site_guard_expected: bool,
+    producer_safe_ambient: dict[str, str],
 ) -> dict[str, str]:
     try:
         account_home = pathlib.Path(pwd.getpwuid(os.getuid()).pw_dir)
@@ -179,7 +189,7 @@ def clean_environment(
     if not account_home.is_absolute() or not account_home.is_dir():
         raise WorkloadError("M3 MPI launch account home directory is unavailable")
     account_home = account_home.resolve(strict=True)
-    environment = validation.isolated_process_environment()
+    environment = validate_safe_ambient_subset(producer_safe_ambient)
     environment.update(
         {
             # Open MPI resolves its MCA configuration before the rank launcher
@@ -206,11 +216,21 @@ def clean_environment(
             "CUDA_VISIBLE_DEVICES": ",".join(lane.devices),
             "MEEP_GPU_MPI_TRANSPORT": "pinned",
             "MEEP_GPU_MPI_COMPLETION": "waitsome",
+            # This validation environment never uses MPI one-sided windows.
+            # Open MPI 5.0.10 nevertheless queries osc_ucx in every rank and
+            # the installed component fails its query before user code starts.
+            # Exclude only that OSC component so point-to-point, collectives,
+            # and the gpmeep production runtime policy remain unchanged.
+            "OMPI_MCA_osc": "^ucx",
             "UCX_MEMTYPE_CACHE": "n",
         }
     )
     if lane.backend == "cuda":
         environment["GPMEEP_VALIDATION_STRICT_CUDA"] = "1"
+    if site_guard_expected:
+        environment["GPMEEP_VALIDATION_BACKEND_ACKNOWLEDGEMENT_REASON"] = (
+            BACKEND_ACKNOWLEDGEMENT_REASON
+        )
     trusted = []
     for candidate in (
         pathlib.Path(runtime_contract["libmeep"]["path"]).resolve().parent,
@@ -221,6 +241,190 @@ def clean_environment(
     if trusted:
         environment["LD_LIBRARY_PATH"] = os.pathsep.join(trusted)
     return environment
+
+
+def site_guard_expected_for_command(case_command: list[str]) -> bool:
+    """Classify commands that intentionally omit the current-runtime guard."""
+    guard_disabled_oracles = {
+        "run_example_oracle.py",
+        "run_v103_example_oracle.py",
+    }
+    return not any(
+        pathlib.Path(value).name in guard_disabled_oracles
+        for value in case_command
+    )
+
+
+def validate_safe_ambient_subset(value: Any) -> dict[str, str]:
+    if (
+        type(value) is not dict
+        or any(
+            type(key) is not str
+            or key not in validation.SAFE_AMBIENT_ENVIRONMENT
+            or type(item) is not str
+            or "\x00" in item
+            for key, item in value.items()
+        )
+    ):
+        raise WorkloadError("M3 MPI safe ambient subset is invalid")
+    return dict(value)
+
+
+def validate_producer_safe_ambient(value: Any) -> dict[str, str]:
+    """Validate the exact ambient inherited by this producer process.
+
+    Replay can run in a different parent process.  Recording this narrow
+    allowlist lets it reconstruct the environment used to launch the lanes
+    without depending on the verifier's unrelated ambient state.
+    """
+
+    if (
+        type(value) is not dict
+        or set(value) != set(PRODUCER_AMBIENT_KEYS)
+        or any(
+            type(key) is not str
+            or type(item) is not str
+            or not item
+            or "\x00" in item
+            for key, item in value.items()
+        )
+    ):
+        raise WorkloadError("M3 MPI producer safe ambient is invalid")
+    return dict(value)
+
+
+def expected_producer_safe_ambient(
+    output: pathlib.Path, python: pathlib.Path
+) -> dict[str, str]:
+    """Derive the specialized producer ambient from sealed path identities."""
+
+    return _expected_controlled_producer_safe_ambient(
+        output,
+        python,
+        evidence_directory="raw",
+        label="M3 MPI",
+    )
+
+
+def expected_performance_producer_safe_ambient(
+    output: pathlib.Path, python: pathlib.Path
+) -> dict[str, str]:
+    """Derive a performance-sample producer ambient without verifier state.
+
+    Both the M3 repeated controller and the M4 equal-work controller launch a
+    child at ``samples/<task>`` with its isolated temporary directory at
+    ``runtime/<task>/tmp``.  Reconstructing these four allowlisted variables
+    from that sealed layout makes semantic replay independent of the parent
+    process which happens to perform the verification.
+    """
+
+    provided_output = pathlib.Path(output)
+    provided_python = pathlib.Path(python)
+    if not provided_output.is_absolute():
+        raise WorkloadError("performance sample output must be absolute")
+    if not provided_python.is_absolute():
+        raise WorkloadError("performance sample Python must be absolute")
+    try:
+        if (
+            not provided_python.is_file()
+            or provided_python.is_symlink()
+            or provided_python.resolve(strict=True) != provided_python
+            or not os.access(provided_python, os.X_OK)
+        ):
+            raise WorkloadError(
+                "performance sample Python must be a canonical executable file"
+            )
+    except OSError as exc:
+        raise WorkloadError(
+            f"performance sample Python is unavailable: {exc}"
+        ) from exc
+    return _expected_controlled_producer_safe_ambient(
+        output,
+        python,
+        evidence_directory="samples",
+        label="performance sample",
+    )
+
+
+def _expected_controlled_producer_safe_ambient(
+    output: pathlib.Path,
+    python: pathlib.Path,
+    *,
+    evidence_directory: str,
+    label: str,
+) -> dict[str, str]:
+    """Bind a narrow producer ambient to a controller-owned output layout."""
+
+    output = pathlib.Path(os.path.abspath(output))
+    python = pathlib.Path(os.path.abspath(python))
+    if (
+        evidence_directory not in {"raw", "samples"}
+        or output.parent.name != evidence_directory
+        or output.name in {"", ".", ".."}
+    ):
+        raise WorkloadError(f"{label} output is not in its controlled layout")
+    controller_root = output.parent.parent
+    if output != controller_root / evidence_directory / output.name:
+        raise WorkloadError(f"{label} output escapes its controlled layout")
+    runtime_tmp = controller_root / "runtime" / output.name / "tmp"
+    try:
+        if (
+            not controller_root.is_dir()
+            or not output.parent.is_dir()
+            or not output.is_dir()
+            or not (controller_root / "runtime").is_dir()
+            or not runtime_tmp.parent.is_dir()
+            or not runtime_tmp.is_dir()
+        ):
+            raise WorkloadError(f"{label} controlled directory layout differs")
+        if (
+            controller_root.resolve(strict=True) != controller_root
+            or output.parent.resolve(strict=True) != output.parent
+            or output.resolve(strict=True) != output
+            or (controller_root / "runtime").resolve(strict=True)
+            != controller_root / "runtime"
+            or runtime_tmp.parent.resolve(strict=True) != runtime_tmp.parent
+            or runtime_tmp.resolve(strict=True) != runtime_tmp
+        ):
+            raise WorkloadError(f"{label} controlled layout contains a symbolic link")
+    except OSError as exc:
+        raise WorkloadError(f"{label} producer runtime layout is unavailable: {exc}") from exc
+    return {
+        "PATH": f"{python.parent}:/usr/bin:/bin",
+        "TMPDIR": str(runtime_tmp),
+        "LC_ALL": "C",
+        "LANG": "C",
+    }
+
+
+def producer_safe_ambient_record(
+    value: Any, output: pathlib.Path, python: pathlib.Path
+) -> dict[str, Any]:
+    values = validate_producer_safe_ambient(value)
+    expected = expected_producer_safe_ambient(output, python)
+    if values != expected:
+        raise WorkloadError("M3 MPI producer safe ambient differs from its path derivation")
+    return {
+        "schema": PRODUCER_AMBIENT_SCHEMA,
+        "values": values,
+        "sha256": validation.environment_sha256(values),
+    }
+
+
+def validate_producer_safe_ambient_record(
+    value: Any, output: pathlib.Path, python: pathlib.Path
+) -> dict[str, str]:
+    if type(value) is not dict or set(value) != {"schema", "values", "sha256"}:
+        raise WorkloadError("M3 MPI producer safe ambient record schema differs")
+    if value.get("schema") != PRODUCER_AMBIENT_SCHEMA:
+        raise WorkloadError("M3 MPI producer safe ambient record version differs")
+    values = validate_producer_safe_ambient(value.get("values"))
+    if value.get("sha256") != validation.environment_sha256(values):
+        raise WorkloadError("M3 MPI producer safe ambient record hash differs")
+    expected = expected_producer_safe_ambient(output, python)
+    if values != expected:
+        raise WorkloadError("M3 MPI producer safe ambient record is not authoritative")
+    return values
 
 
 def _identity(value: str) -> str:
@@ -456,8 +660,17 @@ def validate_rank_bundle(
             or stats.get("pid") != identity["pid"]
         ):
             raise WorkloadError(f"{lane.name} rank {rank} identity binding differs")
+        site_guard_expected = site_guard_expected_for_command(
+            expected_case_command
+        )
         passed, problems = validation.verify_backend_contract(
-            per_rank_case, lane.backend, stats, runtime_contract, run_nonce
+            per_rank_case,
+            lane.backend,
+            stats,
+            runtime_contract,
+            run_nonce,
+            BACKEND_ACKNOWLEDGEMENT_REASON,
+            site_guard_expected,
         )
         if not passed:
             raise WorkloadError(
@@ -768,6 +981,8 @@ def verify_complete(output: pathlib.Path, terminal: str = "COMPLETE") -> dict[st
         or marker.get("outcome") != "PASS"
         or report.get("schema") != SCHEMA
         or report.get("outcome") != "PASS"
+        or report.get("backend_acknowledgement_reason")
+        != BACKEND_ACKNOWLEDGEMENT_REASON
         or marker != _terminal(output, report)
     ):
         raise WorkloadError("M3 MPI terminal report binding differs")
@@ -784,6 +999,15 @@ def verify_complete(output: pathlib.Path, terminal: str = "COMPLETE") -> dict[st
         raise WorkloadError("M3 MPI retained runtime paths are not authoritative")
     expected_code = {
         "controller": absolute_file_record(pathlib.Path(__file__).resolve(), "controller"),
+        "backend_guard": absolute_file_record(
+            SCRIPT_DIR.parent / "gpmeep_backend_guard.py", "backend guard"
+        ),
+        "oracle": absolute_file_record(
+            SCRIPT_DIR / "run_example_oracle.py", "oracle"
+        ),
+        "sitecustomize": absolute_file_record(
+            SCRIPT_DIR / "sitecustomize.py", "sitecustomize"
+        ),
         "rank_launcher": absolute_file_record(paths["launcher"], "rank launcher"),
         "validation_runner": absolute_file_record(
             SCRIPT_DIR / "run_validation.py", "runner"
@@ -808,7 +1032,16 @@ def verify_complete(output: pathlib.Path, terminal: str = "COMPLETE") -> dict[st
         LANE_ORDER
     ):
         raise WorkloadError("M3 MPI retained lane inventory differs")
-    expected_case_command = validation.case_command(case, paths["python"], paths["repo"])
+    expected_case_command = validation.command_with_backend_acknowledgement(
+        validation.case_command(case, paths["python"], paths["repo"]),
+        BACKEND_ACKNOWLEDGEMENT_REASON,
+    )
+    site_guard_expected = site_guard_expected_for_command(
+        expected_case_command
+    )
+    producer_safe_ambient = validate_producer_safe_ambient_record(
+        report.get("producer_safe_ambient"), output, paths["python"]
+    )
     for lane in lanes:
         retained = report["lanes"].get(lane.name)
         root = lane_root(output, lane)
@@ -861,6 +1094,8 @@ def verify_complete(output: pathlib.Path, terminal: str = "COMPLETE") -> dict[st
             build_python=paths["build_python"],
             runtime_contract=snapshot["runtime_contract"],
             run_nonce=retained["run_nonce"],
+            site_guard_expected=site_guard_expected,
+            producer_safe_ambient=producer_safe_ambient,
         )
         if retained.get("environment_sha256") != validation.environment_sha256(
             expected_environment
@@ -952,7 +1187,17 @@ def main(argv: list[str] | None = None) -> int:
             args.cpu_ranks,
             tuple(value for value in args.gpu_devices.split(",") if value),
         )
-        case_command = validation.case_command(case, paths["python"], paths["repo"])
+        case_command = validation.command_with_backend_acknowledgement(
+            validation.case_command(case, paths["python"], paths["repo"]),
+            BACKEND_ACKNOWLEDGEMENT_REASON,
+        )
+        site_guard_expected = site_guard_expected_for_command(case_command)
+        producer_safe_ambient_values = validate_producer_safe_ambient(
+            validation.isolated_process_environment()
+        )
+        producer_safe_ambient = producer_safe_ambient_record(
+            producer_safe_ambient_values, output, paths["python"]
+        )
         lane_records = {}
         for lane in lanes:
             root = lane_root(output, lane)
@@ -965,6 +1210,8 @@ def main(argv: list[str] | None = None) -> int:
                 build_python=paths["build_python"],
                 runtime_contract=snapshot["runtime_contract"],
                 run_nonce=run_nonce,
+                site_guard_expected=site_guard_expected,
+                producer_safe_ambient=producer_safe_ambient_values,
             )
             command = lane_command(
                 lane,
@@ -1041,7 +1288,11 @@ def main(argv: list[str] | None = None) -> int:
                 [lane.devices for lane in lanes if lane.name == LANE_ORDER[2]][0]
             ),
             "receipt_id": receipt["receipt_id"],
+            "backend_acknowledgement_reason": (
+                BACKEND_ACKNOWLEDGEMENT_REASON
+            ),
             "paths": {name: str(path) for name, path in paths.items()},
+            "producer_safe_ambient": producer_safe_ambient,
             "runtime_snapshot": snapshot,
             "lanes": lane_records,
             "comparisons": comparisons,
@@ -1051,6 +1302,15 @@ def main(argv: list[str] | None = None) -> int:
             },
             "evidence_code": {
                 "controller": absolute_file_record(pathlib.Path(__file__).resolve(), "controller"),
+                "backend_guard": absolute_file_record(
+                    SCRIPT_DIR.parent / "gpmeep_backend_guard.py", "backend guard"
+                ),
+                "oracle": absolute_file_record(
+                    SCRIPT_DIR / "run_example_oracle.py", "oracle"
+                ),
+                "sitecustomize": absolute_file_record(
+                    SCRIPT_DIR / "sitecustomize.py", "sitecustomize"
+                ),
                 "rank_launcher": absolute_file_record(paths["launcher"], "rank launcher"),
                 "validation_runner": absolute_file_record(SCRIPT_DIR / "run_validation.py", "runner"),
                 "manifest": absolute_file_record(paths["manifest"], "manifest"),
@@ -1059,7 +1319,7 @@ def main(argv: list[str] | None = None) -> int:
         atomic_write_json(output / "report.json", report)
         atomic_write_json(output / "PENDING_COMPLETE", _terminal(output, report))
         verify_complete(output, "PENDING_COMPLETE")
-        os.replace(output / "PENDING_COMPLETE", output / "COMPLETE")
+        durable_publish_terminal(output / "PENDING_COMPLETE", output / "COMPLETE")
         return 0
     except Exception as exc:
         atomic_write_json(

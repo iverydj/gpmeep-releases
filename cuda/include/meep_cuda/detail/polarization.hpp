@@ -1,7 +1,10 @@
 #ifndef MEEP_CUDA_DETAIL_POLARIZATION_HPP
 #define MEEP_CUDA_DETAIL_POLARIZATION_HPP
 
+#include <cmath>
 #include <cstddef>
+#include <cstdint>
+#include <cstring>
 
 #ifdef __CUDACC__
 #define MEEP_CUDA_POLARIZATION_HOST_DEVICE __host__ __device__
@@ -52,23 +55,71 @@ struct lorentzian_coefficients_fp32 {
   float omega_dt_squared_denominator;
 };
 
+MEEP_CUDA_POLARIZATION_HOST_DEVICE inline bool
+lorentzian_positive_zero_fp32(float value) {
+#if defined(__CUDA_ARCH__)
+  return __float_as_uint(value) == 0U;
+#else
+  std::uint32_t bits = 0;
+  std::memcpy(&bits, &value, sizeof(bits));
+  return bits == 0U;
+#endif
+}
+
+MEEP_CUDA_POLARIZATION_HOST_DEVICE inline bool
+lorentzian_sparse_point_active_fp32(float polarization, float auxiliary,
+                                    float sigma) {
+  return !lorentzian_positive_zero_fp32(polarization) ||
+         !lorentzian_positive_zero_fp32(auxiliary) ||
+         !lorentzian_positive_zero_fp32(sigma);
+}
+
+MEEP_CUDA_POLARIZATION_HOST_DEVICE inline bool
+lorentzian_finite_fp32(float value) {
+#if defined(__CUDA_ARCH__)
+  return isfinite(value);
+#else
+  return std::isfinite(value);
+#endif
+}
+
+MEEP_CUDA_POLARIZATION_HOST_DEVICE inline bool
+lorentzian_coefficients_finite_fp32(
+    const lorentzian_coefficients_fp32 &coefficients) {
+  return lorentzian_finite_fp32(coefficients.gamma_inverse) &&
+         lorentzian_finite_fp32(coefficients.gamma_previous) &&
+         lorentzian_finite_fp32(coefficients.omega_dt_squared) &&
+         lorentzian_finite_fp32(
+             coefficients.omega_dt_squared_denominator);
+}
+
 MEEP_CUDA_POLARIZATION_HOST_DEVICE inline void
 apply_lorentzian_update_fp32(
     float &polarization, float &previous_polarization, float field,
     float sigma, float offdiagonal1, float offdiagonal2,
     bool anisotropic,
-    const lorentzian_coefficients_fp32 &coefficients) {
+    const lorentzian_coefficients_fp32 &coefficients,
+    bool elide_bit_identical_positive_zero = false) {
   // Match Meep's boundary-stability guard for anisotropic sigma exactly.
   if (anisotropic && sigma == 0.0f) return;
 
   const float current = polarization;
-  polarization =
+  const float next_polarization =
       coefficients.gamma_inverse *
       (current *
            (2.0f - coefficients.omega_dt_squared_denominator) -
        coefficients.gamma_previous * previous_polarization +
        coefficients.omega_dt_squared *
            (sigma * field + offdiagonal1 + offdiagonal2));
+  if (elide_bit_identical_positive_zero && !anisotropic &&
+      lorentzian_positive_zero_fp32(current) &&
+      lorentzian_positive_zero_fp32(previous_polarization) &&
+      lorentzian_positive_zero_fp32(sigma) &&
+      lorentzian_finite_fp32(field) &&
+      lorentzian_coefficients_finite_fp32(coefficients) &&
+      lorentzian_positive_zero_fp32(next_polarization))
+    return;
+  polarization = next_polarization;
   previous_polarization = current;
 }
 
@@ -81,7 +132,8 @@ apply_lorentzian_increment_update_fp32(
     float &polarization, float &polarization_increment, float field,
     float sigma, float offdiagonal1, float offdiagonal2,
     bool anisotropic,
-    const lorentzian_coefficients_fp32 &coefficients) {
+    const lorentzian_coefficients_fp32 &coefficients,
+    bool elide_bit_identical_positive_zero = false) {
   // Match Meep's boundary-stability guard for anisotropic sigma exactly.
   if (anisotropic && sigma == 0.0f) return;
 
@@ -91,8 +143,45 @@ apply_lorentzian_increment_update_fp32(
        coefficients.omega_dt_squared_denominator * polarization +
        coefficients.omega_dt_squared *
            (sigma * field + offdiagonal1 + offdiagonal2));
+  if (elide_bit_identical_positive_zero && !anisotropic &&
+      lorentzian_positive_zero_fp32(polarization) &&
+      lorentzian_positive_zero_fp32(polarization_increment) &&
+      lorentzian_positive_zero_fp32(sigma) &&
+      lorentzian_finite_fp32(field) &&
+      lorentzian_coefficients_finite_fp32(coefficients) &&
+      lorentzian_positive_zero_fp32(next_increment) &&
+      lorentzian_positive_zero_fp32(polarization + next_increment))
+    return;
   polarization += next_increment;
   polarization_increment = next_increment;
+}
+
+// A sparse plan may omit a positive-zero state only when the exact recurrence
+// preserves positive zero for every finite field sign class.  This predicate
+// deliberately executes the same recurrence helpers as the update kernels;
+// it is compiled for both host and device so validation can require agreement.
+MEEP_CUDA_POLARIZATION_HOST_DEVICE inline bool
+lorentzian_sparse_coefficients_safe_fp32(
+    const lorentzian_coefficients_fp32 &coefficients,
+    bool increment_state) {
+  if (!lorentzian_coefficients_finite_fp32(coefficients)) return false;
+  const float field_sign_classes[4] = {0.0f, -0.0f, 1.0f, -1.0f};
+  for (int field_class = 0; field_class < 4; ++field_class) {
+    float polarization = 0.0f;
+    float auxiliary = 0.0f;
+    if (increment_state)
+      apply_lorentzian_increment_update_fp32(
+          polarization, auxiliary, field_sign_classes[field_class], 0.0f,
+          0.0f, 0.0f, false, coefficients, false);
+    else
+      apply_lorentzian_update_fp32(
+          polarization, auxiliary, field_sign_classes[field_class], 0.0f,
+          0.0f, 0.0f, false, coefficients, false);
+    if (!lorentzian_positive_zero_fp32(polarization) ||
+        !lorentzian_positive_zero_fp32(auxiliary))
+      return false;
+  }
+  return true;
 }
 
 enum gyrotropic_model_fp32 {

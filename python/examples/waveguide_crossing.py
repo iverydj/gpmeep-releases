@@ -13,6 +13,7 @@ optimization.
 
 import argparse
 import json
+import math
 from pathlib import Path
 import tempfile
 from typing import Callable, List, Optional, Tuple
@@ -147,6 +148,7 @@ def build_optimization_problem(
 
     sim = mp.Simulation(
         resolution=resolution,
+        Courant=0.5,
         cell_size=cell_size,
         boundary_layers=boundary_layers,
         sources=sources,
@@ -636,6 +638,27 @@ def analyze_FOM_convergence(
     return results, results_smoothed
 
 
+_VALIDATION_FIXED_SLICE_TIMESTEPS = 20_001
+_VALIDATION_OPTIMIZER_TIMESTEPS = 10_001
+
+
+def _configure_validation_fixed_work(problem, run_timesteps: List[int]) -> None:
+    """Pin validation solves to their declared maximum and record exact work."""
+    maximum_run_time = problem.maximum_run_time
+    if maximum_run_time is None or maximum_run_time <= 0:
+        raise AssertionError("validation problem has no positive fixed run time")
+    # ``stop_when_dft_decayed`` checks its maximum with ``>`` but permits the
+    # adaptive criterion at an exact ``minimum_run_time`` boundary.  Advancing
+    # the minimum by one representable float makes the first time strictly
+    # beyond the maximum the only legal stop, giving deterministic fixed work.
+    problem.minimum_run_time = math.nextafter(maximum_run_time, math.inf)
+
+    def record_timestep(simulation):
+        run_timesteps.append(int(simulation.fields.t))
+
+    problem.step_funcs = [*problem.step_funcs, mp.at_end(record_timestep)]
+
+
 def _run_optimizer_smoke() -> dict:
     """Run a two-epoch NLopt continuation and verify persisted state.
 
@@ -656,6 +679,7 @@ def _run_optimizer_smoke() -> dict:
     result_path = Path(output_directory.name) / "optimizer-result.npz"
     design = None
     checkpoint_epochs = []
+    run_timesteps = []
     scalar_metrics = {
         "beta_initial": beta_history[0],
         "beta_final": beta_history[-1],
@@ -670,6 +694,8 @@ def _run_optimizer_smoke() -> dict:
             dx=1.0,
             dy=1.0,
         )
+        epoch_run_timesteps = []
+        _configure_validation_fixed_work(problem, epoch_run_timesteps)
         design_size = problem.design_regions[0].design_parameters.weights.size
         if design is None:
             design = np.full(design_size, 0.5, dtype=np.float64)
@@ -753,6 +779,15 @@ def _run_optimizer_smoke() -> dict:
         design_step_l2 = float(np.linalg.norm(design - design_before))
         if not np.isfinite(design_step_l2) or design_step_l2 <= 1e-10:
             raise AssertionError("NLopt did not mutate the continuation design")
+        expected_epoch_timesteps = (
+            _VALIDATION_OPTIMIZER_TIMESTEPS,
+        ) * (2 * max_evaluations_per_epoch)
+        if tuple(epoch_run_timesteps) != expected_epoch_timesteps:
+            raise AssertionError(
+                "optimizer validation work was not fixed: "
+                f"epoch={epoch}, timesteps={epoch_run_timesteps}"
+            )
+        run_timesteps.extend(epoch_run_timesteps)
 
         epoch_record = {
             "beta": beta,
@@ -892,6 +927,7 @@ def _run_optimizer_smoke() -> dict:
             "result_roundtrip_max_abs_difference": (
                 result_roundtrip_max_abs_difference
             ),
+            "run_timesteps": run_timesteps,
         }
     )
     output_directory.cleanup()
@@ -908,6 +944,7 @@ def run_validation() -> None:
         ("tanh_beta1000", False, 1000.0),
     ]
     metrics = {}
+    fixed_slice_run_timesteps = []
     for name, use_smoothed_projection, beta in configurations:
         opt, mapping = build_optimization_problem(
             resolution=resolution,
@@ -916,6 +953,8 @@ def run_validation() -> None:
             dx=2.0,
             dy=2.0,
         )
+        configuration_run_timesteps = []
+        _configure_validation_fixed_work(opt, configuration_run_timesteps)
         grid_size = opt.design_regions[0].design_parameters.grid_size
         nx, ny = int(grid_size.x), int(grid_size.y)
         x_coordinates = np.linspace(-1.0, 1.0, nx)
@@ -1026,6 +1065,15 @@ def run_validation() -> None:
                 rtol=5e-2,
                 atol=1e-10,
             )
+        if tuple(configuration_run_timesteps) != (
+            _VALIDATION_FIXED_SLICE_TIMESTEPS,
+        ) * 3:
+            raise AssertionError(
+                "fixed-slice validation work was not fixed: "
+                f"configuration={name}, "
+                f"timesteps={configuration_run_timesteps}"
+            )
+        fixed_slice_run_timesteps.extend(configuration_run_timesteps)
         metrics[name] = {
             "adjoint_directional_derivative": adjoint_delta,
             "finite_difference_directional_derivative": (
@@ -1044,6 +1092,9 @@ def run_validation() -> None:
                     "saturation_objective_atol": saturation_objective_atol,
                 }
             )
+    metrics["fixed_work"] = {
+        "run_timesteps": fixed_slice_run_timesteps,
+    }
     metrics["optimizer_smoke"] = _run_optimizer_smoke()
     print("gpmeep-example-metrics:" + json.dumps(metrics, sort_keys=True))
 

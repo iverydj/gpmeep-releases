@@ -585,6 +585,17 @@ public:
   // callbacks or other non-thread-safe state. Default: false (serial).
   virtual bool is_thread_safe() const { return false; }
 
+  // sigma_row is part of the same concurrency contract, but is a separate
+  // hook so that a material implementation cannot accidentally opt its
+  // epsilon evaluator into OpenMP while leaving sigma_row unreviewed.
+  virtual bool is_thread_safe_for_sigma() const { return false; }
+
+  // Optional causal accounting hooks. The default implementation keeps the
+  // core material_function ABI usable by non-geometry subclasses without
+  // requiring any telemetry implementation.
+  virtual void note_parallel_epsilon(size_t points) { (void)points; }
+  virtual void note_parallel_sigma(size_t points) { (void)points; }
+
   /* polarizability sigma function: return c'th row of tensor */
   virtual void sigma_row(component c, double sigrow[3], const vec &r) {
     (void)c;
@@ -964,6 +975,15 @@ public:
   void dump(const char *filename, bool single_parallel_file = true);
   void load(const char *filename, bool single_parallel_file = true);
 
+  // Canonical per-array SHA-256 evidence for chi1inv and susceptibility
+  // sigma material storage on this MPI rank. This is intentionally read-only
+  // and avoids multi-gigabyte structure dumps in OFF/ON qualification runs.
+  std::string material_arrays_manifest() const;
+  unsigned long long gpmeep_state_epoch() const;
+  std::string gpmeep_state_manifest() const;
+  std::string gpmeep_chunk_layout_manifest() const;
+  void gpmeep_note_state_mutation();
+
   void dump_chunk_layout(const char *filename);
   void load_chunk_layout(const char *filename, boundary_region &br);
   void load_chunk_layout(const std::vector<grid_volume> &gvs, const std::vector<int> &ids,
@@ -1005,6 +1025,7 @@ private:
                                    int EorH);
 
   std::unique_ptr<binary_partition> bp;
+  unsigned long long gpmeep_mutation_epoch_;
 };
 
 // defined in structure.cpp
@@ -1093,6 +1114,12 @@ public:
   virtual double get_fwidth() const { return 0.0; }
   virtual void set_fwidth(double fw) { (void)fw; }
   virtual void set_frequency(std::complex<double> f) { (void)f; }
+
+  // Python-backed source-time subclasses override this with their retained
+  // callable.  Core Meep treats the value as opaque; the Python backend guard
+  // canonicalizes it transitively so an initialized-run receipt cannot outlive
+  // a mutable callback dependency.  This accessor is hidden from SWIG users.
+  virtual void *gpmeep_external_state() const { return NULL; }
 
 private:
   double current_time;
@@ -1275,8 +1302,15 @@ public:
   int vc; // component descriptor from the original volume
 
 private:
+  friend class fields_chunk;
+  void update_dft_impl(double time);
   int decimation_factor;
 };
+
+// Notify the owning fields object (if still alive) that a monitor's native
+// accumulator or lifecycle state changed. This keeps initialized-run backend
+// acknowledgements exact even for direct public DFT load/scale/remove calls.
+void gpmeep_note_dft_mutation(dft_chunk *dft_chunks);
 
 void save_dft_hdf5(dft_chunk *dft_chunks, component c, h5file *file, const char *dprefix = 0,
                    bool single_parallel_file = true);
@@ -1408,6 +1442,10 @@ struct sourcedata {
   std::vector<ptrdiff_t> idx_arr;
   int fc_idx;
   std::vector<std::complex<double> > amp_arr;
+
+  // Stable content manifest for Python backend-policy workload binding. This
+  // deliberately hashes vector contents rather than SWIG pointer identities.
+  std::string gpmeep_manifest() const;
 };
 
 // near2far.cpp (normally created with fields::add_dft_near2far)
@@ -1591,6 +1629,7 @@ public:
   structure_chunk *s;
   const char *outdir;
   int chunk_idx;
+  fields *gpmeep_fields_owner;
 
   fields_chunk(structure_chunk *, const char *outdir, double m, double beta,
                bool zero_fields_near_cylorigin, int chunkidx, int loop_tile_base_db,
@@ -1858,6 +1897,24 @@ public:
   void log(const char *prefix = "");
   void change_m(double new_m);
   bool has_nonlinearities(bool parallel = true) const;
+  // A lightweight, process-local mutation identity used by gpmeep's
+  // explicit-backend acknowledgement guard. The JSON manifest contains
+  // rank-local state; Python binds its digest in ordered MPI-rank order and
+  // separately binds the concrete wrapper identity so replacing the native
+  // owner also invalidates an outstanding acknowledgement.
+  unsigned long long gpmeep_state_epoch() const;
+  std::string gpmeep_state_manifest() const;
+  void gpmeep_note_state_mutation();
+  // Begin/end a nestable high-level operation that must keep one explicit
+  // process backend for all of its native steps. Ordinary direct fields::step
+  // calls remain backward-compatible operation boundaries of their own.
+  void gpmeep_begin_backend_operation() const;
+  // End the backend-consistency scope established by the most recent
+  // preflight. High-level Python operations call this after the complete
+  // operation has unwound so an otherwise-live wrapper does not prevent a
+  // later explicit backend choice. Direct C++ callers can use the same
+  // begin/release pair to bracket a multi-step operation.
+  void gpmeep_release_backend_pin() const noexcept;
 
   // time.cpp
   std::vector<double> time_spent_on(time_sink sink);
@@ -2348,6 +2405,10 @@ public:
 
 private:
   friend class fields_chunk_test_access;
+  unsigned long long gpmeep_mutation_epoch_;
+  mutable bool gpmeep_backend_pinned_;
+  mutable bool gpmeep_cpu_backend_fast_path_;
+  mutable unsigned int gpmeep_backend_operation_depth_;
   int synchronized_magnetic_fields; // count number of nested synchs
   double last_wall_time;
   std::vector<time_sink> was_working_on;
@@ -2378,6 +2439,8 @@ private:
   enum class boundary_eh_overlap { none, H, E, D_curl };
   bool step_boundaries_impl(field_type ft,
                             boundary_eh_overlap overlap);
+  void process_incoming_chunk_data_impl(field_type ft,
+                                        const chunk_pair &comm_pair);
   bool cuda_whole_update_eh_overlap_eligible(field_type ft,
                                               std::string *reason) const;
   void phase_material();
@@ -2439,7 +2502,6 @@ private:
   void cache_gpu_backend_preflight(bool cuda_execution,
                                    const std::string &diagnostic,
                                    bool feature_fallback = false) const;
-  void prepare_gpu_owner_for_cpu() const;
   bool gpu_step_preflight_is_cached() const;
   void cache_gpu_step_preflight() const;
   void validate_gpu_mpi_transport() const;
@@ -2484,12 +2546,12 @@ public:
   ~flux_vol() { delete next; }
 
   void update_half() {
-    cur_flux_half = flux_wrongE();
-    if (next) next->update_half();
+    f->gpmeep_note_state_mutation();
+    update_half_impl();
   }
   void update() {
-    cur_flux = (flux_wrongE() + cur_flux_half) * 0.5;
-    if (next) next->update();
+    f->gpmeep_note_state_mutation();
+    update_impl();
   }
 
   double flux() { return cur_flux; }
@@ -2497,6 +2559,20 @@ public:
   flux_vol *next;
 
 private:
+  friend class fields;
+
+  // fields::step already advances the owning fields epoch once before any
+  // scientific mutation. Keep the internal monitor walk separate so normal
+  // timestepping pays no duplicate policy bookkeeping, while direct public
+  // SWIG calls to update/update_half still invalidate an exact-run receipt.
+  void update_half_impl() {
+    cur_flux_half = flux_wrongE();
+    if (next) next->update_half_impl();
+  }
+  void update_impl() {
+    cur_flux = (flux_wrongE() + cur_flux_half) * 0.5;
+    if (next) next->update_impl();
+  }
   double flux_wrongE() { return f->flux_in_box_wrongH(d, where); }
   fields *f;
   direction d;

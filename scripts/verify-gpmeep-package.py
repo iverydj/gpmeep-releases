@@ -9,7 +9,10 @@ import json
 import os
 import pathlib
 import re
+import stat
+import subprocess
 import sys
+import tempfile
 from typing import Any
 
 _SCRIPT_DIRECTORY = pathlib.Path(__file__).resolve().parent
@@ -30,10 +33,205 @@ SCHEMA_VERSION = 1
 CONDA_BUILD_NUMBER = 0
 CONDA_BUILD_STRING = "cuda124_mpi_openmpi_py311_0"
 CONDA_SUBDIR = "linux-64"
+_V110_CANDIDATE_RECEIPT_RELATIVE = "share/gpmeep/v110-candidate-build-receipt.json"
 
 
 class VerificationError(RuntimeError):
     pass
+
+
+def _run_v110_validator(contract: pathlib.Path, validator: pathlib.Path, mode: str) -> None:
+    if not validator.is_file():
+        raise VerificationError("v1.1 development-contract validator is absent")
+    result = subprocess.run(
+        [sys.executable, str(validator), "--contract", str(contract), mode],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env={"PATH": "/usr/bin:/bin", "PYTHONNOUSERSITE": "1"},
+    )
+    if result.returncode != 0:
+        raise VerificationError("v1.1 development contract preflight failed")
+
+
+def _validate_v110_development_contract(prefix: pathlib.Path) -> dict[str, Any] | None:
+    """Bind v1.1 package verification to the source/installed contract gate."""
+    source_root = _SCRIPT_DIRECTORY.parent
+    source_contract = source_root / "packaging/v110-development-contract.json"
+    # The canonical source verifier lives in ``scripts``.  Its installed copy
+    # lives in ``share/gpmeep/libexec``, whose parent intentionally contains a
+    # package-relative ``packaging`` directory as well.  Do not mistake that
+    # installed payload for a complete source tree: ``--contract-only`` also
+    # validates source documentation and release-controller wiring which are
+    # deliberately outside the installed-package contract.
+    if _SCRIPT_DIRECTORY.name == "scripts":
+        if not source_contract.is_file():
+            raise VerificationError("v1.1 source development contract is absent")
+        _run_v110_validator(
+            source_contract,
+            _SCRIPT_DIRECTORY / "validate-v110-development-contract.py",
+            "--contract-only",
+        )
+    if DISTRIBUTION_VERSION != "1.1.0":
+        return None
+
+    share = prefix / "share/gpmeep"
+    packaging = share / "packaging"
+    contract = packaging / "v110-development-contract.json"
+    equal_work_plan = packaging / "v110-m4-equal-work-plan.json"
+    schema = packaging / "v110-performance-inversion-record.schema.json"
+    inventory = packaging / "v110-performance-inversion-inventory.json"
+    receipt = prefix / _V110_CANDIDATE_RECEIPT_RELATIVE
+    validator = share / "libexec/validate-v110-development-contract.py"
+    receipt_tool = share / "libexec/v110-release-gate-receipt.py"
+    final_receipt_tool = share / "libexec/v110-final-release-receipt.py"
+    closure_tool = share / "libexec/close-v110-inversion-registry.py"
+    for required in (
+        contract,
+        equal_work_plan,
+        schema,
+        inventory,
+        receipt,
+        validator,
+        receipt_tool,
+        final_receipt_tool,
+        closure_tool,
+    ):
+        if not required.is_file():
+            raise VerificationError(f"installed v1.1 package omits gate file: {required.name}")
+    _run_v110_validator(contract, validator, "--installed-package")
+    return {
+        "contract": contract,
+        "equal_work_plan": equal_work_plan,
+        "schema": schema,
+        "inventory": inventory,
+        "receipt": receipt,
+        "receipt_tool": receipt_tool,
+        "final_receipt_tool": final_receipt_tool,
+        "closure_tool": closure_tool,
+    }
+
+
+def _verify_v110_candidate_receipt(
+    files: dict[str, Any], *, expected_mode: str
+) -> dict[str, Any]:
+    arguments = [
+        sys.executable,
+        "-I",
+        str(files["receipt_tool"]),
+        "--verify",
+        "--receipt",
+        str(files["receipt"]),
+        "--contract",
+        str(files["contract"]),
+        "--schema",
+        str(files["schema"]),
+        "--inventory",
+        str(files["inventory"]),
+        "--embedded-only",
+    ]
+    if expected_mode == "candidate":
+        arguments.append("--require-candidate")
+    result = subprocess.run(
+        arguments,
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env={"PATH": "/usr/bin:/bin", "PYTHONNOUSERSITE": "1"},
+    )
+    if result.returncode != 0:
+        raise VerificationError("v1.1 candidate-build receipt verification failed")
+    try:
+        receipt = json.loads(
+            files["receipt"].read_text(encoding="utf-8"),
+            object_pairs_hook=_unique_json_object,
+            parse_constant=_reject_json_constant,
+        )
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        raise VerificationError("v1.1 candidate-build receipt is unreadable") from error
+    if receipt.get("build_mode") != expected_mode:
+        raise VerificationError("v1.1 package build mode differs from its candidate receipt")
+    return receipt
+
+
+def _verify_v110_final_receipt(
+    files: dict[str, Any],
+    *,
+    receipt_path: pathlib.Path,
+    package_path: pathlib.Path,
+    qualification_manifest: pathlib.Path,
+    evidence_root: pathlib.Path,
+    release_source_root: pathlib.Path,
+    candidate_contract_gate: pathlib.Path,
+    candidate_registry_gate: pathlib.Path,
+    candidate_attestation: pathlib.Path,
+    m4_candidate_manifest: pathlib.Path,
+    candidate_evidence_root: pathlib.Path,
+    source_transition_policy: pathlib.Path,
+    expected_source_transition_policy_sha256: str,
+    source_transition_verifier: pathlib.Path,
+    expected_source_transition_verifier_sha256: str,
+    final_audit_authority: pathlib.Path,
+    expected_final_audit_authority_sha256: str,
+) -> dict[str, Any]:
+    source_root = release_source_root.resolve(strict=True)
+    if not source_root.is_dir() or source_root.is_symlink():
+        raise VerificationError("v1.1 release source root is unsafe")
+    source_files = {
+        "final_receipt_tool": source_root / "scripts/v110-final-release-receipt.py",
+        "receipt_tool": source_root / "scripts/v110-release-gate-receipt.py",
+        "contract": source_root / "packaging/v110-development-contract.json",
+        "schema": source_root / "packaging/v110-performance-inversion-record.schema.json",
+        "inventory": source_root / "packaging/v110-performance-inversion-inventory.json",
+    }
+    if any(not path.is_file() or path.is_symlink() for path in source_files.values()):
+        raise VerificationError("v1.1 release source root omits an exact verifier input")
+    arguments = [
+        sys.executable,
+        "-I",
+        str(source_files["final_receipt_tool"]),
+        "--verify",
+        "--receipt", str(receipt_path),
+        "--package", str(package_path),
+        "--candidate-receipt", str(files["receipt"]),
+        "--candidate-tool", str(source_files["receipt_tool"]),
+        "--contract", str(source_files["contract"]),
+        "--inversion-schema", str(source_files["schema"]),
+        "--inventory", str(source_files["inventory"]),
+        "--qualification-manifest", str(qualification_manifest),
+        "--evidence-root", str(evidence_root),
+        "--candidate-contract-gate", str(candidate_contract_gate),
+        "--candidate-registry-gate", str(candidate_registry_gate),
+        "--candidate-attestation", str(candidate_attestation),
+        "--m4-candidate-manifest", str(m4_candidate_manifest),
+        "--candidate-evidence-root", str(candidate_evidence_root),
+        "--source-transition-policy", str(source_transition_policy),
+        "--expected-source-transition-policy-sha256", expected_source_transition_policy_sha256,
+        "--source-transition-verifier", str(source_transition_verifier),
+        "--expected-source-transition-verifier-sha256", expected_source_transition_verifier_sha256,
+        "--final-audit-authority", str(final_audit_authority),
+        "--expected-final-audit-authority-sha256", expected_final_audit_authority_sha256,
+    ]
+    result = subprocess.run(
+        arguments,
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env={"PATH": "/usr/bin:/bin", "PYTHONNOUSERSITE": "1"},
+    )
+    if result.returncode != 0:
+        raise VerificationError("v1.1 external final-release receipt verification failed")
+    try:
+        return json.loads(
+            receipt_path.read_text(encoding="utf-8"),
+            object_pairs_hook=_unique_json_object,
+            parse_constant=_reject_json_constant,
+        )
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        raise VerificationError("v1.1 external final-release receipt is unreadable") from error
 
 
 def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -91,10 +289,16 @@ def _one_conda_record(prefix: pathlib.Path) -> tuple[pathlib.Path, dict[str, Any
         raise VerificationError("gpmeep conda record is unreadable") from error
     if value.get("name") != "gpmeep" or value.get("version") != DISTRIBUTION_VERSION:
         raise VerificationError("gpmeep conda record identity is invalid")
+    valid_build = value.get("build") == CONDA_BUILD_STRING
+    if DISTRIBUTION_VERSION == "1.1.0":
+        valid_build = value.get("build") in {
+            "cuda124_mpi_openmpi_py311_0_development",
+            "cuda124_mpi_openmpi_py311_0",
+        }
     if (
         type(value.get("build_number")) is not int
         or value["build_number"] != CONDA_BUILD_NUMBER
-        or value.get("build") != CONDA_BUILD_STRING
+        or not valid_build
         or value.get("subdir") != CONDA_SUBDIR
     ):
         raise VerificationError("gpmeep conda build identity is invalid")
@@ -317,13 +521,52 @@ def _manifest(prefix: pathlib.Path, expected_commit: str | None) -> dict[str, An
 
 
 def _write_new(path: pathlib.Path, value: dict[str, Any]) -> None:
-    path = path.resolve()
-    path.parent.mkdir(parents=True, exist_ok=True)
+    destination = path.absolute()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    parent = destination.parent.resolve(strict=True)
+    if parent != destination.parent:
+        raise VerificationError("report parent cannot contain symlinks")
+    destination = parent / destination.name
+    if destination.exists() or destination.is_symlink():
+        raise VerificationError(f"refusing to overwrite report: {destination}")
+    payload = (_canonical_json(value) + "\n").encode("utf-8")
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{destination.name}.", dir=parent
+    )
+    temporary = pathlib.Path(temporary_name)
+    linked = False
+    committed = False
     try:
-        with path.open("x", encoding="utf-8") as stream:
-            stream.write(_canonical_json(value) + "\n")
-    except FileExistsError as error:
-        raise VerificationError(f"refusing to overwrite report: {path}") from error
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.link(temporary, destination)
+        linked = True
+        if stat.S_IMODE(destination.stat().st_mode) != 0o600:
+            raise VerificationError("report mode differs after publication")
+        if destination.read_bytes() != payload:
+            raise VerificationError("report bytes differ after publication")
+        temporary.unlink()
+        directory_descriptor = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
+        committed = True
+    finally:
+        temporary.unlink(missing_ok=True)
+        if linked and not committed:
+            destination.unlink(missing_ok=True)
+            try:
+                directory_descriptor = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(directory_descriptor)
+                finally:
+                    os.close(directory_descriptor)
+            except OSError:
+                pass
 
 
 def _parse_args() -> argparse.Namespace:
@@ -331,6 +574,22 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--prefix", type=pathlib.Path, default=pathlib.Path(sys.prefix))
     parser.add_argument("--expected-source-commit")
     parser.add_argument("--expected-package-sha256")
+    parser.add_argument("--package-file", type=pathlib.Path)
+    parser.add_argument("--final-release-receipt", type=pathlib.Path)
+    parser.add_argument("--qualification-manifest", type=pathlib.Path)
+    parser.add_argument("--release-evidence-root", type=pathlib.Path)
+    parser.add_argument("--release-source-root", type=pathlib.Path)
+    parser.add_argument("--candidate-contract-gate", type=pathlib.Path)
+    parser.add_argument("--candidate-registry-gate", type=pathlib.Path)
+    parser.add_argument("--candidate-attestation", type=pathlib.Path)
+    parser.add_argument("--m4-candidate-manifest", type=pathlib.Path)
+    parser.add_argument("--candidate-evidence-root", type=pathlib.Path)
+    parser.add_argument("--source-transition-policy", type=pathlib.Path)
+    parser.add_argument("--expected-source-transition-policy-sha256")
+    parser.add_argument("--source-transition-verifier", type=pathlib.Path)
+    parser.add_argument("--expected-source-transition-verifier-sha256")
+    parser.add_argument("--final-audit-authority", type=pathlib.Path)
+    parser.add_argument("--expected-final-audit-authority-sha256")
     parser.add_argument("--report", type=pathlib.Path)
     return parser.parse_args()
 
@@ -349,6 +608,13 @@ def main() -> int:
     ):
         raise VerificationError("--expected-package-sha256 must be 64 lowercase hex")
     record_path, conda_record = _one_conda_record(prefix)
+    v110_gate = _validate_v110_development_contract(prefix)
+    v110_receipt = None
+    final_release = None
+    if v110_gate is not None:
+        build_string = conda_record.get("build", "")
+        expected_mode = "development" if build_string.endswith("_development") else "candidate"
+        v110_receipt = _verify_v110_candidate_receipt(v110_gate, expected_mode=expected_mode)
     package_sha256 = _validate_package_identity(
         conda_record, args.expected_package_sha256
     )
@@ -361,12 +627,80 @@ def main() -> int:
         "share/gpmeep/cuda-architecture-inventory.json",
         "share/gpmeep/glibc-compatibility.json",
         "share/gpmeep/libexec/check-cuda-architecture-inventory.py",
+        "share/gpmeep/libexec/gpmeep_backend_guard.py",
         "share/gpmeep/libexec/gpmeep_release_manifest.py",
         "share/gpmeep/release.json",
     }
+    if DISTRIBUTION_VERSION == "1.1.0":
+        required_paths.update(
+            {
+                "share/gpmeep/libexec/v110-release-gate-receipt.py",
+                "share/gpmeep/libexec/v110-final-release-receipt.py",
+                "share/gpmeep/libexec/close-v110-inversion-registry.py",
+                "share/gpmeep/libexec/validate-v110-development-contract.py",
+                "share/gpmeep/libexec/v110-inversion-qualified-child.py",
+                "share/gpmeep/packaging/v110-development-contract.json",
+                "share/gpmeep/packaging/v110-m4-equal-work-plan.json",
+                "share/gpmeep/packaging/v110-performance-inversion-record.schema.json",
+                "share/gpmeep/packaging/v110-performance-inversion-inventory.json",
+                "share/gpmeep/v110-candidate-build-receipt.json",
+            }
+        )
     missing = sorted(required_paths - set(paths))
     if missing:
         raise VerificationError(f"gpmeep package omits required paths: {missing}")
+    manifest = _manifest(prefix, args.expected_source_commit)
+    if v110_receipt is not None and v110_receipt["source_commit"] != manifest["source_commit"]:
+        raise VerificationError("v1.1 gate receipt source commit differs from release manifest")
+    final_arguments = (
+        args.package_file,
+        args.final_release_receipt,
+        args.qualification_manifest,
+        args.release_evidence_root,
+        args.release_source_root,
+        args.candidate_contract_gate,
+        args.candidate_registry_gate,
+        args.candidate_attestation,
+        args.m4_candidate_manifest,
+        args.candidate_evidence_root,
+        args.source_transition_policy,
+        args.expected_source_transition_policy_sha256,
+        args.source_transition_verifier,
+        args.expected_source_transition_verifier_sha256,
+        args.final_audit_authority,
+        args.expected_final_audit_authority_sha256,
+    )
+    if any(item is not None for item in final_arguments):
+        if v110_gate is None or v110_receipt is None or not all(item is not None for item in final_arguments):
+            raise VerificationError("final-release verification requires package, receipt, qualification/evidence, release source, and candidate replay inputs")
+        if v110_receipt["build_mode"] != "candidate":
+            raise VerificationError("a development package cannot carry final release authority")
+        final_release = _verify_v110_final_receipt(
+            v110_gate,
+            receipt_path=args.final_release_receipt,
+            package_path=args.package_file,
+            qualification_manifest=args.qualification_manifest,
+            evidence_root=args.release_evidence_root,
+            release_source_root=args.release_source_root,
+            candidate_contract_gate=args.candidate_contract_gate,
+            candidate_registry_gate=args.candidate_registry_gate,
+            candidate_attestation=args.candidate_attestation,
+            m4_candidate_manifest=args.m4_candidate_manifest,
+            candidate_evidence_root=args.candidate_evidence_root,
+            source_transition_policy=args.source_transition_policy,
+            expected_source_transition_policy_sha256=args.expected_source_transition_policy_sha256,
+            source_transition_verifier=args.source_transition_verifier,
+            expected_source_transition_verifier_sha256=args.expected_source_transition_verifier_sha256,
+            final_audit_authority=args.final_audit_authority,
+            expected_final_audit_authority_sha256=args.expected_final_audit_authority_sha256,
+        )
+        if (
+            final_release.get("state") != "RELEASE_AUTHORIZED"
+            or final_release.get("package", {}).get("sha256") != package_sha256
+            or final_release.get("candidate_authority", {}).get("receipt_id") != v110_receipt["receipt_id"]
+            or final_release.get("candidate_authority", {}).get("source_commit") != manifest["source_commit"]
+        ):
+            raise VerificationError("external final-release authority is not bound to this installed package")
     report = {
         "schema_version": SCHEMA_VERSION,
         "state": "PASS",
@@ -375,9 +709,13 @@ def main() -> int:
         "package_url": conda_record.get("url"),
         "package_sha256": package_sha256,
         "ownership": audit,
-        "manifest": _manifest(prefix, args.expected_source_commit),
+        "manifest": manifest,
         "runtime": _runtime(prefix),
     }
+    if v110_receipt is not None:
+        report["v110_candidate_gate"] = v110_receipt
+    if final_release is not None:
+        report["v110_final_release"] = final_release
     report["report_id"] = hashlib.sha256(
         _canonical_json(report).encode("utf-8")
     ).hexdigest()

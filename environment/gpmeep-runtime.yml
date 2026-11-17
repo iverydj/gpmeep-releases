@@ -30,3 +30,6 @@ dependencies:
   - trimesh
   - gdstk=1.0.1
   - setuptools
+  # Contract/registry validation is part of the locked test runtime. Keeping
+  # it here prevents CI or local tests from escaping to a host Python.
+  - jsonschema=4.26.0

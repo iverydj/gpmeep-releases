@@ -66,6 +66,9 @@ export PKG_CONFIG_PATH="${PREFIX}/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
 # internal build paths in libmeep diagnostics.
 export CFLAGS="${CFLAGS:-} -ffile-prefix-map=${SRC_DIR}=gpmeep-source"
 export CXXFLAGS="${CXXFLAGS:-} -ffile-prefix-map=${SRC_DIR}=gpmeep-source"
+# NVCC otherwise embeds a process-specific intermediate filename in the ELF.
+# Retain strict optimization and use an object-relative intermediate name.
+export NVCCFLAGS="-O3 --objdir-as-tempdir"
 
 cd "${SRC_DIR}"
 autoreconf --verbose --install --symlink --force
@@ -76,7 +79,9 @@ if [[ -e "${BUILD_DIRECTORY}" ]]; then
 fi
 mkdir -p "${BUILD_DIRECTORY}"
 cd "${BUILD_DIRECTORY}"
-"${SRC_DIR}/configure" \
+# Relative source paths also keep CUDA diagnostics independent of SRC_DIR;
+# NVCC does not apply the host compiler's file-prefix-map to device code.
+../configure \
   --enable-maintainer-mode \
   --enable-shared \
   --enable-single \
@@ -117,15 +122,41 @@ install -m 0644 "${RECIPE_DIR}/meep.pc" \
   "${PREFIX}/lib/pkgconfig/meep.pc"
 
 install -d "${PREFIX}/bin" "${PREFIX}/share/gpmeep/examples" \
-  "${PREFIX}/share/gpmeep/docs" "${PREFIX}/share/gpmeep/libexec"
+  "${PREFIX}/share/gpmeep/docs" "${PREFIX}/share/gpmeep/libexec" \
+  "${PREFIX}/share/gpmeep/packaging"
 install -m 0644 "${SRC_DIR}/scripts/gpmeep-self-check.py" \
   "${PREFIX}/share/gpmeep/libexec/gpmeep-self-check.py"
+install -m 0644 "${SRC_DIR}/scripts/gpmeep_backend_guard.py" \
+  "${PREFIX}/share/gpmeep/libexec/gpmeep_backend_guard.py"
 install -m 0644 "${SRC_DIR}/scripts/verify-gpmeep-package.py" \
   "${PREFIX}/share/gpmeep/libexec/gpmeep-verify-provenance.py"
 install -m 0644 "${SRC_DIR}/scripts/gpmeep_release_manifest.py" \
   "${PREFIX}/share/gpmeep/libexec/gpmeep_release_manifest.py"
 install -m 0644 "${SRC_DIR}/scripts/check-cuda-architecture-inventory.py" \
   "${PREFIX}/share/gpmeep/libexec/check-cuda-architecture-inventory.py"
+if [[ -f "${SRC_DIR}/packaging/v110-development-contract.json" ]]; then
+  if [[ -z "${GPMEEP_V110_CANDIDATE_RECEIPT:-}" \
+        || ! -f "${GPMEEP_V110_CANDIDATE_RECEIPT}" \
+        || -L "${GPMEEP_V110_CANDIDATE_RECEIPT}" ]]; then
+    echo "error: v1.1.0 candidate-build receipt is absent" >&2
+    exit 1
+  fi
+  install -m 0644 \
+    "${SRC_DIR}/packaging/v110-development-contract.json" \
+    "${SRC_DIR}/packaging/v110-m4-equal-work-plan.json" \
+    "${SRC_DIR}/packaging/v110-performance-inversion-record.schema.json" \
+    "${SRC_DIR}/packaging/v110-performance-inversion-inventory.json" \
+    "${PREFIX}/share/gpmeep/packaging/"
+  install -m 0644 \
+    "${SRC_DIR}/scripts/validate-v110-development-contract.py" \
+    "${SRC_DIR}/scripts/v110-release-gate-receipt.py" \
+    "${SRC_DIR}/scripts/v110-final-release-receipt.py" \
+    "${SRC_DIR}/scripts/close-v110-inversion-registry.py" \
+    "${SRC_DIR}/scripts/v110-inversion-qualified-child.py" \
+    "${PREFIX}/share/gpmeep/libexec/"
+  install -m 0644 "${GPMEEP_V110_CANDIDATE_RECEIPT}" \
+    "${PREFIX}/share/gpmeep/v110-candidate-build-receipt.json"
+fi
 install -m 0755 "${SRC_DIR}/scripts/gpmeep-self-check-launcher.sh" \
   "${PREFIX}/bin/gpmeep-self-check"
 install -m 0755 "${SRC_DIR}/scripts/gpmeep-verify-provenance-launcher.sh" \
@@ -144,6 +175,7 @@ install -m 0644 \
   "${SRC_DIR}/doc/docs/GPMEEP_V1_0_1_RELEASE_NOTES.md" \
   "${SRC_DIR}/doc/docs/GPMEEP_V1_0_2_RELEASE_NOTES.md" \
   "${SRC_DIR}/doc/docs/GPMEEP_V1_0_3_RELEASE_NOTES.md" \
+  "${SRC_DIR}/doc/docs/GPMEEP_V1_1_0_RELEASE_NOTES.md" \
   "${SRC_DIR}/doc/docs/GPMEEP_LICENSE_AND_PROVENANCE.md" \
   "${PREFIX}/share/gpmeep/docs/"
 

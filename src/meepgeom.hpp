@@ -21,6 +21,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <cstdint>
 #include <vector>
 
 #include "material_data.hpp"
@@ -55,6 +56,49 @@ struct dft_data {
 
   dft_data(int freqs, int components, std::vector<meep::volume> volumes);
 };
+
+// Resettable causal evidence for the opt-in static-material OpenMP path.
+// Keep this as a plain aggregate so it is available through the Python SWIG
+// module as well as to native regression tests.
+struct material_omp_statistics {
+  unsigned long long feature_checks;
+  unsigned long long enabled_checks;
+  unsigned long long eligible_checks;
+  unsigned long long disabled_checks;
+  unsigned long long unsafe_material_checks;
+  unsigned long long guard_rejections;
+  unsigned long long stale_epoch_rejections;
+  unsigned long long non_openmp_checks;
+  unsigned long long epsilon_parallel_calls;
+  unsigned long long epsilon_parallel_points;
+  unsigned long long sigma_parallel_calls;
+  unsigned long long sigma_parallel_points;
+  unsigned long long team_observations;
+  unsigned long long team_mismatch_observations;
+  unsigned long long configured_threads;
+  unsigned long long observed_threads;
+  unsigned long long geometry_epoch;
+  unsigned long long prism_preflight_calls;
+  unsigned long long reset_generation;
+  bool prism_preflight_complete;
+  bool counter_overflow;
+};
+
+material_omp_statistics get_material_omp_statistics();
+void reset_material_omp_statistics();
+
+// Shared serialization boundary for libctl's process-global geometry state.
+// GDSII and libpympb use the same RAII object as Meep geometry setup so C4
+// evaluation cannot overlap a cooperating writer in another frontend.
+class geometry_state_transaction {
+public:
+  geometry_state_transaction();
+  ~geometry_state_transaction();
+  geometry_state_transaction(const geometry_state_transaction &) = delete;
+  geometry_state_transaction &operator=(const geometry_state_transaction &) = delete;
+};
+
+void commit_geometry_state_mutation();
 
 struct fragment_stats {
   static double tol;
@@ -207,12 +251,12 @@ public:
   virtual void eff_chi1inv_row(meep::component c, double chi1inv_row[3], const meep::volume &v,
                                double tol, int maxeval);
 
-  // geom_epsilon is not safe to evaluate concurrently.  Position-dependent
-  // materials mutate material_data::medium, and the anisotropic-averaging
-  // fallback also uses shared integration state.  Keep material-array
-  // initialization serial until those evaluators are made reentrant; FDTD
-  // time stepping remains independently parallelized.
-  virtual bool is_thread_safe() const { return false; }
+  // Only a frozen tree whose selectable leaves are immutable MEDIUM or
+  // PERFECT_METAL values can enter the explicit C4 OpenMP path.
+  virtual bool is_thread_safe() const;
+  virtual bool is_thread_safe_for_sigma() const;
+  virtual void note_parallel_epsilon(size_t points);
+  virtual void note_parallel_sigma(size_t points);
   bool has_user_materials;
 
   void eff_chi1inv_matrix(meep::component c, symm_matrix *chi1inv_matrix, const meep::volume &v,
@@ -228,6 +272,11 @@ public:
   void get_material_pt(material_type &material, const meep::vec &r);
 
 private:
+  bool parallel_eligible(bool sigma) const;
+  unsigned long long geometry_epoch;
+  bool omp_safe_materials;
+  bool omp_has_prism;
+  mutable bool omp_team_observed;
   material_type_list extra_materials;
   pol *current_pol;
 };

@@ -63,6 +63,49 @@ def fake_meep(
     )
 
 
+def relocated_source_bytecode_record(
+    *, python_version: str = "3.14", digest_character: str = "a"
+):
+    cache_tag = python_version.replace(".", "")
+    return {
+        "archive_sha256": "0" * 64,
+        "current_sha256": digest_character * 64,
+        "current_state": "relocated-source-compiled",
+        "derived_sha256": digest_character * 64,
+        "derived_size_bytes": 128,
+        "installed_source_hash_hex": "1" * 16,
+        "installed_source_sha256": "2" * 64,
+        "path": (
+            f"lib/python{python_version}/site-packages/fixture/__pycache__/"
+            f"relocated.cpython-{cache_tag}.pyc"
+        ),
+        "source_path": (
+            f"lib/python{python_version}/site-packages/fixture/relocated.py"
+        ),
+    }
+
+
+def generated_source_bytecode_record(
+    *, python_version: str = "3.14", digest_character: str = "b"
+):
+    cache_tag = python_version.replace(".", "")
+    return {
+        "current_sha256": digest_character * 64,
+        "current_state": "source-compiled",
+        "derived_sha256": digest_character * 64,
+        "derived_size_bytes": 128,
+        "installed_source_hash_hex": "3" * 16,
+        "installed_source_sha256": "4" * 64,
+        "path": (
+            f"lib/python{python_version}/site-packages/fixture/__pycache__/"
+            f"generated.cpython-{cache_tag}.pyc"
+        ),
+        "source_path": (
+            f"lib/python{python_version}/site-packages/fixture/generated.py"
+        ),
+    }
+
+
 def cpu_statistics(*, boundary_calls: int = 1):
     return {
         "dispatch": {
@@ -352,8 +395,9 @@ class CpuMpiFp64ReceiptVerifierTests(unittest.TestCase):
 
         lock_record = PROVENANCE.file_record(lock, repo)
         audit = {
-            "schema_version": 3,
+            "schema_version": 4,
             "environment_prefix": str(environment),
+            "python_version": "3.14",
             "package_cache": {
                 "path": str(package_cache),
                 "archive_count": 1,
@@ -378,11 +422,15 @@ class CpuMpiFp64ReceiptVerifierTests(unittest.TestCase):
                 "sha256": lock_record["sha256"],
             },
             "metadata_package_count": 1,
-            "owned_path_count": len(tool_paths),
+            "owned_path_count": len(tool_paths) + 2,
             "hashed_installed_path_count": len(tool_paths),
             "archive_bound_hardlink_count": len(tool_paths),
             "relocated_hardlink_count": 0,
-            "unhashed_bytecode_path_count": 0,
+            "relocated_source_bytecode_count": 1,
+            "relocated_source_bytecode": [relocated_source_bytecode_record()],
+            "generated_source_bytecode_count": 1,
+            "generated_source_bytecode": [generated_source_bytecode_record()],
+            "declared_generated_bytecode_path_count": 1,
             "generated_entry_points": [],
             "softlink_count": 0,
             "softlinks": [],
@@ -627,6 +675,64 @@ class CpuMpiFp64ReceiptVerifierTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
+            for label, mutate in (
+                (
+                    "legacy-schema",
+                    lambda value: value.__setitem__("schema_version", 3),
+                ),
+                (
+                    "unnormalized-relocated-bytecode",
+                    lambda value: value["relocated_source_bytecode"][0].__setitem__(
+                        "current_state", "archive-exact"
+                    ),
+                ),
+                (
+                    "generated-bytecode-count-drift",
+                    lambda value: value.__setitem__(
+                        "declared_generated_bytecode_path_count", 2
+                    ),
+                ),
+                (
+                    "incomplete-relocated-bytecode-record",
+                    lambda value: value["relocated_source_bytecode"][0].pop(
+                        "source_path"
+                    ),
+                ),
+                (
+                    "noncanonical-generated-bytecode-path",
+                    lambda value: value["generated_source_bytecode"][0].__setitem__(
+                        "path", "../generated.cpython-314.pyc"
+                    ),
+                ),
+                (
+                    "relocated-bytecode-ownership-omission",
+                    lambda value: value.__setitem__(
+                        "owned_path_count", value["owned_path_count"] - 1
+                    ),
+                ),
+                (
+                    "nonnumeric-archive-bound-count",
+                    lambda value: value.__setitem__(
+                        "archive_bound_hardlink_count", "invalid"
+                    ),
+                ),
+            ):
+                invalid_audit = copy.deepcopy(context["audit"])
+                mutate(invalid_audit)
+                audit_path.write_text(
+                    json.dumps(invalid_audit, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                with self.subTest(audit_mutation=label), self.assertRaisesRegex(
+                    QUALIFICATION_CONTRACT.QualificationContractError,
+                    "content audit is not exact",
+                ):
+                    QUALIFICATION_CONTRACT.validate_v2_receipt(receipt, repo)
+            audit_path.write_text(
+                json.dumps(context["audit"], sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+
             lane_name = "installed-two-rank.log"
             lane_record = copy.deepcopy(context["lane_records"][lane_name])
             for rank in lane_record["ranks"]:
@@ -788,9 +894,10 @@ class CpuMpiFp64ReceiptVerifierTests(unittest.TestCase):
             prefix = repo / ".envs" / "cpu"
             lock = repo / "environment.lock"
             retained = {
-                "schema_version": 3,
+                "schema_version": 4,
                 "pass": True,
                 "environment_prefix": str(prefix),
+                "python_version": "3.14",
                 "lock": {"path": str(lock)},
                 "package_cache": {"path": str(cache)},
                 "archive_snapshot": {
@@ -799,6 +906,15 @@ class CpuMpiFp64ReceiptVerifierTests(unittest.TestCase):
                     "descriptor_retained_until_terminal_verification": True,
                     "pathname_fingerprint_rechecked": True,
                 },
+                "relocated_source_bytecode_count": 1,
+                "relocated_source_bytecode": [
+                    relocated_source_bytecode_record(digest_character="1")
+                ],
+                "generated_source_bytecode_count": 1,
+                "generated_source_bytecode": [
+                    generated_source_bytecode_record(digest_character="2")
+                ],
+                "declared_generated_bytecode_path_count": 1,
             }
             audit_path = build / "conda-prefix-content-audit.json"
             audit_path.write_text(json.dumps(retained), encoding="utf-8")
@@ -836,7 +952,7 @@ class CpuMpiFp64ReceiptVerifierTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "differs"):
                     VERIFIER.verify_conda_prefix_against_archives(receipt, repo)
 
-    def test_cuda_verifier_requires_normalized_source_bytecode(self):
+    def test_verifier_requires_normalized_source_bytecode_for_every_build(self):
         with tempfile.TemporaryDirectory() as temporary:
             repo = pathlib.Path(temporary).resolve()
             build = repo / "build/meep-cuda-mpi-python-fp32"
@@ -847,6 +963,7 @@ class CpuMpiFp64ReceiptVerifierTests(unittest.TestCase):
                 "schema_version": 4,
                 "pass": True,
                 "environment_prefix": str(repo / "prefix"),
+                "python_version": "3.14",
                 "lock": {"path": str(repo / "lock")},
                 "package_cache": {"path": str(cache)},
                 "archive_snapshot": {
@@ -857,20 +974,13 @@ class CpuMpiFp64ReceiptVerifierTests(unittest.TestCase):
                 },
                 "relocated_source_bytecode_count": 1,
                 "relocated_source_bytecode": [
-                    {
-                        "current_state": "relocated-source-compiled",
-                        "current_sha256": "1" * 64,
-                        "derived_sha256": "1" * 64,
-                    }
+                    relocated_source_bytecode_record(digest_character="1")
                 ],
                 "generated_source_bytecode_count": 1,
                 "generated_source_bytecode": [
-                    {
-                        "current_state": "source-compiled",
-                        "current_sha256": "2" * 64,
-                        "derived_sha256": "2" * 64,
-                    }
+                    generated_source_bytecode_record(digest_character="2")
                 ],
+                "declared_generated_bytecode_path_count": 1,
             }
             audit = build / "conda-prefix-content-audit.json"
             audit.write_text(json.dumps(retained), encoding="utf-8")
@@ -894,12 +1004,52 @@ class CpuMpiFp64ReceiptVerifierTests(unittest.TestCase):
             ):
                 VERIFIER.verify_conda_prefix_against_archives(receipt, repo)
 
-            retained["relocated_source_bytecode"][0]["current_state"] = (
-                "archive-exact"
-            )
-            audit.write_text(json.dumps(retained), encoding="utf-8")
-            with self.assertRaisesRegex(RuntimeError, "invalid"):
+            receipt["build_kind"] = "cpu-mpi-python-fp64"
+            with mock.patch.object(
+                VERIFIER.subprocess, "run", side_effect=reproduce
+            ):
                 VERIFIER.verify_conda_prefix_against_archives(receipt, repo)
+
+            for label, mutate in (
+                (
+                    "relocated-state",
+                    lambda value: value["relocated_source_bytecode"][0].__setitem__(
+                        "current_state", "archive-exact"
+                    ),
+                ),
+                (
+                    "generated-declaration-count",
+                    lambda value: value.__setitem__(
+                        "declared_generated_bytecode_path_count", 2
+                    ),
+                ),
+                (
+                    "incomplete-generated-record",
+                    lambda value: value["generated_source_bytecode"][0].pop(
+                        "installed_source_hash_hex"
+                    ),
+                ),
+                (
+                    "wrong-source-mapping",
+                    lambda value: value["generated_source_bytecode"][0].__setitem__(
+                        "source_path",
+                        "lib/python3.14/site-packages/fixture/not-generated.py",
+                    ),
+                ),
+                (
+                    "invalid-derived-size",
+                    lambda value: value["relocated_source_bytecode"][0].__setitem__(
+                        "derived_size_bytes", True
+                    ),
+                ),
+            ):
+                invalid = copy.deepcopy(retained)
+                mutate(invalid)
+                audit.write_text(json.dumps(invalid), encoding="utf-8")
+                with self.subTest(mutation=label), self.assertRaisesRegex(
+                    RuntimeError, "invalid"
+                ):
+                    VERIFIER.verify_conda_prefix_against_archives(receipt, repo)
 
 
 class CpuMpiFp64BuilderContractTests(unittest.TestCase):
@@ -936,6 +1086,9 @@ class CpuMpiFp64BuilderContractTests(unittest.TestCase):
             "assert_no_runtime_bytecode \"${INSTALL_DIR}\"",
             '--manifest "installed_environment=${ENV_PREFIX}"',
             '--manifest "host_build_logs=${HOST_BUILD_LOGS}"',
+            "normalize-conda-generated-bytecode.py",
+            "normalize-conda-relocated-bytecode.py",
+            "cpu-mpi-prefix-normalized-content-audit",
             'BUILD_HOME="${BUILD_DIR}/build-home"',
             'export HOME="${BUILD_HOME}"',
             'export XDG_CACHE_HOME="${BUILD_CACHE_HOME}"',
@@ -951,6 +1104,40 @@ class CpuMpiFp64BuilderContractTests(unittest.TestCase):
         self.assertIn("MAMBA_SHA256=", self.source)
         self.assertNotIn("${ENV_PREFIX}/bin/mktemp", self.source)
         self.assertNotIn("run_bounded_build_step check 7200 make -j", self.source)
+        self.assertLess(
+            self.source.index("normalize-conda-generated-bytecode.py"),
+            self.source.index("python -c 'import mpi4py, h5py"),
+        )
+        self.assertLess(
+            self.source.index("normalize-conda-relocated-bytecode.py"),
+            self.source.index("python -c 'import mpi4py, h5py"),
+        )
+        self.assertLess(
+            self.source.index("cpu-mpi-prefix-normalized-content-audit"),
+            self.source.index("RECEIPT_BEGIN=("),
+        )
+        self.assertIn(
+            "for prefix_preparation_attempt in 1 2 3; do", self.source
+        )
+        self.assertIn("PREFIX_PREPARATION_PASSED", self.source)
+        preparation = self.source[
+            self.source.index("PREFIX_GENERATED_BYTECODE_NORMALIZATION=\"\"") :
+            self.source.index("PREFIX_SOURCE_BYTECODE_NORMALIZATION=")
+        ]
+        self.assertEqual(
+            preparation.count("for prefix_preparation_attempt in 1 2 3; do"), 1
+        )
+        self.assertIn(".${prefix_preparation_attempt}.json", preparation)
+        self.assertIn("&& \\\n", preparation)
+        self.assertLess(
+            preparation.index("PREFIX_PREPARATION_PASSED=1"),
+            preparation.index("break"),
+        )
+        self.assertLess(
+            preparation.index("done"),
+            preparation.index('if [[ "${PREFIX_PREPARATION_PASSED}" -ne 1 ]]'),
+        )
+        self.assertIn("exit 1", preparation)
         find_contract = self.source[
             self.source.index("assert_no_runtime_bytecode()") :
             self.source.index('assert_no_runtime_bytecode "${BUILD_DIR}/python/meep"')

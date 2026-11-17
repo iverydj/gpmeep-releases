@@ -31,11 +31,15 @@ from gpmeep_provenance import (
     source_snapshot,
     verify_build_receipt,
 )
+import gpmeep_backend_guard as backend_guard
 
 
-PROBE_PREFIX = "gpmeep-mpi-python-probe-v1:"
-DIVIDE_PREFIX = "gpmeep-divide-mpi-validation-v1:"
-SCHEMA_VERSION = 1
+PROBE_PREFIX = "gpmeep-mpi-python-probe-v2:"
+DIVIDE_PREFIX = "gpmeep-divide-mpi-validation-v2:"
+SCHEMA_VERSION = 2
+BACKEND_ACKNOWLEDGEMENT_REASON = (
+    "M3 MPI qualification intentionally compares explicit CPU and CUDA"
+)
 RECEIPT_KIND = "cuda-mpi-python-fp32"
 LANES = (
     "cpu-hidden",
@@ -347,6 +351,14 @@ def validate_probe_record(
         require(finite_number(rank.get("local_seconds"))
                 and rank["local_seconds"] > 0,
                 "invalid rank-local time")
+        try:
+            backend_guard.validate_evidence(
+                rank.get("backend_guard"),
+                expected_backend=expected_backend,
+                expected_reason=BACKEND_ACKNOWLEDGEMENT_REASON,
+            )
+        except backend_guard.BackendGuardEvidenceError as exc:
+            raise EvidenceError(f"rank backend-guard evidence differs: {exc}") from exc
         runtime = rank.get("runtime")
         require(type(runtime) is dict and set(runtime) == {"python", "extension", "libmeep"},
                 "runtime schema mismatch")
@@ -558,7 +570,7 @@ def load_divide_telemetry(
     ]
     require(len(payloads) == 1 and type(payloads[0]) is dict
             and set(payloads[0]) == {"schema_version", "sha256"}
-            and payloads[0]["schema_version"] == 1
+            and payloads[0]["schema_version"] == 2
             and bool(re.fullmatch(r"[0-9a-f]{64}", payloads[0]["sha256"])),
             "divide MPI telemetry witness mismatch")
     require(telemetry_path.is_file(), "divide MPI telemetry file is absent")
@@ -588,7 +600,7 @@ def validate_divide_telemetry(
     identifiers: list[str] = []
     pids: list[int] = []
     for record in records:
-        require(record.get("schema_version") == 1
+        require(record.get("schema_version") == 2
                 and record.get("nonce") == nonce,
                 "divide MPI telemetry identity mismatch")
         require(record.get("expected_backend") == backend
@@ -597,6 +609,16 @@ def validate_divide_telemetry(
                 "divide MPI backend telemetry mismatch")
         require(type(record.get("pid")) is int and record["pid"] > 1,
                 "divide MPI PID telemetry mismatch")
+        try:
+            backend_guard.validate_evidence(
+                record.get("backend_guard"),
+                expected_backend=backend,
+                expected_reason=BACKEND_ACKNOWLEDGEMENT_REASON,
+            )
+        except backend_guard.BackendGuardEvidenceError as exc:
+            raise EvidenceError(
+                f"divide MPI backend-guard evidence differs: {exc}"
+            ) from exc
         pids.append(record["pid"])
         statistics = record.get("statistics")
         startup = record.get("startup_statistics")
@@ -1028,7 +1050,9 @@ def clean_environment(
         "TMPDIR": str(runtime),
         "PATH": f"{prefix / 'bin'}:/usr/bin:/bin",
         "LD_LIBRARY_PATH": f"{build_dir / 'src' / '.libs'}:{prefix / 'lib'}",
-        "PYTHONPATH": str(build_dir / "python"),
+        "PYTHONPATH": os.pathsep.join(
+            (str(repo / "scripts"), str(build_dir / "python"))
+        ),
         "PYTHONNOUSERSITE": "1",
         "PYTHONDONTWRITEBYTECODE": "1",
         "PYTHONHASHSEED": "0",

@@ -43,8 +43,13 @@
 /* this #define from Python's structmember.h, used by swig, conflicts with meep.hpp */
 #undef READONLY
 
+#include <array>
 #include <complex>
+#include <cstdint>
+#include <cstring>
 #include <string>
+#include <unordered_set>
+#include <vector>
 
 #include "config.h"
 #include "meep/vec.hpp"
@@ -98,8 +103,23 @@ void display_geometric_object_info(int indentby, GEOMETRIC_OBJECT o);
 %ignore meep::eigenmode_data::fft_data_H;
 %ignore meep::eigenmode_data::fft_data_E;
 %ignore meep::eigenmode_data::H;
+%ignore meep_geom::geometry_state_transaction;
+%ignore meep_geom::commit_geometry_state_mutation;
+// flux_vol attaches itself to a fields-owned linked list.  Python ownership of
+// a directly constructed instance conflicts with that list and bypasses the
+// epoch-aware fields::add_flux_vol factory, so expose only the factory path.
+%ignore meep::flux_vol::flux_vol;
+// The opaque callback accessor exists only for the guard's trusted extension
+// helper below; returning a raw PyObject pointer is never a user API.
+%ignore meep::src_time::gpmeep_external_state;
+%ignore meep::custom_py_src_time::gpmeep_external_state;
+// Internal MPI halo transport requires an engine-owned chunk-pair schedule;
+// exposing it to Python permits neither a valid standalone operation nor a
+// safe exact-run acknowledgement boundary. Keep the C++ API for engine use.
+%ignore meep::fields::process_incoming_chunk_data;
 
 %include "numpy.i"
+%include "std_string.i"
 %include "std_vector.i"
 
 %init %{
@@ -547,6 +567,8 @@ void _load_dft_data(meep::dft_chunk *dc, std::complex<double> *cdata, int size) 
     if (n != (size_t)size) {
         meep::abort("Total dft_chunks size does not agree with size allocated for output array.\n");
     }
+
+    meep::gpmeep_note_dft_mutation(dc);
 
     for (meep::dft_chunk *cur = dc; cur; cur = cur->next_in_dft) {
         // The caller is replacing this monitor's canonical host data. Drop
@@ -1501,6 +1523,134 @@ void _get_gradient(PyObject *grad, double scalegrad,
 %feature("immutable") meep::fields_chunk::connections;
 %feature("immutable") meep::fields_chunk::num_connections;
 
+// DFT/legacy-monitor descriptors are engine-owned once constructed. Their
+// supported mutation APIs (scale/load/remove/update) publish a fields epoch;
+// raw descriptor assignment cannot do so and can corrupt owner lists or
+// device mirrors, so retain read access while removing Python setters.
+%immutable meep::dft_chunk::omega;
+%immutable meep::dft_chunk::persist;
+%immutable meep::dft_chunk::c;
+%immutable meep::dft_chunk::N;
+%immutable meep::dft_chunk::dft;
+%immutable meep::dft_chunk::next_in_chunk;
+%immutable meep::dft_chunk::next_in_dft;
+%immutable meep::dft_chunk::stored_weight;
+%immutable meep::dft_chunk::include_dV_and_interp_weights;
+%immutable meep::dft_chunk::sqrt_dV_and_interp_weights;
+%immutable meep::dft_chunk::extra_weight;
+%immutable meep::dft_chunk::fc;
+%immutable meep::dft_chunk::is;
+%immutable meep::dft_chunk::ie;
+%immutable meep::dft_chunk::is_old;
+%immutable meep::dft_chunk::ie_old;
+%immutable meep::dft_chunk::s0;
+%immutable meep::dft_chunk::s1;
+%immutable meep::dft_chunk::e0;
+%immutable meep::dft_chunk::e1;
+%immutable meep::dft_chunk::dV0;
+%immutable meep::dft_chunk::dV1;
+%immutable meep::dft_chunk::empty_dim;
+%immutable meep::dft_chunk::scale;
+%immutable meep::dft_chunk::shift;
+%immutable meep::dft_chunk::S;
+%immutable meep::dft_chunk::sn;
+%immutable meep::dft_chunk::dft_phase;
+%immutable meep::dft_chunk::avg1;
+%immutable meep::dft_chunk::avg2;
+%immutable meep::dft_chunk::vc;
+
+%immutable meep::dft_flux::freq;
+%immutable meep::dft_flux::E;
+%immutable meep::dft_flux::H;
+%immutable meep::dft_flux::cE;
+%immutable meep::dft_flux::cH;
+%immutable meep::dft_flux::where;
+%immutable meep::dft_flux::normal_direction;
+%immutable meep::dft_flux::use_symmetry;
+%immutable meep::dft_flux::eigenmode_cache;
+%immutable meep::dft_flux::eigenmode_cache_dispersive;
+%immutable meep::dft_flux::eigenmode_cache_frequency;
+
+%immutable meep::dft_energy::freq;
+%immutable meep::dft_energy::E;
+%immutable meep::dft_energy::H;
+%immutable meep::dft_energy::D;
+%immutable meep::dft_energy::B;
+%immutable meep::dft_energy::where;
+%immutable meep::dft_force::freq;
+%immutable meep::dft_force::offdiag1;
+%immutable meep::dft_force::offdiag2;
+%immutable meep::dft_force::diag;
+%immutable meep::dft_force::where;
+%immutable meep::dft_fields::freq;
+%immutable meep::dft_fields::chunks;
+%immutable meep::dft_fields::where;
+%immutable meep::dft_near2far::freq;
+%immutable meep::dft_near2far::F;
+%immutable meep::dft_near2far::eps;
+%immutable meep::dft_near2far::mu;
+%immutable meep::dft_near2far::where;
+%immutable meep::dft_near2far::periodic_d;
+%immutable meep::dft_near2far::periodic_n;
+%immutable meep::dft_near2far::periodic_k;
+%immutable meep::dft_near2far::period;
+%immutable meep::dft_ldos::freq;
+%immutable meep::flux_vol::next;
+// src_time::next is an owning engine list link. Python replacement can create
+// cycles, aliases, or double ownership; list construction stays in add_to.
+%immutable meep::src_time::next;
+
+// The fields/structure owners expose methods for every supported state
+// transition (Bloch/boundary/material/source/output changes). Raw setters
+// bypass those transitions and can leave MPI/device mirrors inconsistent.
+// Keep the historical read surface; `fields.t` remains writable because the
+// Python Simulation restart path intentionally resets it and the manifest
+// binds its exact value.
+%immutable meep::fields::num_chunks;
+%immutable meep::fields::shared_chunks;
+%immutable meep::fields::chunks;
+%immutable meep::fields::sources;
+%immutable meep::fields::fluxes;
+%immutable meep::fields::S;
+%immutable meep::fields::a;
+%immutable meep::fields::dt;
+%immutable meep::fields::gv;
+%immutable meep::fields::user_volume;
+%immutable meep::fields::v;
+%immutable meep::fields::m;
+%immutable meep::fields::bfast_scaled_k;
+%immutable meep::fields::beta;
+%immutable meep::fields::phasein_time;
+%immutable meep::fields::is_real;
+%immutable meep::fields::k;
+%immutable meep::fields::eikna;
+%immutable meep::fields::coskna;
+%immutable meep::fields::sinkna;
+%immutable meep::fields::boundaries;
+%immutable meep::fields::outdir;
+%immutable meep::fields::components_allocated;
+%immutable meep::fields::loop_tile_base_db;
+%immutable meep::fields::loop_tile_base_eh;
+%immutable meep::fields::last_step_output_wall_time;
+%immutable meep::fields::last_step_output_t;
+
+%immutable meep::structure::num_chunks;
+%immutable meep::structure::shared_chunks;
+%immutable meep::structure::chunks;
+%immutable meep::structure::gv;
+%immutable meep::structure::user_volume;
+%immutable meep::structure::a;
+%immutable meep::structure::Courant;
+%immutable meep::structure::dt;
+%immutable meep::structure::v;
+%immutable meep::structure::S;
+%immutable meep::structure::outdir;
+%immutable meep::structure::num_effort_volumes;
+%immutable meep::structure::effort_volumes;
+// This engine-owned allocation participates in structure destruction. Direct
+// replacement can create two owners for one buffer and bypass guard state.
+%immutable meep::structure::effort;
+
 %ignore susceptibility_equal;
 %ignore susceptibility_list_equal;
 %ignore medium_struct_equal;
@@ -1593,6 +1743,36 @@ void _get_gradient(PyObject *grad, double scalegrad,
  * extension types. The same module therefore imports in CPU-only builds.
  */
 %inline %{
+PyObject *_gpmeep_fields_external_source_states(meep::fields *f) {
+    if (!f)
+        throw std::invalid_argument(
+            "native source-state collection requires a fields owner");
+    SWIG_PYTHON_THREAD_SCOPED_BLOCK;
+    PyObject *result = PyList_New(0);
+    if (!result)
+        throw std::runtime_error(
+            "could not allocate native source-state collection");
+    std::unordered_set<const meep::src_time *> seen;
+    for (const meep::src_time *source = f->sources; source;
+         source = source->next) {
+        if (!seen.insert(source).second) {
+            Py_DECREF(result);
+            throw std::runtime_error(
+                "native source list contains a cycle");
+        }
+        void *external = source->gpmeep_external_state();
+        if (!external)
+            continue;
+        PyObject *value = reinterpret_cast<PyObject *>(external);
+        if (PyList_Append(result, value) < 0) {
+            Py_DECREF(result);
+            throw std::runtime_error(
+                "could not retain native external source state");
+        }
+    }
+    return result;
+}
+
 struct gpu_python_statistics {
     unsigned long long runtime_availability_probes;
     unsigned long long runtime_device_enumerations;
@@ -1616,6 +1796,10 @@ struct gpu_python_statistics {
     unsigned long long cpu_polarization_points;
     unsigned long long cuda_polarization_calls;
     unsigned long long cuda_polarization_points;
+    unsigned long long cuda_zero_state_elision_enabled_calls;
+    unsigned long long cuda_zero_state_elision_enabled_points;
+    unsigned long long cuda_zero_state_elision_inspectable_calls;
+    unsigned long long cuda_zero_state_elision_inspectable_points;
     unsigned long long cpu_source_calls;
     unsigned long long cpu_source_points;
     unsigned long long cuda_source_calls;
@@ -1815,6 +1999,107 @@ struct gpu_python_statistics {
     unsigned long long phase_update_eh_forced_batches;
     unsigned long long phase_update_eh_batched_operations;
     unsigned long long phase_update_eh_unbatched_operations;
+    unsigned long long structured_curl_graph_collection_checks;
+    unsigned long long structured_curl_graph_collection_launches;
+    unsigned long long structured_curl_graph_plan_creations;
+    unsigned long long structured_curl_graph_plan_rebuilds;
+    unsigned long long structured_curl_graph_plan_reuses;
+    unsigned long long structured_curl_graph_plan_destroys;
+    unsigned long long structured_curl_graph_plan_destroy_failures;
+    unsigned long long structured_curl_graph_live_plans;
+    unsigned long long structured_curl_graph_quarantined_plans;
+    unsigned long long structured_curl_graph_logical_operations;
+    unsigned long long structured_curl_graph_unsupported_fallbacks;
+    unsigned long long structured_curl_graph_creation_fallbacks;
+    unsigned long long structured_curl_graph_launch_failures;
+    unsigned long long structured_curl_graph_replay_checks;
+    unsigned long long structured_curl_graph_replay_launches;
+    unsigned long long structured_curl_graph_replay_unready;
+    unsigned long long structured_curl_graph_replay_generation_misses;
+    unsigned long long structured_curl_graph_replay_mirror_misses;
+};
+
+struct gpu_python_material_phasing_statistics {
+    unsigned long long checks;
+    unsigned long long reused;
+    unsigned long long disabled;
+    unsigned long long ineligible;
+};
+
+struct gpu_python_resident_point_read_statistics {
+    unsigned long long cuda_read_attempts;
+    unsigned long long cuda_read_completions;
+    unsigned long long cuda_read_failures;
+    unsigned long long scalars_copied;
+    unsigned long long device_to_host_calls;
+    unsigned long long device_to_host_bytes;
+    unsigned long long host_nanoseconds;
+};
+
+struct gpu_python_boundary_execution_statistics {
+    unsigned long long local_checks;
+    unsigned long long local_disabled;
+    unsigned long long local_unready;
+    unsigned long long local_prepare_invalidations;
+    unsigned long long local_replay_empty;
+    unsigned long long local_replay_work;
+    unsigned long long local_failures;
+    unsigned long long local_descriptor_rebuild_attempts;
+    unsigned long long prepare_calls;
+    unsigned long long prepare_failures;
+    unsigned long long prepared_arrays;
+    unsigned long long prepare_host_nanoseconds;
+    unsigned long long plan_empty;
+    unsigned long long plan_direct_zero;
+    unsigned long long plan_direct_local;
+    unsigned long long plan_graph;
+    unsigned long long plan_staged;
+    unsigned long long span_cache_hits;
+    unsigned long long span_cache_misses;
+    unsigned long long span_cache_bypasses;
+};
+
+/*
+ * Sparse-plan statistics are deliberately separate from gpu_python_statistics.
+ * Reading them is a checked operation which may synchronize CUDA state and
+ * reject an active resident phase; the long-standing statistics() API must
+ * retain its non-synchronizing, non-throwing behavior and stable groups.
+ */
+struct gpu_python_sparse_lorentzian_statistics {
+    unsigned long long opt_in_calls;
+    unsigned long long opt_in_points;
+    unsigned long long eligible_calls;
+    unsigned long long eligible_points;
+    unsigned long long ineligible_calls;
+    unsigned long long ineligible_points;
+    unsigned long long first_observation_dense_calls;
+    unsigned long long first_observation_dense_points;
+    unsigned long long plan_build_attempts;
+    unsigned long long plan_build_successes;
+    unsigned long long plan_build_failures;
+    unsigned long long plan_hits;
+    unsigned long long plan_invalidations;
+    unsigned long long dense_locked_decisions;
+    unsigned long long accepted_total_points;
+    unsigned long long accepted_active_points;
+    unsigned long long sparse_submission_calls;
+    unsigned long long sparse_submission_points;
+    unsigned long long guard_scan_submissions;
+    unsigned long long guard_scan_submission_points;
+    unsigned long long cpu_fallback_calls;
+    unsigned long long cpu_fallback_points;
+    unsigned long long device_guard_scan_calls;
+    unsigned long long device_guard_scan_points;
+    unsigned long long device_sparse_update_calls;
+    unsigned long long device_sparse_update_points;
+    unsigned long long device_dense_fallback_calls;
+    unsigned long long device_dense_fallback_points;
+    unsigned long long live_plans;
+    unsigned long long live_guards;
+    unsigned long long retained_index_bytes;
+    unsigned long long reset_generation;
+    unsigned long long counter_overflow;
+    unsigned long long teardown_incomplete;
 };
 
 bool _gpu_backend_compiled() {
@@ -1852,14 +2137,16 @@ void _gpu_set_backend(int mode) {
         meep::gpu::set_backend(meep::gpu::backend_mode::cpu);
         return;
       case 1:
-        meep::gpu::set_backend(meep::gpu::backend_mode::automatic);
-        return;
+        throw std::runtime_error(
+            "gpmeep v1.1.0 automatic backend selection is disabled; "
+            "choose 'cpu' or 'cuda'");
       case 2:
         meep::gpu::set_backend(meep::gpu::backend_mode::cuda);
         return;
       default:
         throw std::runtime_error(
-            "GPU backend must be 'cpu', 'auto', or 'cuda'");
+            "gpmeep v1.1.0 backend must be 'cpu' or 'cuda'; "
+            "automatic selection is disabled");
     }
 }
 
@@ -1877,6 +2164,86 @@ const char *_gpu_backend_diagnostic() {
     return diagnostic.c_str();
 }
 
+unsigned long long _gpu_backend_generation() {
+    return static_cast<unsigned long long>(
+        meep::gpu::detail::backend_generation());
+}
+
+PyObject *_gpu_collective_rank_records(const char *record) {
+    constexpr std::size_t payload_capacity = 4096;
+    struct collective_record {
+        std::uint64_t sequence;
+        std::uint64_t checksum;
+        std::uint32_t rank;
+        std::uint32_t length;
+        std::array<char, payload_capacity> payload;
+    };
+    if (!record)
+        throw std::invalid_argument(
+            "recommendation collective record must be non-null");
+    const std::size_t length = std::strlen(record);
+    if (length >= payload_capacity)
+        throw std::invalid_argument(
+            "recommendation collective record exceeds 4095 bytes");
+    const int count = meep::count_processors();
+    if (count <= 0)
+        throw std::runtime_error(
+            "recommendation collective has no active MPI ranks");
+    const int rank = meep::my_rank();
+    if (rank < 0 || rank >= count)
+        throw std::runtime_error(
+            "recommendation collective rank is outside the communicator");
+    const std::uint64_t sequence = meep::next_fixed_gather_sequence();
+    auto checksum = [](const char *data, std::size_t size) {
+        // FNV-1a is an integrity checksum here, not a security primitive. The
+        // Python policy separately uses SHA-256 for workload identity.
+        std::uint64_t value = 14695981039346656037ULL;
+        for (std::size_t index = 0; index < size; ++index) {
+            value ^= static_cast<unsigned char>(data[index]);
+            value *= 1099511628211ULL;
+        }
+        return value;
+    };
+    collective_record local = {};
+    local.sequence = sequence;
+    local.rank = static_cast<std::uint32_t>(rank);
+    local.length = static_cast<std::uint32_t>(length);
+    std::memcpy(local.payload.data(), record, length);
+    local.checksum = checksum(local.payload.data(), length);
+    std::vector<collective_record> records(static_cast<std::size_t>(count));
+    meep::all_gather_fixed_bytes(
+        reinterpret_cast<const char *>(&local),
+        reinterpret_cast<char *>(records.data()),
+        static_cast<int>(sizeof(collective_record)));
+    for (int index = 0; index < count; ++index) {
+        const collective_record &value = records[static_cast<std::size_t>(index)];
+        if (value.sequence != sequence ||
+            value.rank != static_cast<std::uint32_t>(index) ||
+            value.length >= payload_capacity ||
+            value.payload[static_cast<std::size_t>(value.length)] != '\0' ||
+            value.checksum != checksum(value.payload.data(), value.length))
+            throw std::runtime_error(
+                "recommendation collective record integrity check failed");
+    }
+    PyObject *result = PyList_New(count);
+    if (!result)
+        throw std::runtime_error(
+            "could not allocate recommendation collective result");
+    for (int index = 0; index < count; ++index) {
+        const collective_record &value = records[static_cast<std::size_t>(index)];
+        PyObject *item = PyUnicode_DecodeUTF8(
+            value.payload.data(), static_cast<Py_ssize_t>(value.length),
+            "strict");
+        if (!item) {
+            Py_DECREF(result);
+            throw std::runtime_error(
+                "recommendation collective record is not valid UTF-8");
+        }
+        PyList_SET_ITEM(result, index, item);
+    }
+    return result;
+}
+
 void _gpu_select_device(int ordinal) {
     meep::gpu::select_device(ordinal);
 }
@@ -1889,6 +2256,42 @@ const char *_gpu_selected_device_identifier() {
     static thread_local std::string identifier;
     identifier = meep::gpu::selected_device_identifier();
     return identifier.c_str();
+}
+
+PyObject *_gpu_device_inventory() {
+    // Take one coherent native snapshot.  The legacy per-property helpers
+    // below each enumerate CUDA devices independently; using them to build a
+    // single Python inventory made one public devices() query perform eleven
+    // identical runtime enumerations per GPU-policy attempt.
+    const std::vector<meep::gpu::device_info> devices =
+        meep::gpu::enumerate_devices();
+    PyObject *result = PyList_New(
+        static_cast<Py_ssize_t>(devices.size()));
+    if (!result)
+        throw std::runtime_error("could not allocate GPU device inventory");
+    for (std::size_t index = 0; index < devices.size(); ++index) {
+        const meep::gpu::device_info &device = devices[index];
+        PyObject *item = Py_BuildValue(
+            "{s:i,s:(ii),s:i,s:i,s:O,s:K,s:K,s:s,s:s}",
+            "ordinal", device.ordinal,
+            "compute_capability", device.compute_major, device.compute_minor,
+            "multiprocessor_count", device.multiprocessor_count,
+            "max_threads_per_block", device.max_threads_per_block,
+            "compatible", device.compatible ? Py_True : Py_False,
+            "global_memory_bytes",
+            static_cast<unsigned long long>(device.global_memory_bytes),
+            "memory_bandwidth_bytes_per_second",
+            static_cast<unsigned long long>(
+                device.memory_bandwidth_bytes_per_second),
+            "identifier", device.identifier.c_str(),
+            "name", device.name.c_str());
+        if (!item) {
+            Py_DECREF(result);
+            throw std::runtime_error("could not build GPU device record");
+        }
+        PyList_SET_ITEM(result, static_cast<Py_ssize_t>(index), item);
+    }
+    return result;
 }
 
 int _gpu_device_count() {
@@ -2000,6 +2403,8 @@ gpu_python_statistics _gpu_statistics() {
         meep::gpu::get_phase_batch_policy_statistics();
     const meep::gpu::curl_phase_replay_statistics curl_phase_replay =
         meep::gpu::get_curl_phase_replay_statistics();
+    const meep::gpu::structured_curl_graph_statistics structured_curl_graph =
+        meep::gpu::get_structured_curl_graph_statistics();
     const gpu_python_statistics result = {
         runtime.availability_probes,
         runtime.device_enumerations,
@@ -2023,6 +2428,10 @@ gpu_python_statistics _gpu_statistics() {
         polarizations.cpu_update_points,
         polarizations.cuda_update_calls,
         polarizations.cuda_update_points,
+        polarizations.cuda_zero_state_elision_enabled_calls,
+        polarizations.cuda_zero_state_elision_enabled_points,
+        polarizations.cuda_zero_state_elision_inspectable_calls,
+        polarizations.cuda_zero_state_elision_inspectable_points,
         sources.cpu_update_calls,
         sources.cpu_update_points,
         sources.cuda_update_calls,
@@ -2221,12 +2630,129 @@ gpu_python_statistics _gpu_statistics() {
         phase_batch_policy.update_eh_automatic_rejected,
         phase_batch_policy.update_eh_forced_batches,
         phase_batch_policy.update_eh_batched_operations,
-        phase_batch_policy.update_eh_unbatched_operations};
+        phase_batch_policy.update_eh_unbatched_operations,
+        structured_curl_graph.collection_checks,
+        structured_curl_graph.collection_launches,
+        structured_curl_graph.plan_creations,
+        structured_curl_graph.plan_rebuilds,
+        structured_curl_graph.plan_reuses,
+        structured_curl_graph.plan_destroys,
+        structured_curl_graph.plan_destroy_failures,
+        structured_curl_graph.live_plans,
+        structured_curl_graph.quarantined_plans,
+        structured_curl_graph.logical_operations,
+        structured_curl_graph.unsupported_fallbacks,
+        structured_curl_graph.creation_fallbacks,
+        structured_curl_graph.launch_failures,
+        structured_curl_graph.replay_checks,
+        structured_curl_graph.replay_launches,
+        structured_curl_graph.replay_unready,
+        structured_curl_graph.replay_generation_misses,
+        structured_curl_graph.replay_mirror_misses};
+    return result;
+}
+
+gpu_python_material_phasing_statistics
+_gpu_material_phasing_statistics() {
+    const meep::gpu::material_phasing_statistics statistics =
+        meep::gpu::get_material_phasing_statistics();
+    const gpu_python_material_phasing_statistics result = {
+        statistics.checks, statistics.reused, statistics.disabled, statistics.ineligible};
+    return result;
+}
+
+gpu_python_resident_point_read_statistics
+_gpu_resident_point_read_statistics() {
+    const meep::gpu::resident_point_read_statistics statistics =
+        meep::gpu::get_resident_point_read_statistics();
+    const gpu_python_resident_point_read_statistics result = {
+        statistics.cuda_read_attempts,
+        statistics.cuda_read_completions,
+        statistics.cuda_read_failures,
+        statistics.scalars_copied,
+        statistics.device_to_host_calls,
+        statistics.device_to_host_bytes,
+        statistics.host_nanoseconds};
+    return result;
+}
+
+gpu_python_boundary_execution_statistics
+_gpu_boundary_execution_statistics() {
+    const meep::gpu::boundary_execution_statistics statistics =
+        meep::gpu::get_boundary_execution_statistics();
+    const gpu_python_boundary_execution_statistics result = {
+        statistics.local_checks,
+        statistics.local_disabled,
+        statistics.local_unready,
+        statistics.local_prepare_invalidations,
+        statistics.local_replay_empty,
+        statistics.local_replay_work,
+        statistics.local_failures,
+        statistics.local_descriptor_rebuild_attempts,
+        statistics.prepare_calls,
+        statistics.prepare_failures,
+        statistics.prepared_arrays,
+        statistics.prepare_host_nanoseconds,
+        statistics.plan_empty,
+        statistics.plan_direct_zero,
+        statistics.plan_direct_local,
+        statistics.plan_graph,
+        statistics.plan_staged,
+        statistics.span_cache_hits,
+        statistics.span_cache_misses,
+        statistics.span_cache_bypasses};
+    return result;
+}
+
+gpu_python_sparse_lorentzian_statistics
+_gpu_sparse_lorentzian_statistics() {
+    const meep::gpu::sparse_lorentzian_statistics statistics =
+        meep::gpu::get_sparse_lorentzian_statistics();
+    const gpu_python_sparse_lorentzian_statistics result = {
+        statistics.opt_in_calls,
+        statistics.opt_in_points,
+        statistics.eligible_calls,
+        statistics.eligible_points,
+        statistics.ineligible_calls,
+        statistics.ineligible_points,
+        statistics.first_observation_dense_calls,
+        statistics.first_observation_dense_points,
+        statistics.plan_build_attempts,
+        statistics.plan_build_successes,
+        statistics.plan_build_failures,
+        statistics.plan_hits,
+        statistics.plan_invalidations,
+        statistics.dense_locked_decisions,
+        statistics.accepted_total_points,
+        statistics.accepted_active_points,
+        statistics.sparse_submission_calls,
+        statistics.sparse_submission_points,
+        statistics.guard_scan_submissions,
+        statistics.guard_scan_submission_points,
+        statistics.cpu_fallback_calls,
+        statistics.cpu_fallback_points,
+        statistics.device_guard_scan_calls,
+        statistics.device_guard_scan_points,
+        statistics.device_sparse_update_calls,
+        statistics.device_sparse_update_points,
+        statistics.device_dense_fallback_calls,
+        statistics.device_dense_fallback_points,
+        statistics.live_plans,
+        statistics.live_guards,
+        statistics.retained_index_bytes,
+        statistics.reset_generation,
+        static_cast<unsigned long long>(statistics.counter_overflow),
+        static_cast<unsigned long long>(statistics.teardown_incomplete),
+    };
     return result;
 }
 
 void _gpu_reset_statistics() {
     meep::gpu::reset_dispatch_statistics();
+}
+
+void _gpu_reset_sparse_lorentzian_statistics() {
+    meep::gpu::reset_sparse_lorentzian_statistics();
 }
 %}
 
@@ -2339,8 +2865,8 @@ PyObject *_get_array_slice_dimensions(meep::fields *f, const meep::volume &where
     class _GpuController:
         """Process-local CUDA backend discovery, selection, and statistics."""
 
-        _BACKENDS = {"cpu": 0, "auto": 1, "automatic": 1, "cuda": 2}
-        _BACKEND_NAMES = ("cpu", "auto", "cuda")
+        _BACKENDS = {"cpu": 0, "cuda": 2}
+        _BACKEND_NAMES = ("cpu", "invalid", "cuda")
 
         @property
         def compiled(self):
@@ -2371,6 +2897,10 @@ PyObject *_get_array_slice_dimensions(meep::fields *f, const meep::volume &where
             return _gpu_backend_diagnostic()
 
         @property
+        def _backend_generation(self):
+            return _gpu_backend_generation()
+
+        @property
         def selected_device(self):
             return _gpu_selected_device()
 
@@ -2383,21 +2913,92 @@ PyObject *_get_array_slice_dimensions(meep::fields *f, const meep::volume &where
                 backend = self._BACKENDS[str(mode).lower()]
             except KeyError as exc:
                 raise ValueError(
-                    "GPU backend must be 'cpu', 'auto', or 'cuda'"
+                    "gpmeep v1.1.0 backend must be 'cpu' or 'cuda'; "
+                    "automatic selection is disabled"
                 ) from exc
-            _gpu_set_backend(backend)
+            from meep import backend_policy
+
+            backend_policy._run_gpu_controller_transition(
+                self, _gpu_set_backend, backend
+            )
+
+        def _invalidate_policy_device_inventory(self):
+            import sys
+
+            policy = sys.modules.get("meep.backend_policy")
+            if policy is not None:
+                policy._invalidate_device_inventory_cache(self)
+
+        def _refresh_policy_device_inventory(self):
+            self._invalidate_policy_device_inventory()
+
+        def _guard_run(
+            self,
+            simulation,
+            until,
+            until_after_sources,
+            step_functions,
+            operation=None,
+        ):
+            from meep import backend_policy
+            import meep as package
+
+            return backend_policy.guard_run(
+                package,
+                simulation,
+                until,
+                until_after_sources,
+                step_functions,
+                operation,
+            )
+
+        def _seal_simulation_file_inputs(self, simulation):
+            from meep import backend_policy
+            import meep as package
+
+            backend_policy.seal_simulation_file_inputs(package, simulation)
+
+        def _clear_simulation_file_input_seals(self, simulation):
+            from meep import backend_policy
+
+            backend_policy.clear_simulation_file_input_seals(simulation)
+
+        def _bind_simulation_file_input_owners(self, simulation, fields):
+            from meep import backend_policy
+
+            backend_policy.bind_simulation_file_input_owners(
+                simulation, fields
+            )
+
+        def acknowledge_backend_mismatch(
+            self, challenge, reason, scope="simulation"
+        ):
+            from meep import backend_policy
+
+            backend_policy.acknowledge_backend_mismatch(
+                challenge, reason, scope=scope
+            )
+
+        @property
+        def pending_recommendation(self):
+            from meep import backend_policy
+
+            return backend_policy.pending_recommendation()
+
+        @property
+        def recommendation(self):
+            from meep import backend_policy
+
+            return backend_policy.last_recommendation()
 
         def select_device(self, ordinal):
-            _gpu_select_device(int(ordinal))
+            from meep import backend_policy
 
-        def devices(self):
-            # Device enumeration itself raises when the CUDA runtime has no
-            # visible device (for example in a login node or restricted
-            # container). Discovery is a query API, so represent that ordinary
-            # state as an empty inventory while preserving the diagnostic via
-            # runtime_diagnostic.
-            if not self.runtime_available:
-                return []
+            backend_policy._run_gpu_controller_transition(
+                self, _gpu_select_device, int(ordinal)
+            )
+
+        def _legacy_device_inventory(self):
             devices = []
             for index in range(_gpu_device_count()):
                 devices.append(
@@ -2426,11 +3027,74 @@ PyObject *_get_array_slice_dimensions(meep::fields *f, const meep::volume &where
                 )
             return devices
 
+        def devices(self):
+            # Device enumeration itself raises when the CUDA runtime has no
+            # visible device (for example in a login node or restricted
+            # container). Discovery is a query API, so represent that ordinary
+            # state as an empty inventory while preserving the diagnostic via
+            # runtime_diagnostic.
+            if not self.runtime_available:
+                return []
+            # Internal, qualification-only same-binary A/B control.  Normal
+            # users always receive the coherent one-enumeration snapshot.
+            import os
+            if os.environ.get(
+                "MEEP_GPU_DISABLE_DEVICE_INVENTORY_SNAPSHOT"
+            ) == "1":
+                return self._legacy_device_inventory()
+            return _gpu_device_inventory()
+
         def reset_statistics(self):
             _gpu_reset_statistics()
 
+        def reset_sparse_lorentzian_statistics(self):
+            _gpu_reset_sparse_lorentzian_statistics()
+
+        def sparse_lorentzian_statistics(self):
+            stats = _gpu_sparse_lorentzian_statistics()
+            names = (
+                "opt_in_calls",
+                "opt_in_points",
+                "eligible_calls",
+                "eligible_points",
+                "ineligible_calls",
+                "ineligible_points",
+                "first_observation_dense_calls",
+                "first_observation_dense_points",
+                "plan_build_attempts",
+                "plan_build_successes",
+                "plan_build_failures",
+                "plan_hits",
+                "plan_invalidations",
+                "dense_locked_decisions",
+                "accepted_total_points",
+                "accepted_active_points",
+                "sparse_submission_calls",
+                "sparse_submission_points",
+                "guard_scan_submissions",
+                "guard_scan_submission_points",
+                "cpu_fallback_calls",
+                "cpu_fallback_points",
+                "device_guard_scan_calls",
+                "device_guard_scan_points",
+                "device_sparse_update_calls",
+                "device_sparse_update_points",
+                "device_dense_fallback_calls",
+                "device_dense_fallback_points",
+                "live_plans",
+                "live_guards",
+                "retained_index_bytes",
+                "reset_generation",
+                "counter_overflow",
+                "teardown_incomplete",
+            )
+            return {name: int(getattr(stats, name)) for name in names}
+
         def statistics(self):
             stats = _gpu_statistics()
+            boundary_execution = _gpu_boundary_execution_statistics()
+            point_reads = _gpu_resident_point_read_statistics()
+            material_phasing = _gpu_material_phasing_statistics()
 
             def values(names):
                 return {name: int(getattr(stats, name)) for name in names}
@@ -2453,6 +3117,10 @@ PyObject *_get_array_slice_dimensions(meep::fields *f, const meep::volume &where
                         "device_to_host_bytes",
                     )
                 ),
+                "material_phasing": {
+                    name: int(getattr(material_phasing, name))
+                    for name in ("checks", "reused", "disabled", "ineligible")
+                },
                 "resident": values(
                     (
                         "host_to_device_bytes_avoided",
@@ -2476,6 +3144,10 @@ PyObject *_get_array_slice_dimensions(meep::fields *f, const meep::volume &where
                         "cpu_polarization_points",
                         "cuda_polarization_calls",
                         "cuda_polarization_points",
+                        "cuda_zero_state_elision_enabled_calls",
+                        "cuda_zero_state_elision_enabled_points",
+                        "cuda_zero_state_elision_inspectable_calls",
+                        "cuda_zero_state_elision_inspectable_points",
                     )
                 ),
                 "sources": values(
@@ -2486,6 +3158,43 @@ PyObject *_get_array_slice_dimensions(meep::fields *f, const meep::volume &where
                         "cuda_source_points",
                     )
                 ),
+                "resident_point_reads": {
+                    name: int(getattr(point_reads, name))
+                    for name in (
+                        "cuda_read_attempts",
+                        "cuda_read_completions",
+                        "cuda_read_failures",
+                        "scalars_copied",
+                        "device_to_host_calls",
+                        "device_to_host_bytes",
+                        "host_nanoseconds",
+                    )
+                },
+                "boundary_execution": {
+                    name: int(getattr(boundary_execution, name))
+                    for name in (
+                        "local_checks",
+                        "local_disabled",
+                        "local_unready",
+                        "local_prepare_invalidations",
+                        "local_replay_empty",
+                        "local_replay_work",
+                        "local_failures",
+                        "local_descriptor_rebuild_attempts",
+                        "prepare_calls",
+                        "prepare_failures",
+                        "prepared_arrays",
+                        "prepare_host_nanoseconds",
+                        "plan_empty",
+                        "plan_direct_zero",
+                        "plan_direct_local",
+                        "plan_graph",
+                        "plan_staged",
+                        "span_cache_hits",
+                        "span_cache_misses",
+                        "span_cache_bypasses",
+                    )
+                },
                 "boundaries": values(
                     (
                         "cpu_boundary_calls",
@@ -2775,9 +3484,38 @@ PyObject *_get_array_slice_dimensions(meep::fields *f, const meep::volume &where
                         "phase_update_eh_unbatched_operations",
                     )
                 ),
+                "structured_curl_graph": values(
+                    (
+                        "structured_curl_graph_collection_checks",
+                        "structured_curl_graph_collection_launches",
+                        "structured_curl_graph_plan_creations",
+                        "structured_curl_graph_plan_rebuilds",
+                        "structured_curl_graph_plan_reuses",
+                        "structured_curl_graph_plan_destroys",
+                        "structured_curl_graph_plan_destroy_failures",
+                        "structured_curl_graph_live_plans",
+                        "structured_curl_graph_quarantined_plans",
+                        "structured_curl_graph_logical_operations",
+                        "structured_curl_graph_unsupported_fallbacks",
+                        "structured_curl_graph_creation_fallbacks",
+                        "structured_curl_graph_launch_failures",
+                        "structured_curl_graph_replay_checks",
+                        "structured_curl_graph_replay_launches",
+                        "structured_curl_graph_replay_unready",
+                        "structured_curl_graph_replay_generation_misses",
+                        "structured_curl_graph_replay_mirror_misses",
+                    )
+                ),
             }
 
     gpu = _GpuController()
+
+    # ``simulation.dft_ldos`` intentionally replaces the generated SWIG
+    # class export below with the public step-function factory.  Retain the
+    # exact package-generated class under a private name so backend_policy's
+    # package-class snapshot can still authenticate LDOS proxy instances. The
+    # private export is excluded from ``__all__`` and is not a user API.
+    _gpmeep_swig_dft_ldos_class = dft_ldos
 
     from .geom import (
         Block,
@@ -2957,6 +3695,12 @@ PyObject *_get_array_slice_dimensions(meep::fields *f, const meep::volume &where
     from .verbosity_mgr import (
         Verbosity
     )
+
+    # Freeze NumPy dispatcher identities and package-owned classes before
+    # user code can mutate module exports between ``import meep`` and the
+    # first guarded run.  The policy remains advisory and never selects a
+    # backend; eager import only establishes immutable anti-replay anchors.
+    from . import backend_policy as backend_policy
 
     _gpmeep_lazy_visualization_exports = frozenset(
         ("visualization", "plot2D", "plot3D", "plot_fields", "Animate2D")

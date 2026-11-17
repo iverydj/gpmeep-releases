@@ -12,24 +12,6 @@ import meep as mp
 **Project keywords:** `GPU-accelerated FDTD`, `GPU FDTD`, `CUDA FDTD`,
 `Meep GPU`.
 
-Accepted source snapshots, release notes, package identity/checksum records,
-and installation instructions are published in this repository. Active development and
-candidate qualification occur separately so the public release history
-contains accepted versions rather than unfinished development branches.
-
-**Current download status:** v1.0.3 source and its Git tag are available.
-Prebuilt Conda binaries are not yet attached here: inherited package recipe
-metadata requires a separate privacy review before upload. The checksum record
-identifies the existing accepted binary; it does not mean that binary is
-currently downloadable from this public repository. Source build scripts are
-included; see the [installation guide](doc/docs/GPMEEP_INSTALLATION.md#building-from-the-public-source).
-
-Raw validation logs and private execution metadata are not published. See
-[the public release policy](PUBLIC_RELEASE_POLICY.md) and
-[v1.0.3 package identity](PUBLIC_RELEASE.json). The public snapshot removes
-non-runtime evidence files; its Git commit is not the original binary's build
-commit.
-
 ## Project creator and gpmeep contribution
 
 **gpmeep was conceived, created, and is led by
@@ -61,6 +43,12 @@ source/API compatibility within the validated v1 feature contract, not a claim
 that every upstream build option or execution path is present. Do not change a
 script to `import gpmeep`: there is no `gpmeep` Python module.
 
+The v1.1.0 release-candidate line retains v1.0.3 compatibility fixes and adds
+the explicit CPU/CUDA backend contract, evidence-bound performance
+classification, expanded CUDA paths, and the default-off structured-curl CUDA
+Graph optimization. It is not a published release until the exact package
+passes the M4, portability, and final receipt gates below.
+
 v1.0.3 retains the accepted v1.0.2 CUDA and numerical implementation while
 repairing production-reported Linux/Conda portability, build-path, error
 propagation, and custom CUDA-architecture provenance defects. A worktree or
@@ -74,7 +62,7 @@ The user-visible differences are:
 |---|---|---|
 | Conda distribution | usually installed as `pymeep` | installed as `gpmeep` in a separate prefix |
 | Python import | `import meep as mp` | exactly the same |
-| Backend | CPU | CPU by default, with opt-in `auto` or NVIDIA CUDA |
+| Backend | CPU | released v1.0.x: CPU default with opt-in `auto` or NVIDIA CUDA; v1.1.0 target: explicit CPU/CUDA choice with a guarded mismatch acknowledgement |
 | Extra runtime API | no CUDA controller | `mp.gpu` discovery, selection, diagnostics, and counters |
 | Precision | depends on the upstream build; commonly FP64 | the v1 CPU and CUDA lanes are both FP32 |
 | Adjoint / MPB execution | build dependent | upstream imports and spelling; FDTD portions may use the selected backend, while packaged JAX and MPB remain CPU-side and MPB is non-MPI |
@@ -95,6 +83,9 @@ sim = mp.Simulation(...)  # existing Meep code
 sim.run(...)
 ```
 
+### Released v1.0.x backend behavior
+
+The following API describes the released v1.0.x packages, including v1.0.3.
 To request a backend, add one gpmeep-specific line before constructing or
 running simulations:
 
@@ -123,6 +114,162 @@ promise that GPU is faster for every simulation. Inspect
 `mp.gpu.active_backend`, `mp.gpu.backend_diagnostic`, and
 `mp.gpu.statistics()` when validating which path actually ran.
 
+This is the v1.0.x-only automatic policy. It remains documented so existing
+released packages are not misrepresented, but `auto` is not part of the v1.1.0
+target contract.
+
+### v1.1.0 development: explicit CPU/CUDA choice
+
+The development target permits only user-selected `cpu` or `cuda`; it never
+chooses, switches, or silently falls back between them. Omitting a selection is
+interpreted as the legacy CPU choice, but still passes through the recommendation
+guard. If the chosen backend disagrees with the recommendation, the first attempt
+fails before simulation state changes. The user may then repeat that exact run
+with an explicit, reason-bearing acknowledgement bound to its workload and
+MPI-topology fingerprints. After that exact retry is accepted, later runs of
+that same `Simulation` object reuse the acknowledgement only while the selected/recommended
+direction, reason and confidence, policy version, MPI topology, and policy
+threshold facts remain identical. This avoids making repeated short runs slower
+just to repeat the same warning. By default, a different simulation receives
+its own first warning. An explicitly reviewed homogeneous batch can instead
+opt into the separately bounded process scope described below; gpmeep still
+does not choose or change its backend. The `dev/v1.1.0` branch implements this API;
+it becomes a released contract only after the v1.1.0 release gates pass.
+
+`auto` and `automatic` are deliberately rejected in v1.1.0. Select the backend
+yourself, then handle a recommendation mismatch explicitly:
+
+```python
+import meep as mp
+from meep import backend_policy
+
+mp.gpu.set_backend("cuda")  # or "cpu"; gpmeep never changes this choice
+sim = mp.Simulation(...)
+
+try:
+    sim.run(until_after_sources=20)
+except backend_policy.BackendRecommendationMismatch as mismatch:
+    print(mismatch.telemetry)
+    mp.gpu.acknowledge_backend_mismatch(
+        mismatch.challenge,
+        reason="production comparison intentionally uses CUDA",
+    )
+    sim.run(until_after_sources=20)
+```
+
+The default acknowledgement scope is `"simulation"`. For a batch that
+deliberately creates many equivalent `Simulation` objects, the user may accept
+one exact challenge with `scope="process"`:
+
+```python
+mp.gpu.acknowledge_backend_mismatch(
+    mismatch.challenge,
+    reason="reviewed CUDA benchmark batch on this fixed MPI topology",
+    scope="process",
+)
+```
+
+This is an explicit reduction in warning frequency, not automatic backend
+selection and not permission to ignore a broken CUDA environment. Reuse is
+limited to the same process and the same selected/recommended direction,
+reason/confidence class, policy thresholds and version, and MPI/GPU topology.
+Changing any of those facts warns again; a forked child inherits no acceptance.
+Omit `scope` when each newly constructed simulation should require its own
+warning. Every MPI run, including either kind of reuse, still computes the
+exact collective workload fingerprint so rank-divergent geometry, sources, or
+callbacks fail before solver mutation. Only a one-rank reuse path may skip that
+deep rank-consistency check.
+
+The first mismatched call performs no `init_sim`, DFT creation, or timestep.
+The acknowledgement permits only the immediately repeated exact workload and
+is consumed before that run mutates state. Changed source/geometry/DFT, file
+input, initialization or output hook, stopping condition or step callback,
+backend, device mapping, MPI topology, process, or policy revision invalidates
+it. Initialized simulations are also supported: the challenge binds ordered
+per-rank native `fields` and material-`structure` state manifests, including
+monotonic mutation epochs, current timestep, field mode, boundary/Bloch state,
+and core solver scalars. Native `step`, field/structure load or reset,
+initialization, material/source/component change, DFT add/update/load/scale or
+removal, boundary change, and synchronization advance an epoch; replacing a
+local native owner also invalidates the pending retry. The reason must occupy
+8--512 UTF-8 bytes,
+and every MPI rank must submit the same challenge and reason.
+`mp.gpu.pending_recommendation` exposes the current pre-run telemetry, while
+`mp.gpu.recommendation` exposes the last decision.
+
+The same guard runs before the high-level `Simulation.run`, `run_k_point`,
+`solve_cw`, and `solve_eigfreq` entry points mutate solver state. A broken CUDA
+environment or rank/device mapping raises `BackendEnvironmentError`; it is a
+configuration error and cannot be acknowledged. Direct low-level `mp.fields`
+calls do not carry a `Simulation` workload description, so the C++ engine
+enforces the explicit all-or-nothing backend but cannot make the high-level
+CPU/CUDA suitability recommendation. Low-level callers must make and document
+that performance choice themselves.
+
+Normal Meep Python code should mutate solver state through the documented
+methods (`Simulation`, `add_flux`/other monitor constructors, `scale_dfts`,
+`load_*`, monitor `remove`, material/source setters, and field methods), just as
+it does upstream. In v1.1.0, engine-owned raw SWIG descriptor members remain
+readable for inspection but are no longer assignable from Python. This includes
+the linked monitor/DFT descriptors and the exposed storage/configuration members
+of native `fields` and `structure` owners: direct assignment could bypass the
+mutation epoch, corrupt owner lists, or desynchronize MPI and CUDA mirrors.
+This includes `structure.effort`: it is an engine-owned allocation, not a
+replaceable Python data buffer, and assigning it could create conflicting
+owners during teardown. It remains readable for inspection.
+`fields.t` is the deliberate exception because Meep's existing high-level
+restart path resets it; its exact value is bound by the native state manifest.
+The raw `flux_vol(fields, ...)` SWIG constructor is not exported because it can
+attach a monitor to an initialized native owner without going through that
+owner's mutation epoch. Use `Simulation.add_flux` (normally) or
+`fields.add_flux_vol` (for supported low-level code), both of which preserve
+ownership and invalidate any pending acknowledgement.
+The owning native `src_time.next` list link is also readable but not assignable;
+source-list construction remains an engine operation. Native cycle detection
+fails the manifest instead of issuing a retry challenge.
+The internal `fields.process_incoming_chunk_data` MPI halo-transport routine is
+also no longer exported to Python. These restrictions do not change supported
+high-level Meep usage; custom code that assigned raw native members must migrate
+to the corresponding public method before using gpmeep v1.1.0.
+
+For Python stopping conditions and step callbacks, the workload fingerprint
+binds bytecode, defaults, closures, transitively referenced functions and
+mutable globals, statically accessed module attributes, and iterator/generator
+position. It also binds function attributes and annotations, transitive
+descriptor functions, bound built-in owners, instance `__dict__` and all MRO
+`__slots__`, mutable class/base-class state, built-in subclass state, and
+deterministic object-reference numbers for aliases, shared subgraphs, and
+cycles. Simulation configuration is taken from its semantic instance state;
+native derived caches alone are excluded. Epsilon, structure, fields, and
+chunk-layout input files are content-hashed when present. Raw Python addresses
+and SWIG pointers are never used. Adjoint-generated `sourcedata` combines a
+native SHA-256 manifest of its component, chunk, index, and amplitude contents
+with canonicalized Python proxy attributes. A module reached through a
+container/object has no statically provable attribute path and therefore fails
+closed; direct statically accessed module attributes remain supported. Opaque
+extension state or any other object graph that cannot be represented without a
+type/name-only fallback is rejected before initialization instead of issuing a
+reusable challenge. Runtime-only exclusions are restricted to exact Meep-owned
+objects; a user object's similarly named field, including a `_gpmeep_` prefix,
+remains part of the fingerprint. Meep-owned Python classes are trusted by the
+package class and original-member identities captured at import, not by a
+spoofable `__module__` string; an added or replaced method is therefore
+canonicalized transitively like user code.
+
+For a direct Python `CustomSource`, the initialized native source manifest
+records that external state is present and retrieves the retained callable
+through a private trusted extension helper. The same transitive canonicalizer
+therefore binds its bytecode, closures, globals, descriptors, aliases, and
+mutable values. Changing callback state after a mismatch changes the challenge;
+an acknowledgement for the earlier callback state cannot authorize the run.
+
+The recommendation uses rank-local grid size, estimated timesteps, source and
+monitor structure, estimated launches/transfers, available device memory, and
+the actual MPI/GPU mapping. It is advice, not an automatic scheduler or a speed
+guarantee. Hardware/workload crossover may be resolved by the warning; an
+environment defect fails closed, while confirmed gpmeep engine overhead remains
+an optimization/release-gate issue and is not excused by recommending CPU.
+
 For two GPUs, gpmeep uses MPI rank decomposition rather than making one Python
 process transparently drive both devices:
 
@@ -143,6 +290,9 @@ rank sees its own rank-local ordinal. Oversubscription is an explicit exception,
 not the recommended performance configuration. More GPUs do not guarantee a
 faster run: rank-local work must be large enough to repay MPI and CUDA
 synchronization costs.
+
+The following implementation section describes the released v1.0.x line;
+v1.1.0 removes its `auto` choice according to the explicit-choice contract above.
 
 ## How GPU acceleration works
 
@@ -182,9 +332,10 @@ an independent host-to-device/device-to-host copy:
    solver mutation. Generation and transaction checks prevent stale or
    partially published host/device state.
 6. **Treat speed as a measured crossover.** Small, short, callback-heavy, or
-   over-decomposed jobs may not amortize GPU overhead. Released v1.0.x keeps
-   explicit `cpu` and `cuda` choices and offers `auto` only as an opt-in policy;
-   no backend mode is presented as a universal speed guarantee.
+   over-decomposed jobs may not amortize GPU overhead. v1.1.0 keeps the backend
+   choice with the user and issues an evidence-based, explicitly
+   acknowledgeable warning when that choice disagrees with the recommendation;
+   it never silently changes the backend.
 
 The resulting speedup comes primarily from eliminating repeated full-state
 transfers and executing the dominant update/monitor pipeline at GPU memory
@@ -214,25 +365,59 @@ halo data: validated CUDA-aware MPI or pinned-host staging
 
 ### Backend selection is owner-wide and state-atomic
 
-CPU is the default. `mp.gpu.set_backend("cuda")` is a required-CUDA request:
-runtime, device assignment, or supported-time-step preflight failure raises
-before the step modifies any field. `auto` is an opt-in admission policy. All
-MPI ranks first agree on the requested mode, workload decision, feature set,
-transport, and device assignment. A validated time step is therefore entirely
-CPU or entirely CUDA for that fields owner; gpmeep does not silently execute an
-unsupported chunk on the CPU after partially advancing other chunks on CUDA.
+CPU is the default. In v1.1.0, `mp.gpu.set_backend("cpu")` and
+`mp.gpu.set_backend("cuda")` are explicit user choices; `auto` is rejected.
+A `cuda` choice is also an all-or-nothing request: runtime, device assignment,
+memory-capacity, or supported-time-step preflight failure raises before the
+step modifies any field. All MPI ranks first agree on the requested mode,
+guard decision, feature set, transport, and device assignment. A validated
+time step is therefore entirely CPU or entirely CUDA for that fields owner;
+gpmeep does not silently execute an unsupported chunk on the CPU after
+partially advancing other chunks on CUDA.
 
-Automatic selection has two stages. The host-only stage can reject a small
-rank-local domain without initializing the CUDA runtime. In the current build,
-the reference floor is 524,288 local cells for one serial FDTD worker per MPI
-rank; `MEEP_GPU_AUTO_MIN_CELLS` provides an explicit override. Owners that pass
-the first stage are checked against GPU memory bandwidth and a conservative
-memory budget: 1,024 bytes per local cell plus 64 MiB, while reserving the
-larger of 512 MiB or 10% of total device memory. Every rank must pass. This
-policy is designed to reject the bounded launch-dominated cases used to
-calibrate it, but it cannot know the future run length, monitor count, output
-cost, Python/optimizer share, or MPI topology, so it is not a guarantee that
-the selected backend is faster.
+Before the high-level solver initializes, the recommendation guard estimates
+rank-local grid work, known run length, source/monitor work, launch and transfer
+cost, device memory, and MPI/GPU topology. It advises CPU or CUDA but never
+changes the explicit choice. The first mismatch requires the exact,
+reason-bearing acknowledgement described above. The exact challenge is
+one-shot and cannot be replayed. The default bounded scope belongs only to the
+same `Simulation` object. A separate `scope="process"` opt-in can cover later
+simulation objects only when their complete policy class and MPI/GPU topology
+match the explicitly accepted class. The current reference floor is
+524,288 local cells for one serial FDTD worker per MPI rank, but this is a
+versioned calibration input rather than an application API or a speed
+guarantee. Unknown stopping duration, Python/optimizer work, output cost, and
+machine-specific contention can still require an end-to-end measurement.
+
+Each reusable scope cache holds at most 32 entries and is never inherited as
+an authorization by a forked child. Under the default scope, a different
+`Simulation` requires a new exact warning. Under explicit process scope,
+backend direction, policy classification, MPI topology, policy version, or
+threshold-category change still requires a new exact warning and
+acknowledgement. CUDA environment/device failures remain
+non-acknowledgeable. For diagnostic same-binary
+A/B measurements only, set
+`MEEP_GPU_DISABLE_BACKEND_ACK_SCOPE_CACHE=1` to restore an exact warning for
+every mismatched run; this is not recommended for normal production use.
+
+The first policy attempt for a live `Simulation` obtains the complete CUDA
+device inventory from one coherent native snapshot. Repeated `run` calls on
+that same object reuse a mutation-isolated positive snapshot; a different
+`Simulation`, a fork, relevant CUDA/MPI environment or topology change, or an
+explicit backend/device transition forces fresh discovery. Public
+`mp.gpu.devices()` remains uncached. Supported controller transitions are
+serialized with the guard, and a native generation/state check is repeated on
+cache hits. A device failure during an already-running simulation is still
+fail-closed by the native CUDA preflight/step path; the scoped cache never
+causes CPU fallback or automatic backend selection. One inventory call also
+does not repeat device enumeration separately for every reported property.
+The qualification-only
+`MEEP_GPU_DISABLE_DEVICE_INVENTORY_SNAPSHOT=1` control restores the legacy
+per-property query path solely for same-binary A/B evidence; it is not a
+recommended production setting. Qualification excludes its inventory-attestation
+probe from the workload-only primary time, requires identical OFF/ON inventory
+digests and mismatch-acknowledgement counts, and still records total subprocess
+time as a diagnostic.
 
 ### Persistent field residency and coherence
 
@@ -284,16 +469,68 @@ boundary phases; and then DFT accumulation. The main device work is:
 Cylindrical coordinates and BFAST each have supported CUDA paths, but their
 combination is not a supported curl configuration.
 
-Tile coalescing, topology-aware curl/H/E phase batching, stable phase replay,
-cached boundary descriptors, and eligible communication/compute overlap reduce
-launch and scheduling overhead. These are conditional fast paths, not extra
-physics restrictions: an ordinary supported CUDA kernel can still run when a
-particular overlap or replay optimization is ineligible. Indexed-source
-batching remains experimental/forced-only, and automatic multi-monitor DFT
-batching is fail-closed in v1.0.2; neither is presented as a default speedup.
+Tile coalescing, separate topology-aware H/E and curl phase batching/replay,
+cached boundary descriptors, and eligible
+communication/compute overlap reduce launch and scheduling overhead. Curl
+automatic mode requires at least four operations and admits the fused kernel
+only when the entire phase fits within 24 logical blocks per GPU SM and no
+single operation exceeds 12 blocks per SM. In the sealed RTX 3090 Ti one/two-
+GPU matrix this bound rejects the 128³/256³ stress grids where the historical
+forced path regressed while retaining launch-bound production phases;
+`MEEP_GPU_ENABLE_PHASE_BATCHED_CURL=1` still bypasses the bound as an expert
+diagnostic opt-in. Unset H/E controls retain their distinct measured adaptive
+policy, which uses a per-operation block budget. These are conditional fast
+paths, not extra physics restrictions: an ordinary supported CUDA kernel still
+runs when a particular batching, overlap, or replay optimization is ineligible.
+Presence of `MEEP_GPU_DISABLE_PHASE_BATCHED_CURL` disables curl collection
+entirely. Indexed-source batching and multi-monitor DFT fusion remain
+experimental/forced-only; neither is presented as an unconditional speedup.
 An arbitrary custom susceptibility subclass is not implicitly CUDA-capable:
-required CUDA rejects it during preflight, while `auto` selects CPU for the
-whole owner before the step.
+required CUDA rejects it during preflight, and the user must explicitly choose
+CPU for that workload. gpmeep never switches the requested backend silently.
+
+M4 also provides a distinct, default-off structured-curl CUDA Graph ablation:
+
+```sh
+MEEP_GPU_ENABLE_STRUCTURED_CURL_GRAPH=1 python your_simulation.py
+```
+
+It does not use the regressive fused curl-phase kernel. Instead, it constructs
+one graph node for each existing structured curl kernel and chains those nodes
+in the original submission order. The arithmetic kernel, material/PML inputs,
+and Yee update order are unchanged; only repeated host launch submission is
+collapsed. The executable graph is reused only after its device ordinal,
+complete phase topology, every captured device pointer, resident-cache
+allocation generation, and input/output mirror identities still match.
+Generation, topology, pointer, or host-mirror changes reject replay and rebuild
+through the ordinary collected path. Singleton phases and phases interrupted by
+dependent beta, BFAST, or cylindrical corrections run their ordinary structured
+kernels instead. Topologies known to require those direct corrections are
+rejected before fingerprinting or operation collection, avoiding per-step Graph
+bookkeeping on a path that cannot produce a complete executable graph. Graph
+creation failure likewise falls back to those kernels;
+graph launch failure is fail-closed and propagates because completion may be
+uncertain. Graph destruction reselects the executable's creation device and
+performs a device-wide completion fence before releasing the CUDA executable.
+If selection, fencing, or destruction fails, gpmeep does not free the graph,
+its plan metadata, or any captured resident allocation: the complete lifetime
+set is quarantined until process exit, remains unusable, and stays included in
+the live-plan gauge.
+
+The opt-in must be the exact value `1`. Presence of
+`MEEP_GPU_DISABLE_STRUCTURED_CURL_GRAPH` wins regardless of its value. If
+`MEEP_GPU_ENABLE_PHASE_BATCHED_CURL=1` explicitly forces the historical fused
+experiment, that control takes precedence and the graph path stays inactive.
+`MEEP_GPU_DISABLE_CURL_PHASE_REPLAY` disables stable replay while retaining
+collection-time graph submissions. `mp.gpu.statistics()["structured_curl_graph"]`
+reports graph submissions, represented logical kernel operations, lifecycle,
+fallback, failure, and generation/mirror rejection counters. In particular,
+`structured_curl_graph_plan_destroy_failures` is resettable causal evidence,
+while `structured_curl_graph_quarantined_plans` is a non-resetting process-long
+gauge; neither a failed destroy nor a quarantined executable is reported as a
+successful destroy. This path remains an ablation until sealed numerical and
+timing evidence establishes a favorable crossover; enabling it is not yet a
+general speed guarantee.
 
 ### DFT monitors and scientific reductions
 
@@ -376,7 +613,7 @@ end-to-end time for the real workload.
 | Python controller and telemetry | [`python/meep.i`](python/meep.i), [`src/meep/gpu.hpp`](src/meep/gpu.hpp) |
 | backend selection, device mapping, resident cache, and coherence | [`src/gpu_backend.cpp`](src/gpu_backend.cpp), [`src/gpu_backend_internal.hpp`](src/gpu_backend_internal.hpp) |
 | time-step order and boundary/MPI scheduling | [`src/step.cpp`](src/step.cpp) |
-| B/D curl and automatic crossover policy | [`src/step_db.cpp`](src/step_db.cpp) |
+| B/D curl and topology-aware phase-batch policy | [`src/step_db.cpp`](src/step_db.cpp) |
 | H/E and polarization updates | [`src/update_eh.cpp`](src/update_eh.cpp), [`src/update_pols.cpp`](src/update_pols.cpp), [`src/susceptibility.cpp`](src/susceptibility.cpp), [`src/multilevel-atom.cpp`](src/multilevel-atom.cpp) |
 | DFT, LDOS, eigenmode, and Near2Far consumers | [`src/dft.cpp`](src/dft.cpp), [`src/dft_ldos.cpp`](src/dft_ldos.cpp), [`src/near2far.cpp`](src/near2far.cpp) |
 | MPI transport negotiation | [`src/mympi.cpp`](src/mympi.cpp) |
@@ -394,7 +631,7 @@ measurements are in the [CPU/automatic/CUDA guide](doc/docs/GPMEEP_GPU_CROSSOVER
 - Do not install official `pymeep` and `gpmeep` into the same environment.
   Both provide the `meep` module and native `libmeep` ABI. Keep separate Conda
   or Micromamba prefixes and compare outputs across processes/files.
-- The Conda package version (`gpmeep 1.0.3`, etc.) is the distribution version.
+- The Conda package version (`gpmeep 1.1.0`, etc.) is the distribution version.
   `mp.__version__` remains the embedded upstream Meep source version, so use
   the Conda record and gpmeep provenance tools when identifying a release.
 - `meep.mpb` and `meep.adjoint` retain their Python imports. In the v1 package,
@@ -422,6 +659,34 @@ defects observed in a production deployment. It does not introduce a
 speculative kernel or MPI transport rewrite. Structural GPU changes remain
 separate explicitly approved v1.1.0 candidates.
 
+The active v1.1.0 development branch is governed by a fail-closed
+[development plan](doc/docs/GPMEEP_V1_1_0_DEVELOPMENT_PLAN.md). In that line,
+backend choice remains the user's: the recommendation system may stop a
+mismatched first attempt and require acknowledgement, but it may not switch
+CPU/CUDA automatically. GPU-slower-than-CPU cases must be classified with
+profiling evidence; gpmeep engine/design overhead is an optimization and
+release-gate issue, not a condition that can be closed by a warning.
+Candidate construction and publication are separate authorities: the receipt
+inside a candidate package can authorize only the build, while an external
+post-package receipt binds the exact qualified package SHA-256 before any tag
+or upload. See the [v1.1.0 release-trust procedure](doc/docs/GPMEEP_V1_1_0_RELEASE_TRUST.md).
+
+The full development history and authoritative source release remain in the
+private `iverydj/gpmeep` repository. Validated public releases are published
+through
+[`iverydj/gpmeep-releases`](https://github.com/iverydj/gpmeep-releases).
+Each release tag there points to a source snapshot authorized from the private
+development tree and accompanies checksum-bound immutable release assets. The
+public repository does not run the private development workflow or qualify a
+candidate; it publishes already accepted source, packages, documentation, and
+release evidence.
+
+Public publication additionally follows the
+[privacy-clean release policy](doc/docs/GPMEEP_PUBLIC_RELEASE_POLICY.md).
+Legacy identical-tree mirror controllers must not be used for this public
+target: raw evidence remains private, and all public refs/assets must pass a
+privacy gate independently of numerical/package qualification.
+
 The v1 release target is a checksum-locked Linux x86-64 Conda package and a
 one-command installer into a dedicated environment. Runtime release validation
 currently covers RTX 3090 Ti (sm86); the CUDA 12.4 portable build policy emits
@@ -433,10 +698,14 @@ co-installation with official `pymeep` are intentionally unsupported.
 - [Correctness and performance summary](doc/docs/GPMEEP_PERFORMANCE.md)
 - [Choosing CPU, automatic, or CUDA execution](doc/docs/GPMEEP_GPU_CROSSOVER.md)
 - [v1.0.3 field-feedback compatibility release notes](doc/docs/GPMEEP_V1_0_3_RELEASE_NOTES.md)
+- [v1.1.0 structural-performance release notes](doc/docs/GPMEEP_V1_1_0_RELEASE_NOTES.md)
 - [v1.0.2 crossover-guidance release notes](doc/docs/GPMEEP_V1_0_2_RELEASE_NOTES.md)
 - [v1.0.1 provenance correction](doc/docs/GPMEEP_V1_0_1_RELEASE_NOTES.md)
 - [License, attribution, and provenance](doc/docs/GPMEEP_LICENSE_AND_PROVENANCE.md)
 - [v1 release gates](doc/docs/GPMEEP_V1_RELEASE_PLAN_KO.md)
+- [v1.1.0 development contract](doc/docs/GPMEEP_V1_1_0_DEVELOPMENT_PLAN.md)
+- [v1.1.0 candidate and release trust procedure](doc/docs/GPMEEP_V1_1_0_RELEASE_TRUST.md)
+- [future portability TODO](doc/docs/GPMEEP_FUTURE_TODO.md)
 
 After downloading the v1 Conda package and its `.sha256` sidecar into a
 `downloads/` directory that is separate from the builder's `dist/` output:
@@ -444,8 +713,7 @@ After downloading the v1 Conda package and its `.sha256` sidecar into a
 ```sh
 /bin/bash -p scripts/install-gpmeep.sh \
   --prefix /absolute/path/to/gpmeep-v1 \
-  --package downloads/gpmeep-1.0.3-cuda124_mpi_openmpi_py311_0.conda \
-  --expected-source-commit b48c9b678f2316cefa95e48a661f7a877547a000 \
+  --package downloads/gpmeep-1.1.0-cuda124_mpi_openmpi_py311_0.conda \
   --mode gpu1 --gpu-devices 0
 ```
 
@@ -453,10 +721,6 @@ The installer verifies the package checksum, exact dependency lock,
 package/source provenance, installed CPU/CUDA numerical equivalence, strict
 CUDA work, and zero CPU fallback. `--mode gpu2 --gpu-devices 0,1` adds the
 two-rank/two-device transport check.
-
-The explicit source commit above identifies the original v1.0.3 binary, not
-this privacy-cleaned publication snapshot. Keep it when installing that
-package; a package rebuilt locally uses its own clean build commit instead.
 
 ## License
 
@@ -467,16 +731,14 @@ later, the license of Meep, from which it is derived ([`LICENSE`](LICENSE),
 
 ## Citing gpmeep
 
-If you use gpmeep in published work, please cite this software. The metadata
-is in [`CITATION.cff`](CITATION.cff) (GitHub's "Cite this repository" button
-exports it as APA or BibTeX):
+If you use gpmeep in published work, please cite this software. The metadata,
+including the release version, is in [`CITATION.cff`](CITATION.cff) (GitHub's
+"Cite this repository" button exports it as APA or BibTeX):
 
 ```bibtex
 @software{yi_gpmeep,
   author  = {Yi, Dong-Joon},
   title   = {gpmeep: CUDA-accelerated, multi-GPU Meep distribution},
-  version = {1.0.3},
-  year    = {2026},
   url     = {https://github.com/iverydj/gpmeep-releases},
   license = {GPL-2.0-or-later}
 }

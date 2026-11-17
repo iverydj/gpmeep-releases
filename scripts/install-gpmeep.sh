@@ -74,7 +74,7 @@ if [[ ! "${GLIBC_VERSION}" =~ ^[0-9]+(\.[0-9]+)+$ ]]; then
 fi
 if [[ "$(/usr/bin/printf '%s\n%s\n' "${GPMEEP_GLIBC_MINIMUM}" "${GLIBC_VERSION}" | \
   /usr/bin/sort -V | /usr/bin/head -n 1)" != "${GPMEEP_GLIBC_MINIMUM}" ]]; then
-  echo "error: gpmeep v1.0.3 requires glibc ${GPMEEP_GLIBC_MINIMUM} or newer; host has ${GLIBC_VERSION}" >&2
+  echo "error: gpmeep v1.1.0 requires glibc ${GPMEEP_GLIBC_MINIMUM} or newer; host has ${GLIBC_VERSION}" >&2
   exit 2
 fi
 if [[ -z "${PREFIX}" || -z "${PACKAGE}" ]]; then
