@@ -4,6 +4,10 @@ Dong-Joon Yi <https://iverydj.github.io/>
   Creator, project lead, lead developer, and maintainer of the gpmeep CUDA,
   multi-GPU, validation, packaging, and release work.
 
+Claude (Anthropic) and Codex (OpenAI)
+  Minor contributors: AI coding assistants that helped write code under the
+  project lead's direction.
+
 gpmeep is derived from Meep. The upstream Meep author list preserved below is
 in roughly chronological order:
 
